@@ -53,8 +53,8 @@ type Storage struct {
 
 // Database 对应 [Database]。
 //
-// 注意：当前阶段（P0）只是“读进来并校验格式”，并不会真的去连接数据库。
-// 所以你本机没装 MySQL，程序照样能跑起来。
+// P2 开始，程序启动时会真的连接 MySQL（见 internal/database）。
+// 这四个字段加上密码，会组成 go-sql-driver 的 DSN。
 type Database struct {
 	Host     string
 	Port     int
@@ -183,7 +183,18 @@ func (c Config) validate() error {
 		return fmt.Errorf("Storage.LocalRoot is required")
 	}
 
-	// 数据库端口这里只检查格式；当前阶段根本不会连接数据库。
+	// 数据库：P2 开始会真的连接 MySQL，所以这几项必须有值。
+	if strings.TrimSpace(c.Database.Host) == "" {
+		return fmt.Errorf("Database.Host is required")
+	}
+	if strings.TrimSpace(c.Database.User) == "" {
+		return fmt.Errorf("Database.User is required")
+	}
+	if strings.TrimSpace(c.Database.Name) == "" {
+		return fmt.Errorf("Database.Name is required")
+	}
+
+	// 数据库端口只检查范围；能不能连上要等启动时 Ping（见 internal/database）。
 	if c.Database.Port < 1 || c.Database.Port > 65535 {
 		return fmt.Errorf("Database.Port must be between 1 and 65535")
 	}

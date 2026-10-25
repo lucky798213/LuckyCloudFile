@@ -45,7 +45,7 @@ var (
 // 成功返回 201：
 //
 //	{"id":"3f2a...","name":"a.txt","size":1234}
-func uploadFile(logger *slog.Logger, svc *file.Service) gin.HandlerFunc {
+func uploadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 第一道限制：整个请求体不能无限大，防止有人往死里发。
 		// 注意这里加上了 multipart 的余量，真正的“32 MiB”由下面的 Service 精确检查。
@@ -85,7 +85,7 @@ func uploadFile(logger *slog.Logger, svc *file.Service) gin.HandlerFunc {
 
 		// part 是一个“还没读完的数据流”，直接交给 Service。
 		// 文件名只作为元数据保存，磁盘上的文件名用服务端生成的 ID。
-		record, err := svc.Upload(filepath.Base(part.FileName()), part)
+		record, err := svc.Upload(c.Request.Context(), filepath.Base(part.FileName()), part)
 		if err != nil {
 			if isTooLarge(err) {
 				respondTooLarge(c)
@@ -108,9 +108,9 @@ func uploadFile(logger *slog.Logger, svc *file.Service) gin.HandlerFunc {
 //
 // 它先把 ID 拿到内存索引里查：查不到直接 404，不会拿任意字符串去拼磁盘路径。
 // 查到了就打开文件，用 io.Copy 流式写回响应，不把整个文件读进内存。
-func downloadFile(logger *slog.Logger, svc *file.Service) gin.HandlerFunc {
+func downloadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		record, f, err := svc.Open(c.Param("id"))
+		record, f, err := svc.Open(c.Request.Context(), c.Param("id"))
 		if errors.Is(err, file.ErrNotFound) {
 			c.JSON(http.StatusNotFound, ErrorResponse{
 				Code:    "file_not_found",
@@ -147,9 +147,9 @@ func downloadFile(logger *slog.Logger, svc *file.Service) gin.HandlerFunc {
 // deleteFile 处理 DELETE /api/files/:id。
 //
 // 成功返回 204（No Content，没有响应正文）；ID 不存在返回 404。
-func deleteFile(logger *slog.Logger, svc *file.Service) gin.HandlerFunc {
+func deleteFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		err := svc.Delete(c.Param("id"))
+		err := svc.Delete(c.Request.Context(), c.Param("id"))
 		switch {
 		case errors.Is(err, file.ErrNotFound):
 			c.JSON(http.StatusNotFound, ErrorResponse{

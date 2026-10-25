@@ -60,6 +60,9 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 		{"invalid timeout", "ShutdownTimeoutSeconds = 5", "ShutdownTimeoutSeconds = 0", "ShutdownTimeoutSeconds"},
 		{"missing storage", "LocalRoot = data", "LocalRoot =", "Storage.LocalRoot"},
 		{"invalid log level", "LogLevel = info", "LogLevel = invalid", "LogLevel"},
+		{"missing database host", "Host = HOST", "Host =", "Database.Host"},
+		{"missing database user", "User = DB_USER", "User =", "Database.User"},
+		{"missing database name", "Name = DB_NAME", "Name =", "Database.Name"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := Load(writeConfig(t, strings.Replace(validINI, tc.old, tc.replacement, 1)))

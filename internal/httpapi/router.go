@@ -5,6 +5,7 @@
 package httpapi
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
@@ -22,11 +23,21 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 }
 
+// fileService 是路由需要文件服务提供的三个能力。
+//
+// 这里用接口而不是直接写 *file.Service，是为了让 HTTP 层的测试
+// 可以用一个不连数据库的假实现；生产代码传进去的仍然是 *file.Service。
+type fileService interface {
+	Upload(ctx context.Context, name string, r io.Reader) (file.File, error)
+	Open(ctx context.Context, id string) (file.File, io.ReadCloser, error)
+	Delete(ctx context.Context, id string) error
+}
+
 // NewRouter 创建并配置好路由。
 //
 // logger 和 fileService 都从参数传进来，而不是在包里自己创建：
-// 这样整个程序共用同一套对象，测试时也能换成临时目录和“不输出”的日志。
-func NewRouter(logger *slog.Logger, fileService *file.Service) *gin.Engine {
+// 这样整个程序共用同一套对象，测试时也能换成假的实现。
+func NewRouter(logger *slog.Logger, fileService fileService) *gin.Engine {
 	// gin.New() 创建一个空引擎。
 	// 不用 gin.Default()，是因为它自带日志和 panic 恢复中间件，
 	// 而我们的日志格式要自己控制（JSON、带耗时），所以中间件自己加。

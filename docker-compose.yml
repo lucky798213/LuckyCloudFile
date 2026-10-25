@@ -1,0 +1,24 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: luckycloudfile-mysql
+    environment:
+      # 仅供本机开发，不要用于生产。
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: luckycloudfile
+      MYSQL_USER: lucky
+      MYSQL_PASSWORD: lucky
+    ports:
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./scripts/mysql-init.sql:/docker-entrypoint-initdb.d/01-test-db.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  mysql-data:
+    name: luckycloudfile-mysql-data

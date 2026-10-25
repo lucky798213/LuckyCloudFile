@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"luckyCloudFile/internal/config"
+	"luckyCloudFile/internal/database"
 	"luckyCloudFile/internal/file"
 	"luckyCloudFile/internal/httpapi"
 	"luckyCloudFile/internal/storage"
@@ -27,20 +28,28 @@ import (
 //
 // 整个启动过程是“一步一步来”的，任何一步失败都直接返回错误：
 //
-//	检查存储目录 → 创建 HTTP Server → 绑定端口 → 开始服务
+//	检查存储目录 → 连接 MySQL → 创建 HTTP Server → 绑定端口 → 开始服务
 func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	// 第一步：确认存储目录存在且可写。放在最前面，避免服务跑起来后才发现存不了文件。
 	if err := checkStorage(cfg.Storage.LocalRoot); err != nil {
 		return err
 	}
 
-	// 第二步：创建“存储 → 文件业务 → 路由”这条调用链。
+	// 第二步：连接 MySQL。连不上就在这里失败，而不是等第一个请求才报错。
+	// database.Open 还会自动建表（P2 先用 AutoMigrate）。
+	db, err := database.Open(ctx, cfg.Database)
+	if err != nil {
+		return fmt.Errorf("initialize database: %w", err)
+	}
+	defer db.Close()
+
+	// 第三步：创建“存储 → 文件业务 → 路由”这条调用链。
 	// 这里是整个程序唯一一处把它们组装起来的地方，
 	// 以后换成 S3，只要改这一行的存储实现。
 	store := storage.NewLocal(cfg.Storage.LocalRoot)
-	fileService := file.NewService(store)
+	fileService := file.NewService(db, store)
 
-	// 第三步：创建 HTTP Server。它只是一个“配置好的对象”，还没开始监听。
+	// 第四步：创建 HTTP Server。它只是一个“配置好的对象”，还没开始监听。
 	// Handler 就是路由表，来自 internal/httpapi。
 	server := &http.Server{
 		Handler: httpapi.NewRouter(logger, fileService),
@@ -53,7 +62,7 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		IdleTimeout: 60 * time.Second,
 	}
 
-	// 第四步：真正占用端口。
+	// 第五步：真正占用端口。
 	// 这里故意用同步的 net.Listen，而不是在 goroutine 里 ListenAndServe：
 	// 端口被占用时能立刻拿到错误，不会先打印“启动成功”再失败。
 	listener, err := net.Listen("tcp", cfg.HTTP.Listen)
@@ -62,7 +71,7 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 	defer listener.Close()
 
-	// 第五步：开始服务，直到收到退出信号。
+	// 第六步：开始服务，直到收到退出信号。
 	shutdownTimeout := time.Duration(cfg.HTTP.ShutdownTimeoutSeconds) * time.Second
 	return serve(ctx, server, listener, shutdownTimeout, logger)
 }
@@ -85,7 +94,7 @@ func serve(ctx context.Context, server *http.Server, listener net.Listener, shut
 	}()
 
 	// 这一行只在端口真正绑定成功后才会打印，所以它能当作“启动成功”的信号。
-	logger.Info("http listening", "address", listener.Addr().String(), "database_connected", false)
+	logger.Info("http listening", "address", listener.Addr().String(), "database_connected", true)
 
 	// 等第一个发生的事件。
 	select {

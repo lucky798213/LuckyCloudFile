@@ -9,10 +9,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	mysqlDriver "github.com/go-sql-driver/mysql"
 
 	"luckyCloudFile/internal/config"
 )
@@ -151,12 +154,54 @@ func TestShutdownTimeoutClosesRemainingConnections(t *testing.T) {
 	_ = waitError(t, requestDone)
 }
 
+// testDatabaseConfig 从集成测试用的 DSN 里拆出 config.Database。
+// 没设置 DSN 时跳过：Run 现在启动时必须连上 MySQL。
+func testDatabaseConfig(t *testing.T) config.Database {
+	t.Helper()
+
+	dsn := os.Getenv("CLOUDREVE_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("set CLOUDREVE_TEST_MYSQL_DSN to run tests that start the full app")
+	}
+
+	mc, err := mysqlDriver.ParseDSN(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, portText, err := net.SplitHostPort(mc.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return config.Database{
+		Host: host, Port: port, User: mc.User, Password: mc.Passwd, Name: mc.DBName,
+	}
+}
+
 func TestRunRejectsOccupiedPort(t *testing.T) {
 	listener := testListener(t)
-	cfg := config.Config{HTTP: config.HTTP{Listen: listener.Addr().String(), ShutdownTimeoutSeconds: 1},
-		Storage: config.Storage{LocalRoot: t.TempDir()}}
+	cfg := config.Config{
+		HTTP:     config.HTTP{Listen: listener.Addr().String(), ShutdownTimeoutSeconds: 1},
+		Storage:  config.Storage{LocalRoot: t.TempDir()},
+		Database: testDatabaseConfig(t),
+	}
 	if err := Run(context.Background(), cfg, testLogger()); err == nil || !strings.Contains(err.Error(), "listen HTTP") {
 		t.Fatalf("wanted occupied-port error, got %v", err)
+	}
+}
+
+func TestRunRejectsUnavailableDatabase(t *testing.T) {
+	cfg := config.Config{
+		HTTP:    config.HTTP{Listen: "127.0.0.1:0", ShutdownTimeoutSeconds: 1},
+		Storage: config.Storage{LocalRoot: t.TempDir()},
+		// 端口 1 基本不可能有 MySQL 在监听。
+		Database: config.Database{Host: "127.0.0.1", Port: 1, User: "nobody", Name: "nothing"},
+	}
+	if err := Run(context.Background(), cfg, testLogger()); err == nil || !strings.Contains(err.Error(), "initialize database") {
+		t.Fatalf("wanted database error, got %v", err)
 	}
 }
 

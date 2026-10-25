@@ -1,19 +1,20 @@
-// Package file 是文件的业务层：生成 ID、记录元数据、协调存储。
+// Package file 是文件的业务层：生成 ID、操作数据库记录、协调磁盘存储。
 //
 // 它不碰 HTTP（那是 internal/httpapi），也不碰 os.Open/os.Rename（那是 internal/storage）。
-// 它只决定“这件事该按什么顺序做”。
+// 它只决定“这件事该按什么顺序做、失败了怎么收拾”。
 package file
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"os"
-	"sync"
 
+	"luckyCloudFile/internal/ent"
+	entfile "luckyCloudFile/internal/ent/file"
 	"luckyCloudFile/internal/storage"
 )
 
@@ -28,111 +29,189 @@ var (
 	ErrTooLarge = errors.New("file too large")
 )
 
-// File 是一条文件记录。
+// File 是返回给 HTTP 层的文件信息（不包含数据库内部字段）。
 //
-// ID 由服务端生成，用来命名磁盘文件和之后查询；
-// Name 只是原始文件名，用来给用户看，绝不参与拼接磁盘路径。
-// 这样同名文件不会互相覆盖，也不用担心文件名里带 ../ 之类的路径穿越。
+// 它和 ent 生成的 ent.File 不是同一个类型：
+// ent.File 是数据库记录，下面这个只是“客户端需要看到的三个字段”。
 type File struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 	Size int64  `json:"size"`
 }
 
-// Service 管理所有文件记录，并把文件内容交给 storage 落盘。
+// Service 负责文件业务：落盘 + 写数据库。
 type Service struct {
-	store *storage.Local
-
-	// HTTP 请求是并发进来的，map 本身不是并发安全的，所以用互斥锁保护。
-	mu    sync.Mutex
-	files map[string]File
+	client *ent.Client
+	store  *storage.Local
 }
 
 // NewService 创建文件服务。
-func NewService(store *storage.Local) *Service {
-	return &Service{
-		store: store,
-		files: make(map[string]File),
-	}
+func NewService(client *ent.Client, store *storage.Local) *Service {
+	return &Service{client: client, store: store}
 }
 
-// Upload 把 r 的内容存成一个文件，登记元数据，然后返回这条记录。
+// Upload 把 r 的内容存成文件，并在数据库里登记 File 和 Entity。
 //
-// 顺序很重要：先真正写成功，再登记。
-// 如果写磁盘失败就直接返回错误，不留下“索引里有、磁盘上却没有”的坏记录。
-func (s *Service) Upload(name string, r io.Reader) (File, error) {
-	// 1. 生成服务端 ID
-	id, err := newID()
+// 顺序是：
+//  1. 生成两个随机 ID：File 的公开 ID、Entity 的磁盘 key
+//  2. 先把内容写进磁盘（临时文件 → Rename）
+//  3. 再在一个事务里写 Entity 和 File 两行
+//
+// 如果第 3 步失败，会把第 2 步写好的磁盘文件删掉，避免“磁盘有、库里没有”的孤儿文件。
+func (s *Service) Upload(ctx context.Context, name string, r io.Reader) (File, error) {
+	fileID, err := newID()
+	if err != nil {
+		return File{}, err
+	}
+	storageKey, err := newID()
 	if err != nil {
 		return File{}, err
 	}
 
-	// 2. 落盘（storage 内部会先写临时文件，写完再重命名）
-	size, err := s.store.Save(id, r, MaxUploadBytes)
+	// 先落盘。磁盘写失败时数据库还没动过，直接返回即可。
+	size, err := s.store.Save(storageKey, r, MaxUploadBytes)
 	if err != nil {
-		// 把存储层的“太大了”翻译成业务层的错误，HTTP 层只需要认识 file.ErrTooLarge。
 		if errors.Is(err, storage.ErrTooLarge) {
 			return File{}, ErrTooLarge
 		}
 		return File{}, err
 	}
 
-	// 3. 写成功了，才登记到内存里
-	record := File{ID: id, Name: name, Size: size}
-	s.mu.Lock()
-	s.files[id] = record
-	s.mu.Unlock()
-
-	return record, nil
-}
-
-// Get 按 ID 查一条记录。
-func (s *Service) Get(id string) (File, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	record, ok := s.files[id]
-	return record, ok
-}
-
-// Open 按 ID 打开文件，同时返回元数据。
-// 下载接口用它：先确认 ID 存在，再去磁盘打开，避免拿任意字符串去拼路径。
-func (s *Service) Open(id string) (File, *os.File, error) {
-	s.mu.Lock()
-	record, ok := s.files[id]
-	s.mu.Unlock()
-	if !ok {
-		return File{}, nil, ErrNotFound
+	// 再写数据库。失败就回滚磁盘，保证两边一致。
+	if err := s.saveRecords(ctx, fileID, storageKey, name, size); err != nil {
+		_ = s.store.Remove(storageKey)
+		return File{}, err
 	}
 
-	f, err := s.store.Open(id)
+	return File{ID: fileID, Name: name, Size: size}, nil
+}
+
+// saveRecords 在一个事务里写入 Entity 和 File。
+//
+// 两个表必须一起成功：只有 File 没有 Entity，就不知道内容在哪；
+// 只有 Entity 没有 File，就是一份没人引用的孤儿内容。
+func (s *Service) saveRecords(ctx context.Context, fileID, storageKey, name string, size int64) error {
+	tx, err := s.client.Tx(ctx)
 	if err != nil {
-		// 索引里有、磁盘上却没有：对外都当成“文件不存在”。
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+
+	entity, err := tx.Entity.Create().
+		SetStorageKey(storageKey).
+		SetSize(size).
+		SetPolicy("local").
+		SetRefCount(1).
+		Save(ctx)
+	if err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("create entity: %w", err)
+	}
+
+	if _, err := tx.File.Create().
+		SetID(fileID).
+		SetName(name).
+		SetEntity(entity).
+		Save(ctx); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("create file: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
+}
+
+// Open 按 ID 查数据库，然后打开对应的磁盘文件。
+//
+// 这里不会拿客户端传来的字符串去拼路径：
+// 只有数据库里真实存在的 ID 才会走到 Entity.StorageKey。
+func (s *Service) Open(ctx context.Context, id string) (File, io.ReadCloser, error) {
+	record, err := s.client.File.Query().
+		Where(entfile.ID(id)).
+		WithEntity().
+		Only(ctx)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return File{}, nil, ErrNotFound
+		}
+		return File{}, nil, fmt.Errorf("query file: %w", err)
+	}
+
+	entity := record.Edges.Entity
+	if entity == nil {
+		return File{}, nil, fmt.Errorf("file %s has no entity", id)
+	}
+
+	f, err := s.store.Open(entity.StorageKey)
+	if err != nil {
+		// 数据库有记录但磁盘文件没了：对外也当作“不存在”。
 		if errors.Is(err, fs.ErrNotExist) {
 			return File{}, nil, ErrNotFound
 		}
-		return File{}, nil, err
+		return File{}, nil, fmt.Errorf("open content: %w", err)
 	}
-	return record, f, nil
+
+	return File{ID: record.ID, Name: record.Name, Size: entity.Size}, f, nil
 }
 
-// Delete 删除文件：先删磁盘文件，再从内存索引里移除。
+// Delete 删除文件：先删磁盘内容，再在事务里删数据库记录。
 //
-// 磁盘删除失败时保留索引并返回错误，这样调用方知道“没删干净”；
-// 如果磁盘文件本来就不在了，就当成已删除，继续清索引。
-func (s *Service) Delete(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, ok := s.files[id]; !ok {
-		return ErrNotFound
+// 为什么先删磁盘？如果磁盘删除失败，数据库不动，文件还能下载、也能重试删除。
+// 反过来先删数据库，磁盘失败就会留下永远没人认识的孤儿文件。
+//
+// 如果磁盘删完、事务却失败了：数据库里还有记录，但磁盘文件已经没了。
+// 再调一次 Delete 时，磁盘不存在会被当成“已经删了”，然后继续把数据库记录删掉，
+// 所以重试是安全的。
+func (s *Service) Delete(ctx context.Context, id string) error {
+	record, err := s.client.File.Query().
+		Where(entfile.ID(id)).
+		WithEntity().
+		Only(ctx)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("query file: %w", err)
 	}
 
-	if err := s.store.Remove(id); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
+	entity := record.Edges.Entity
+	if entity == nil {
+		return fmt.Errorf("file %s has no entity", id)
 	}
 
-	delete(s.files, id)
+	if err := s.store.Remove(entity.StorageKey); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove content: %w", err)
+	}
+
+	tx, err := s.client.Tx(ctx)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+
+	if err := tx.File.DeleteOneID(record.ID).Exec(ctx); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("delete file: %w", err)
+	}
+
+	// 引用数减到 0 才删 Entity，这样以后多个 File 共享一份内容时不会被误删。
+	if entity.RefCount <= 1 {
+		if err := tx.Entity.DeleteOneID(entity.ID).Exec(ctx); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("delete entity: %w", err)
+		}
+	} else {
+		if _, err := tx.Entity.UpdateOneID(entity.ID).
+			SetRefCount(entity.RefCount - 1).
+			Save(ctx); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("update ref count: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
 	return nil
 }
 

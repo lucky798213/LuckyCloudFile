@@ -10,15 +10,11 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-
-	"luckyCloudFile/internal/file"
-	"luckyCloudFile/internal/storage"
 )
 
 func TestRoutes(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	fileService := file.NewService(storage.NewLocal(t.TempDir()))
-	r := NewRouter(logger, fileService)
+	r := NewRouter(logger, newFakeFileService())
 	r.GET("/panic", func(c *gin.Context) { panic("SECRET") })
 	for _, tc := range []struct {
 		method, path string

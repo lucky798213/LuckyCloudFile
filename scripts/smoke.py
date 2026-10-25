@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""构建真实二进制，用本机临时端口验证 P0；不依赖 MySQL 或第三方 Python 包。"""
+"""构建真实二进制，用本机临时端口验证 HTTP 生命周期；需要本机 MySQL 已启动（docker compose up -d）。"""
 
 import json
 import os
@@ -17,8 +17,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
+    db_host = os.environ.get("CLOUDREVE_DB_HOST", "127.0.0.1")
+    db_port = os.environ.get("CLOUDREVE_DB_PORT", "3306")
+    db_user = os.environ.get("CLOUDREVE_DB_USER", "lucky")
+    db_name = os.environ.get("CLOUDREVE_DB_NAME", "luckycloudfile")
+    os.environ.setdefault("CLOUDREVE_DB_PASSWORD", "lucky")
+
     processes = []
-    with tempfile.TemporaryDirectory(prefix="cloudreve-p0-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="luckycloudfile-smoke-") as temporary:
         temp = Path(temporary)
         binary = temp / "server"
         subprocess.run(
@@ -30,7 +36,9 @@ def main():
             path = temp / name
             path.write_text(
                 f"[HTTP]\nListen = {address}\nShutdownTimeoutSeconds = {timeout}\n"
-                f"[Storage]\nLocalRoot = {temp / 'data'}\n",
+                f"[Storage]\nLocalRoot = {temp / 'data'}\n"
+                f"[Database]\nHost = {db_host}\nPort = {db_port}\n"
+                f"User = {db_user}\nName = {db_name}\n",
                 encoding="utf-8",
             )
             return path
@@ -41,7 +49,7 @@ def main():
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             )
             processes.append(process)
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 15
             with selectors.DefaultSelector() as selector:
                 selector.register(process.stdout, selectors.EVENT_READ)
                 while time.monotonic() < deadline:
@@ -52,7 +60,7 @@ def main():
                         raise AssertionError("server exited before readiness")
                     event = json.loads(line)
                     if event.get("msg") == "http listening":
-                        assert event["database_connected"] is False
+                        assert event["database_connected"] is True
                         return process, event["address"]
             raise AssertionError("server did not become ready")
 
@@ -77,7 +85,7 @@ def main():
             first, address = start(conf)
             request(address, "/healthz", 200, "status", "ok")
             request(address, "/missing", 404, "code", "not_found")
-            print("PASS: real-process health and JSON errors; no database required")
+            print("PASS: real-process health and JSON errors (MySQL connected)")
 
             fixed = configuration("fixed.ini", address)
             collision = subprocess.run(

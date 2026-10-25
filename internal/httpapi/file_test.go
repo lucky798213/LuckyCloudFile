@@ -2,31 +2,95 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"luckyCloudFile/internal/file"
-	"luckyCloudFile/internal/storage"
 )
 
-// newTestRouter 创建一个用临时目录做存储的路由，测试之间互不影响。
-func newTestRouter(t *testing.T) (http.Handler, string) {
-	t.Helper()
+// fakeFileService 实现和 *file.Service 相同的三个方法，但不连数据库、不写磁盘。
+//
+// HTTP 层的测试只关心“状态码、响应头、JSON 对不对”，
+// 真正的数据库和磁盘行为由 internal/file 的集成测试覆盖。
+type fakeFileService struct {
+	mu       sync.Mutex
+	nextID   int
+	records  map[string]file.File
+	contents map[string][]byte
+}
 
-	root := t.TempDir()
+func newFakeFileService() *fakeFileService {
+	return &fakeFileService{
+		records:  make(map[string]file.File),
+		contents: make(map[string][]byte),
+	}
+}
+
+func (f *fakeFileService) Upload(ctx context.Context, name string, r io.Reader) (file.File, error) {
+	// 测试替身把内容读进内存就够了，不用真的写磁盘。
+	data, err := io.ReadAll(io.LimitReader(r, file.MaxUploadBytes+1))
+	if err != nil {
+		return file.File{}, err
+	}
+	if int64(len(data)) > file.MaxUploadBytes {
+		return file.File{}, file.ErrTooLarge
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextID++
+	id := fmt.Sprintf("fake-%d", f.nextID)
+	record := file.File{ID: id, Name: name, Size: int64(len(data))}
+	f.records[id] = record
+	f.contents[id] = data
+	return record, nil
+}
+
+func (f *fakeFileService) Open(ctx context.Context, id string) (file.File, io.ReadCloser, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	record, ok := f.records[id]
+	if !ok {
+		return file.File{}, nil, file.ErrNotFound
+	}
+	return record, io.NopCloser(bytes.NewReader(f.contents[id])), nil
+}
+
+func (f *fakeFileService) Delete(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.records[id]; !ok {
+		return file.ErrNotFound
+	}
+	delete(f.records, id)
+	delete(f.contents, id)
+	return nil
+}
+
+func (f *fakeFileService) stored(id string) ([]byte, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	data, ok := f.contents[id]
+	return data, ok
+}
+
+// newTestRouter 创建一个使用假文件服务的路由，测试之间互不影响。
+func newTestRouter(t *testing.T) (http.Handler, *fakeFileService) {
+	t.Helper()
+	fake := newFakeFileService()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	router := NewRouter(logger, file.NewService(storage.NewLocal(root)))
-	return router, root
+	return NewRouter(logger, fake), fake
 }
 
 // uploadRequest 构造一个 multipart/form-data 上传请求。
@@ -51,7 +115,7 @@ func uploadRequest(t *testing.T, field, filename string, content []byte) *http.R
 	return req
 }
 
-// upload 上传一个文件并返回解析后的记录，省得每个测试都重复一遍。
+// upload 上传一个文件并返回解析后的记录。
 func upload(t *testing.T, router http.Handler, content []byte) file.File {
 	t.Helper()
 
@@ -69,7 +133,7 @@ func upload(t *testing.T, router http.Handler, content []byte) file.File {
 }
 
 func TestUploadFile(t *testing.T) {
-	router, root := newTestRouter(t)
+	router, fake := newTestRouter(t)
 	content := []byte("hello luckyCloudFile")
 
 	recorder := httptest.NewRecorder()
@@ -87,23 +151,14 @@ func TestUploadFile(t *testing.T) {
 		t.Fatalf("unexpected record: %+v", record)
 	}
 
-	// 磁盘上的文件名应该是生成的 ID，内容必须和上传的完全一致。
-	saved, err := os.ReadFile(filepath.Join(root, record.ID))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(saved, content) {
-		t.Fatalf("saved content = %q, want %q", saved, content)
-	}
-
-	// 原始文件名只当元数据，不能真的在磁盘上生成这个文件。
-	if _, err := os.Stat(filepath.Join(root, "greeting.txt")); !os.IsNotExist(err) {
-		t.Fatal("client file name must not be used as the disk path")
+	saved, ok := fake.stored(record.ID)
+	if !ok || !bytes.Equal(saved, content) {
+		t.Fatalf("stored content = %q, want %q", saved, content)
 	}
 }
 
 func TestUploadDoesNotUseClientNameAsPath(t *testing.T) {
-	router, root := newTestRouter(t)
+	router, fake := newTestRouter(t)
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, uploadRequest(t, "file", "../../evil.txt", []byte("x")))
@@ -116,17 +171,15 @@ func TestUploadDoesNotUseClientNameAsPath(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &record); err != nil {
 		t.Fatal(err)
 	}
+	// 处理器会把客户端路径压成文件名，并且只把 ID 交给 Service。
 	if record.Name != "evil.txt" {
 		t.Fatalf("name = %q, want evil.txt", record.Name)
 	}
-
-	// 存储目录里只应该有那一个用 ID 命名的文件。
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
+	if record.ID == "evil.txt" {
+		t.Fatal("client file name must not be used as the file ID")
 	}
-	if len(entries) != 1 || entries[0].Name() != record.ID {
-		t.Fatalf("unexpected files in storage: %v", entries)
+	if _, ok := fake.stored(record.ID); !ok {
+		t.Fatal("file content was not stored under the generated ID")
 	}
 }
 
@@ -161,7 +214,7 @@ func TestUploadMissingFileField(t *testing.T) {
 }
 
 func TestUploadWrongFieldName(t *testing.T) {
-	router, root := newTestRouter(t)
+	router, fake := newTestRouter(t)
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, uploadRequest(t, "avatar", "a.txt", []byte("x")))
@@ -176,13 +229,8 @@ func TestUploadWrongFieldName(t *testing.T) {
 	if response.Code != "invalid_field" {
 		t.Fatalf("code = %q, want invalid_field", response.Code)
 	}
-
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("rejected upload left files behind: %v", entries)
+	if len(fake.records) != 0 {
+		t.Fatal("rejected upload must not be stored")
 	}
 }
 
@@ -201,7 +249,7 @@ func TestUploadExactlyAtLimit(t *testing.T) {
 }
 
 func TestUploadFileContentTooLarge(t *testing.T) {
-	router, root := newTestRouter(t)
+	router, _ := newTestRouter(t)
 	content := bytes.Repeat([]byte("x"), int(file.MaxUploadBytes)+1)
 
 	recorder := httptest.NewRecorder()
@@ -209,15 +257,6 @@ func TestUploadFileContentTooLarge(t *testing.T) {
 
 	if recorder.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("wanted 413, got %d: %s", recorder.Code, recorder.Body.String())
-	}
-
-	// 失败的上传不能留下任何文件（包括临时文件）。
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("failed upload left files behind: %v", entries)
 	}
 }
 
@@ -248,16 +287,15 @@ func TestUploadRejectsNonMultipart(t *testing.T) {
 	}
 }
 
-// TestUploadDownloadDelete 是 P1 的验收闭环：
+// TestUploadDownloadDelete 是 HTTP 层的闭环：
 // 上传 → 下载 → SHA-256 一致 → 删除 → 再下载 404。
 func TestUploadDownloadDelete(t *testing.T) {
-	router, root := newTestRouter(t)
-	content := []byte("luckyCloudFile P1 closed loop\n")
+	router, fake := newTestRouter(t)
+	content := []byte("luckyCloudFile closed loop\n")
 	wantHash := sha256.Sum256(content)
 
 	record := upload(t, router, content)
 
-	// 下载并校验内容。
 	download := httptest.NewRecorder()
 	router.ServeHTTP(download, httptest.NewRequest(http.MethodGet, "/api/files/"+record.ID, nil))
 	if download.Code != http.StatusOK {
@@ -273,17 +311,15 @@ func TestUploadDownloadDelete(t *testing.T) {
 		t.Fatalf("Content-Length = %q, want %d", length, record.Size)
 	}
 
-	// 删除。
 	deleted := httptest.NewRecorder()
 	router.ServeHTTP(deleted, httptest.NewRequest(http.MethodDelete, "/api/files/"+record.ID, nil))
 	if deleted.Code != http.StatusNoContent {
 		t.Fatalf("wanted 204, got %d: %s", deleted.Code, deleted.Body.String())
 	}
-
-	// 磁盘文件没了，再下载是 404。
-	if _, err := os.Stat(filepath.Join(root, record.ID)); !os.IsNotExist(err) {
-		t.Fatal("file is still on disk after delete")
+	if _, ok := fake.stored(record.ID); ok {
+		t.Fatal("file is still stored after delete")
 	}
+
 	after := httptest.NewRecorder()
 	router.ServeHTTP(after, httptest.NewRequest(http.MethodGet, "/api/files/"+record.ID, nil))
 	if after.Code != http.StatusNotFound {
