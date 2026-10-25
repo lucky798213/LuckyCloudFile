@@ -3,15 +3,23 @@
 package ent
 
 import (
+	"luckyCloudFile/internal/ent/authsession"
 	"luckyCloudFile/internal/ent/entity"
 	"luckyCloudFile/internal/ent/file"
 	"luckyCloudFile/internal/ent/schema"
+	"luckyCloudFile/internal/ent/user"
 )
 
 // The init function reads all schema descriptors with runtime code
 // (default values, validators, hooks and policies) and stitches it
 // to their package variables.
 func init() {
+	authsessionFields := schema.AuthSession{}.Fields()
+	_ = authsessionFields
+	// authsessionDescTokenHash is the schema descriptor for token_hash field.
+	authsessionDescTokenHash := authsessionFields[0].Descriptor()
+	// authsession.TokenHashValidator is a validator for the "token_hash" field. It is called by the builders before save.
+	authsession.TokenHashValidator = authsessionDescTokenHash.Validators[0].(func(string) error)
 	entityFields := schema.Entity{}.Fields()
 	_ = entityFields
 	// entityDescStorageKey is the schema descriptor for storage_key field.
@@ -42,8 +50,14 @@ func init() {
 	fileDescParent := fileFields[2].Descriptor()
 	// file.DefaultParent holds the default value on creation for the parent field.
 	file.DefaultParent = fileDescParent.Default.(string)
-	// fileDescOwner is the schema descriptor for owner field.
-	fileDescOwner := fileFields[3].Descriptor()
-	// file.DefaultOwner holds the default value on creation for the owner field.
-	file.DefaultOwner = fileDescOwner.Default.(string)
+	userFields := schema.User{}.Fields()
+	_ = userFields
+	// userDescUsername is the schema descriptor for username field.
+	userDescUsername := userFields[0].Descriptor()
+	// user.UsernameValidator is a validator for the "username" field. It is called by the builders before save.
+	user.UsernameValidator = userDescUsername.Validators[0].(func(string) error)
+	// userDescPasswordHash is the schema descriptor for password_hash field.
+	userDescPasswordHash := userFields[1].Descriptor()
+	// user.PasswordHashValidator is a validator for the "password_hash" field. It is called by the builders before save.
+	user.PasswordHashValidator = userDescPasswordHash.Validators[0].(func(string) error)
 }

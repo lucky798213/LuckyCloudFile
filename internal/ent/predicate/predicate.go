@@ -6,8 +6,14 @@ import (
 	"entgo.io/ent/dialect/sql"
 )
 
+// AuthSession is the predicate function for authsession builders.
+type AuthSession func(*sql.Selector)
+
 // Entity is the predicate function for entity builders.
 type Entity func(*sql.Selector)
 
 // File is the predicate function for file builders.
 type File func(*sql.Selector)
+
+// User is the predicate function for user builders.
+type User func(*sql.Selector)

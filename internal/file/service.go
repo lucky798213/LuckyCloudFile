@@ -50,15 +50,17 @@ func NewService(client *ent.Client, store *storage.Local) *Service {
 	return &Service{client: client, store: store}
 }
 
-// Upload 把 r 的内容存成文件，并在数据库里登记 File 和 Entity。
+// Upload 把 r 的内容存成 ownerID 用户的文件，并在数据库里登记 File 和 Entity。
+//
+// ownerID 只能来自登录会话，不能来自请求体或 URL。
 //
 // 顺序是：
 //  1. 生成两个随机 ID：File 的公开 ID、Entity 的磁盘 key
 //  2. 先把内容写进磁盘（临时文件 → Rename）
-//  3. 再在一个事务里写 Entity 和 File 两行
+//  3. 再在一个事务里写 Entity 和 File 两行，File 的 owner_id 填当前用户
 //
 // 如果第 3 步失败，会把第 2 步写好的磁盘文件删掉，避免“磁盘有、库里没有”的孤儿文件。
-func (s *Service) Upload(ctx context.Context, name string, r io.Reader) (File, error) {
+func (s *Service) Upload(ctx context.Context, ownerID int, name string, r io.Reader) (File, error) {
 	fileID, err := newID()
 	if err != nil {
 		return File{}, err
@@ -78,7 +80,7 @@ func (s *Service) Upload(ctx context.Context, name string, r io.Reader) (File, e
 	}
 
 	// 再写数据库。失败就回滚磁盘，保证两边一致。
-	if err := s.saveRecords(ctx, fileID, storageKey, name, size); err != nil {
+	if err := s.saveRecords(ctx, ownerID, fileID, storageKey, name, size); err != nil {
 		_ = s.store.Remove(storageKey)
 		return File{}, err
 	}
@@ -90,7 +92,7 @@ func (s *Service) Upload(ctx context.Context, name string, r io.Reader) (File, e
 //
 // 两个表必须一起成功：只有 File 没有 Entity，就不知道内容在哪；
 // 只有 Entity 没有 File，就是一份没人引用的孤儿内容。
-func (s *Service) saveRecords(ctx context.Context, fileID, storageKey, name string, size int64) error {
+func (s *Service) saveRecords(ctx context.Context, ownerID int, fileID, storageKey, name string, size int64) error {
 	tx, err := s.client.Tx(ctx)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
@@ -111,6 +113,7 @@ func (s *Service) saveRecords(ctx context.Context, fileID, storageKey, name stri
 		SetID(fileID).
 		SetName(name).
 		SetEntity(entity).
+		SetOwnerID(ownerID).
 		Save(ctx); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("create file: %w", err)
@@ -122,13 +125,13 @@ func (s *Service) saveRecords(ctx context.Context, fileID, storageKey, name stri
 	return nil
 }
 
-// Open 按 ID 查数据库，然后打开对应的磁盘文件。
+// Open 只打开 ownerID 用户自己的文件。
 //
-// 这里不会拿客户端传来的字符串去拼路径：
-// 只有数据库里真实存在的 ID 才会走到 Entity.StorageKey。
-func (s *Service) Open(ctx context.Context, id string) (File, io.ReadCloser, error) {
+// “ID 存在”不代表“当前用户能下载”：查询必须同时匹配文件 ID 和 owner_id。
+// 别人的文件与不存在的文件都返回 ErrNotFound，避免泄露文件是否存在。
+func (s *Service) Open(ctx context.Context, ownerID int, id string) (File, io.ReadCloser, error) {
 	record, err := s.client.File.Query().
-		Where(entfile.ID(id)).
+		Where(entfile.ID(id), entfile.OwnerID(ownerID)).
 		WithEntity().
 		Only(ctx)
 	if err != nil {
@@ -155,7 +158,7 @@ func (s *Service) Open(ctx context.Context, id string) (File, io.ReadCloser, err
 	return File{ID: record.ID, Name: record.Name, Size: entity.Size}, f, nil
 }
 
-// Delete 删除文件：先删磁盘内容，再在事务里删数据库记录。
+// Delete 只允许 ownerID 用户删除自己的文件：先删磁盘内容，再在事务里删数据库记录。
 //
 // 为什么先删磁盘？如果磁盘删除失败，数据库不动，文件还能下载、也能重试删除。
 // 反过来先删数据库，磁盘失败就会留下永远没人认识的孤儿文件。
@@ -163,9 +166,9 @@ func (s *Service) Open(ctx context.Context, id string) (File, io.ReadCloser, err
 // 如果磁盘删完、事务却失败了：数据库里还有记录，但磁盘文件已经没了。
 // 再调一次 Delete 时，磁盘不存在会被当成“已经删了”，然后继续把数据库记录删掉，
 // 所以重试是安全的。
-func (s *Service) Delete(ctx context.Context, id string) error {
+func (s *Service) Delete(ctx context.Context, ownerID int, id string) error {
 	record, err := s.client.File.Query().
-		Where(entfile.ID(id)).
+		Where(entfile.ID(id), entfile.OwnerID(ownerID)).
 		WithEntity().
 		Only(ctx)
 	if err != nil {

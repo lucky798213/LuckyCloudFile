@@ -56,20 +56,6 @@ func (_u *FileUpdate) SetNillableParent(v *string) *FileUpdate {
 	return _u
 }
 
-// SetOwner sets the "owner" field.
-func (_u *FileUpdate) SetOwner(v string) *FileUpdate {
-	_u.mutation.SetOwner(v)
-	return _u
-}
-
-// SetNillableOwner sets the "owner" field if the given value is not nil.
-func (_u *FileUpdate) SetNillableOwner(v *string) *FileUpdate {
-	if v != nil {
-		_u.SetOwner(*v)
-	}
-	return _u
-}
-
 // SetEntityID sets the "entity" edge to the Entity entity by ID.
 func (_u *FileUpdate) SetEntityID(id int) *FileUpdate {
 	_u.mutation.SetEntityID(id)
@@ -129,6 +115,9 @@ func (_u *FileUpdate) check() error {
 	if _u.mutation.EntityCleared() && len(_u.mutation.EntityIDs()) > 0 {
 		return errors.New(`ent: clearing a required unique edge "File.entity"`)
 	}
+	if _u.mutation.OwnerCleared() && len(_u.mutation.OwnerIDs()) > 0 {
+		return errors.New(`ent: clearing a required unique edge "File.owner"`)
+	}
 	return nil
 }
 
@@ -149,9 +138,6 @@ func (_u *FileUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if value, ok := _u.mutation.Parent(); ok {
 		_spec.SetField(file.FieldParent, field.TypeString, value)
-	}
-	if value, ok := _u.mutation.Owner(); ok {
-		_spec.SetField(file.FieldOwner, field.TypeString, value)
 	}
 	if _u.mutation.EntityCleared() {
 		edge := &sqlgraph.EdgeSpec{
@@ -230,20 +216,6 @@ func (_u *FileUpdateOne) SetNillableParent(v *string) *FileUpdateOne {
 	return _u
 }
 
-// SetOwner sets the "owner" field.
-func (_u *FileUpdateOne) SetOwner(v string) *FileUpdateOne {
-	_u.mutation.SetOwner(v)
-	return _u
-}
-
-// SetNillableOwner sets the "owner" field if the given value is not nil.
-func (_u *FileUpdateOne) SetNillableOwner(v *string) *FileUpdateOne {
-	if v != nil {
-		_u.SetOwner(*v)
-	}
-	return _u
-}
-
 // SetEntityID sets the "entity" edge to the Entity entity by ID.
 func (_u *FileUpdateOne) SetEntityID(id int) *FileUpdateOne {
 	_u.mutation.SetEntityID(id)
@@ -316,6 +288,9 @@ func (_u *FileUpdateOne) check() error {
 	if _u.mutation.EntityCleared() && len(_u.mutation.EntityIDs()) > 0 {
 		return errors.New(`ent: clearing a required unique edge "File.entity"`)
 	}
+	if _u.mutation.OwnerCleared() && len(_u.mutation.OwnerIDs()) > 0 {
+		return errors.New(`ent: clearing a required unique edge "File.owner"`)
+	}
 	return nil
 }
 
@@ -353,9 +328,6 @@ func (_u *FileUpdateOne) sqlSave(ctx context.Context) (_node *File, err error) {
 	}
 	if value, ok := _u.mutation.Parent(); ok {
 		_spec.SetField(file.FieldParent, field.TypeString, value)
-	}
-	if value, ok := _u.mutation.Owner(); ok {
-		_spec.SetField(file.FieldOwner, field.TypeString, value)
 	}
 	if _u.mutation.EntityCleared() {
 		edge := &sqlgraph.EdgeSpec{

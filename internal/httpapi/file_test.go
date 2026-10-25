@@ -28,16 +28,18 @@ type fakeFileService struct {
 	nextID   int
 	records  map[string]file.File
 	contents map[string][]byte
+	owners   map[string]int
 }
 
 func newFakeFileService() *fakeFileService {
 	return &fakeFileService{
 		records:  make(map[string]file.File),
 		contents: make(map[string][]byte),
+		owners:   make(map[string]int),
 	}
 }
 
-func (f *fakeFileService) Upload(ctx context.Context, name string, r io.Reader) (file.File, error) {
+func (f *fakeFileService) Upload(ctx context.Context, ownerID int, name string, r io.Reader) (file.File, error) {
 	// 测试替身把内容读进内存就够了，不用真的写磁盘。
 	data, err := io.ReadAll(io.LimitReader(r, file.MaxUploadBytes+1))
 	if err != nil {
@@ -54,27 +56,29 @@ func (f *fakeFileService) Upload(ctx context.Context, name string, r io.Reader) 
 	record := file.File{ID: id, Name: name, Size: int64(len(data))}
 	f.records[id] = record
 	f.contents[id] = data
+	f.owners[id] = ownerID
 	return record, nil
 }
 
-func (f *fakeFileService) Open(ctx context.Context, id string) (file.File, io.ReadCloser, error) {
+func (f *fakeFileService) Open(ctx context.Context, ownerID int, id string) (file.File, io.ReadCloser, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	record, ok := f.records[id]
-	if !ok {
+	if !ok || f.owners[id] != ownerID {
 		return file.File{}, nil, file.ErrNotFound
 	}
 	return record, io.NopCloser(bytes.NewReader(f.contents[id])), nil
 }
 
-func (f *fakeFileService) Delete(ctx context.Context, id string) error {
+func (f *fakeFileService) Delete(ctx context.Context, ownerID int, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.records[id]; !ok {
+	if _, ok := f.records[id]; !ok || f.owners[id] != ownerID {
 		return file.ErrNotFound
 	}
 	delete(f.records, id)
 	delete(f.contents, id)
+	delete(f.owners, id)
 	return nil
 }
 
@@ -85,15 +89,21 @@ func (f *fakeFileService) stored(id string) ([]byte, bool) {
 	return data, ok
 }
 
-// newTestRouter 创建一个使用假文件服务的路由，测试之间互不影响。
+// newTestRouter 创建一个使用假文件/认证服务的路由，测试之间互不影响。
 func newTestRouter(t *testing.T) (http.Handler, *fakeFileService) {
 	t.Helper()
 	fake := newFakeFileService()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	return NewRouter(logger, fake), fake
+	return NewRouter(logger, fake, newFakeAuthService()), fake
 }
 
-// uploadRequest 构造一个 multipart/form-data 上传请求。
+// authorize 给请求加上 A 或 B 的测试 Token。
+func authorize(req *http.Request, token string) *http.Request {
+	req.Header.Set("Authorization", "Bearer "+token)
+	return req
+}
+
+// uploadRequest 构造一个 multipart/form-data 上传请求，默认以 A 登录。
 func uploadRequest(t *testing.T, field, filename string, content []byte) *http.Request {
 	t.Helper()
 
@@ -112,7 +122,7 @@ func uploadRequest(t *testing.T, field, filename string, content []byte) *http.R
 
 	req := httptest.NewRequest(http.MethodPost, "/api/files", &body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
-	return req
+	return authorize(req, testTokenA)
 }
 
 // upload 上传一个文件并返回解析后的记录。
@@ -197,6 +207,7 @@ func TestUploadMissingFileField(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/files", &body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
+	authorize(req, testTokenA)
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, req)
@@ -278,12 +289,53 @@ func TestUploadRejectsNonMultipart(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/files", strings.NewReader("raw body"))
 	req.Header.Set("Content-Type", "text/plain")
+	authorize(req, testTokenA)
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, req)
 
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("wanted 400, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestFileOwnershipIsolation 证明 B 知道 A 的文件 ID 也操作不了，
+// 并且 B 的失败不会破坏 A 的文件。
+func TestFileOwnershipIsolation(t *testing.T) {
+	router, _ := newTestRouter(t)
+	content := []byte("only A can read this")
+
+	record := upload(t, router, content)
+
+	// B 知道准确的 ID，但下载必须得到 404。
+	byB := httptest.NewRecorder()
+	router.ServeHTTP(byB, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+record.ID, nil), testTokenB))
+	if byB.Code != http.StatusNotFound {
+		t.Fatalf("B download wanted 404, got %d: %s", byB.Code, byB.Body.String())
+	}
+
+	// B 删除同样得到 404。
+	deleteByB := httptest.NewRecorder()
+	router.ServeHTTP(deleteByB, authorize(httptest.NewRequest(http.MethodDelete, "/api/files/"+record.ID, nil), testTokenB))
+	if deleteByB.Code != http.StatusNotFound {
+		t.Fatalf("B delete wanted 404, got %d: %s", deleteByB.Code, deleteByB.Body.String())
+	}
+
+	// A 仍然能完整下载，证明 B 的失败没有影响文件。
+	byA := httptest.NewRecorder()
+	router.ServeHTTP(byA, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+record.ID, nil), testTokenA))
+	if byA.Code != http.StatusOK {
+		t.Fatalf("A download after B failed wanted 200, got %d: %s", byA.Code, byA.Body.String())
+	}
+	if !bytes.Equal(byA.Body.Bytes(), content) {
+		t.Fatalf("A content changed after B failed: %q", byA.Body.Bytes())
+	}
+
+	// 最后 A 可以删除自己的文件。
+	deleteByA := httptest.NewRecorder()
+	router.ServeHTTP(deleteByA, authorize(httptest.NewRequest(http.MethodDelete, "/api/files/"+record.ID, nil), testTokenA))
+	if deleteByA.Code != http.StatusNoContent {
+		t.Fatalf("A delete wanted 204, got %d", deleteByA.Code)
 	}
 }
 
@@ -297,7 +349,7 @@ func TestUploadDownloadDelete(t *testing.T) {
 	record := upload(t, router, content)
 
 	download := httptest.NewRecorder()
-	router.ServeHTTP(download, httptest.NewRequest(http.MethodGet, "/api/files/"+record.ID, nil))
+	router.ServeHTTP(download, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+record.ID, nil), testTokenA))
 	if download.Code != http.StatusOK {
 		t.Fatalf("wanted 200, got %d: %s", download.Code, download.Body.String())
 	}
@@ -312,7 +364,7 @@ func TestUploadDownloadDelete(t *testing.T) {
 	}
 
 	deleted := httptest.NewRecorder()
-	router.ServeHTTP(deleted, httptest.NewRequest(http.MethodDelete, "/api/files/"+record.ID, nil))
+	router.ServeHTTP(deleted, authorize(httptest.NewRequest(http.MethodDelete, "/api/files/"+record.ID, nil), testTokenA))
 	if deleted.Code != http.StatusNoContent {
 		t.Fatalf("wanted 204, got %d: %s", deleted.Code, deleted.Body.String())
 	}
@@ -321,9 +373,48 @@ func TestUploadDownloadDelete(t *testing.T) {
 	}
 
 	after := httptest.NewRecorder()
-	router.ServeHTTP(after, httptest.NewRequest(http.MethodGet, "/api/files/"+record.ID, nil))
+	router.ServeHTTP(after, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+record.ID, nil), testTokenA))
 	if after.Code != http.StatusNotFound {
 		t.Fatalf("wanted 404 after delete, got %d", after.Code)
+	}
+}
+
+func TestFileEndpointsRequireLogin(t *testing.T) {
+	router, fake := newTestRouter(t)
+
+	requests := []*http.Request{
+		uploadRequest(t, "file", "a.txt", []byte("x")),
+		httptest.NewRequest(http.MethodGet, "/api/files/whatever", nil),
+		httptest.NewRequest(http.MethodDelete, "/api/files/whatever", nil),
+	}
+	for _, req := range requests {
+		// uploadRequest 默认带 A 的 Token；这里统一去掉，验证未登录行为。
+		req.Header.Del("Authorization")
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("%s %s without token: wanted 401, got %d: %s",
+				req.Method, req.URL.Path, recorder.Code, recorder.Body.String())
+		}
+		var response ErrorResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Code != "unauthorized" {
+			t.Fatalf("code = %q, want unauthorized", response.Code)
+		}
+	}
+
+	// 无效 Token 也不能上传，更不能留下文件。
+	req := uploadRequest(t, "file", "a.txt", []byte("x"))
+	req.Header.Set("Authorization", "Bearer not-a-real-token")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid token: wanted 401, got %d", recorder.Code)
+	}
+	if len(fake.records) != 0 {
+		t.Fatal("unauthenticated upload must not be stored")
 	}
 }
 
@@ -331,7 +422,7 @@ func TestDownloadUnknownID(t *testing.T) {
 	router, _ := newTestRouter(t)
 
 	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/files/does-not-exist", nil))
+	router.ServeHTTP(recorder, authorize(httptest.NewRequest(http.MethodGet, "/api/files/does-not-exist", nil), testTokenA))
 
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("wanted 404, got %d", recorder.Code)
@@ -349,7 +440,7 @@ func TestDeleteUnknownID(t *testing.T) {
 	router, _ := newTestRouter(t)
 
 	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodDelete, "/api/files/does-not-exist", nil))
+	router.ServeHTTP(recorder, authorize(httptest.NewRequest(http.MethodDelete, "/api/files/does-not-exist", nil), testTokenA))
 
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("wanted 404, got %d", recorder.Code)

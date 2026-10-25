@@ -24,11 +24,12 @@ func (File) Fields() []ent.Field {
 		// 用户看到的原始文件名，只用于展示和下载时的 Content-Disposition。
 		field.String("name").NotEmpty(),
 
-		// 父目录。P2 还没有目录表，先用逻辑路径表示（例如 "/"、"/photos"）。
+		// 父目录。本阶段还没有目录表，先用逻辑路径表示（例如 "/"、"/photos"）。
 		field.String("parent").Default("/"),
 
-		// 所有者。P2 还没有用户表，先固定成 local。
-		field.String("owner").Default("local"),
+		// 文件所有者的用户 ID。它和下面的 owner 边共用同一列；
+		// 上传后不允许修改，防止文件被转移到别的用户名下。
+		field.Int("owner_id").Immutable(),
 	}
 }
 
@@ -37,5 +38,9 @@ func (File) Edges() []ent.Edge {
 	return []ent.Edge{
 		// 一个 File 必须对应一个 Entity；Entity 可以被多个 File 引用。
 		edge.To("entity", Entity.Type).Unique().Required(),
+
+		// 文件所有者。生成的 owner_id 列只能由服务端根据登录会话填写，
+		// 下载和删除时也必须用当前用户的 ID 一起查询。
+		edge.From("owner", User.Type).Ref("files").Unique().Field("owner_id").Immutable().Required(),
 	}
 }

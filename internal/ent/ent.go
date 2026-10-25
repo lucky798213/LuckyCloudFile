@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"luckyCloudFile/internal/ent/authsession"
 	"luckyCloudFile/internal/ent/entity"
 	"luckyCloudFile/internal/ent/file"
+	"luckyCloudFile/internal/ent/user"
 	"reflect"
 	"sync"
 
@@ -74,8 +76,10 @@ var (
 func checkColumn(t, c string) error {
 	initCheck.Do(func() {
 		columnCheck = sql.NewColumnCheck(map[string]func(string) bool{
-			entity.Table: entity.ValidColumn,
-			file.Table:   file.ValidColumn,
+			authsession.Table: authsession.ValidColumn,
+			entity.Table:      entity.ValidColumn,
+			file.Table:        file.ValidColumn,
+			user.Table:        user.ValidColumn,
 		})
 	})
 	return columnCheck(t, c)

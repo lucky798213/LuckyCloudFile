@@ -28,16 +28,16 @@ type ErrorResponse struct {
 // 这里用接口而不是直接写 *file.Service，是为了让 HTTP 层的测试
 // 可以用一个不连数据库的假实现；生产代码传进去的仍然是 *file.Service。
 type fileService interface {
-	Upload(ctx context.Context, name string, r io.Reader) (file.File, error)
-	Open(ctx context.Context, id string) (file.File, io.ReadCloser, error)
-	Delete(ctx context.Context, id string) error
+	Upload(ctx context.Context, ownerID int, name string, r io.Reader) (file.File, error)
+	Open(ctx context.Context, ownerID int, id string) (file.File, io.ReadCloser, error)
+	Delete(ctx context.Context, ownerID int, id string) error
 }
 
 // NewRouter 创建并配置好路由。
 //
-// logger 和 fileService 都从参数传进来，而不是在包里自己创建：
+// logger、fileService 和 authService 都从参数传进来，而不是在包里自己创建：
 // 这样整个程序共用同一套对象，测试时也能换成假的实现。
-func NewRouter(logger *slog.Logger, fileService fileService) *gin.Engine {
+func NewRouter(logger *slog.Logger, fileService fileService, authService authService) *gin.Engine {
 	// gin.New() 创建一个空引擎。
 	// 不用 gin.Default()，是因为它自带日志和 panic 恢复中间件，
 	// 而我们的日志格式要自己控制（JSON、带耗时），所以中间件自己加。
@@ -51,14 +51,21 @@ func NewRouter(logger *slog.Logger, fileService fileService) *gin.Engine {
 	r.Use(requestLogger(logger))
 	r.Use(recoverPanic(logger))
 
-	// 健康检查：证明 HTTP 进程还活着。
+	// 健康检查：证明 HTTP 进程还活着，不需要登录。
 	r.GET("/healthz", health)
 
+	// 登录是唯一的公开业务接口：没有 Token 的人才需要它。
+	r.POST("/api/auth/login", login(logger, authService))
+
+	// 下面这些接口都先经过 Token 校验，再进入各自的处理函数。
+	protected := r.Group("/api")
+	protected.Use(requireAuth(logger, authService))
+	protected.POST("/auth/logout", logout(logger, authService))
 	// 文件上传：请求体是 multipart/form-data，文件放在 file 字段里。
-	r.POST("/api/files", uploadFile(logger, fileService))
-	// 文件下载和删除：:id 是上传时返回的服务端 ID。
-	r.GET("/api/files/:id", downloadFile(logger, fileService))
-	r.DELETE("/api/files/:id", deleteFile(logger, fileService))
+	protected.POST("/files", uploadFile(logger, fileService))
+	// 文件下载和删除：:id 是上传时返回的服务端 ID，且必须属于当前用户。
+	protected.GET("/files/:id", downloadFile(logger, fileService))
+	protected.DELETE("/files/:id", deleteFile(logger, fileService))
 
 	// 兜底：没匹配到任何路由时，返回统一的 JSON 错误，而不是 Gin 默认的纯文本 404。
 	r.NoRoute(notFound)

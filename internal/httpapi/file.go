@@ -47,6 +47,13 @@ var (
 //	{"id":"3f2a...","name":"a.txt","size":1234}
 func uploadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// 用户 ID 只能来自鉴权中间件写入的登录会话。
+		ownerID, ok := currentUserID(c)
+		if !ok {
+			respondInternalError(c, logger, "upload file: missing authenticated user")
+			return
+		}
+
 		// 第一道限制：整个请求体不能无限大，防止有人往死里发。
 		// 注意这里加上了 multipart 的余量，真正的“32 MiB”由下面的 Service 精确检查。
 		c.Request.Body = http.MaxBytesReader(
@@ -85,7 +92,7 @@ func uploadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 
 		// part 是一个“还没读完的数据流”，直接交给 Service。
 		// 文件名只作为元数据保存，磁盘上的文件名用服务端生成的 ID。
-		record, err := svc.Upload(c.Request.Context(), filepath.Base(part.FileName()), part)
+		record, err := svc.Upload(c.Request.Context(), ownerID, filepath.Base(part.FileName()), part)
 		if err != nil {
 			if isTooLarge(err) {
 				respondTooLarge(c)
@@ -106,11 +113,18 @@ func uploadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 
 // downloadFile 处理 GET /api/files/:id。
 //
-// 它先把 ID 拿到内存索引里查：查不到直接 404，不会拿任意字符串去拼磁盘路径。
+// Service 会同时按文件 ID 和当前用户 ID 查询：查不到直接 404，
+// 既不会拿任意字符串去拼磁盘路径，也不会把别人的文件暴露给当前用户。
 // 查到了就打开文件，用 io.Copy 流式写回响应，不把整个文件读进内存。
 func downloadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		record, f, err := svc.Open(c.Request.Context(), c.Param("id"))
+		ownerID, ok := currentUserID(c)
+		if !ok {
+			respondInternalError(c, logger, "download file: missing authenticated user")
+			return
+		}
+
+		record, f, err := svc.Open(c.Request.Context(), ownerID, c.Param("id"))
 		if errors.Is(err, file.ErrNotFound) {
 			c.JSON(http.StatusNotFound, ErrorResponse{
 				Code:    "file_not_found",
@@ -146,10 +160,17 @@ func downloadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 
 // deleteFile 处理 DELETE /api/files/:id。
 //
-// 成功返回 204（No Content，没有响应正文）；ID 不存在返回 404。
+// 成功返回 204（No Content，没有响应正文）；
+// 文件不存在或不属于当前用户，统一返回 404。
 func deleteFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		err := svc.Delete(c.Request.Context(), c.Param("id"))
+		ownerID, ok := currentUserID(c)
+		if !ok {
+			respondInternalError(c, logger, "delete file: missing authenticated user")
+			return
+		}
+
+		err := svc.Delete(c.Request.Context(), ownerID, c.Param("id"))
 		switch {
 		case errors.Is(err, file.ErrNotFound):
 			c.JSON(http.StatusNotFound, ErrorResponse{
@@ -214,5 +235,14 @@ func respondTooLarge(c *gin.Context) {
 	c.JSON(http.StatusRequestEntityTooLarge, ErrorResponse{
 		Code:    "file_too_large",
 		Message: fmt.Sprintf("file must be at most %d MiB", file.MaxUploadBytes/(1<<20)),
+	})
+}
+
+// respondInternalError 记录只给服务端看的细节，对客户端返回统一的 500。
+func respondInternalError(c *gin.Context, logger *slog.Logger, message string) {
+	logger.Error(message, "path", c.Request.URL.Path)
+	c.JSON(http.StatusInternalServerError, ErrorResponse{
+		Code:    "internal_error",
+		Message: "internal server error",
 	})
 }

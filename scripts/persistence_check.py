@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""P2 验收：上传 → 重启服务 → 按原 ID 下载，内容 SHA-256 不变。
+"""登录验收：已存在账号登录 → 上传 → 重启服务 → 用原 Token 按原 ID 下载 → 删除 → 退出。
 
-前提：MySQL 已启动（docker compose up -d），且已建好 luckycloudfile 库。
+前提：
+  - MySQL 已启动（docker compose up -d），且已建好 luckycloudfile 库；
+  - 账号已经通过 cmd/createuser 显式创建；
+  - 通过 CLOUDREVE_TEST_USERNAME / CLOUDREVE_TEST_PASSWORD 提供账号和密码。
+
+正常启动本脚本启动的服务不会自动创建任何账号。
 """
 
 import hashlib
@@ -17,6 +22,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
+    username = os.environ.get("CLOUDREVE_TEST_USERNAME", "A")
+    password = os.environ.get("CLOUDREVE_TEST_PASSWORD")
+    if not password:
+        raise SystemExit("请通过 CLOUDREVE_TEST_PASSWORD 提供已初始化账号的密码")
+
     db_host = os.environ.get("CLOUDREVE_DB_HOST", "127.0.0.1")
     db_port = os.environ.get("CLOUDREVE_DB_PORT", "3306")
     db_user = os.environ.get("CLOUDREVE_DB_USER", "lucky")
@@ -67,8 +77,25 @@ def main():
             assert process.returncode == 0, output
             assert '"msg":"http stopped"' in output, output
 
-        def upload(address, content):
-            boundary = "----luckycloudfile-p2"
+        def login(address):
+            body = json.dumps({"username": username, "password": password}).encode()
+            request = urllib.request.Request(
+                f"http://{address}/api/auth/login",
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with opener.open(request, timeout=10) as response:
+                assert response.status == 200, response.status
+                token = json.load(response)["token"]
+                assert token, "login returned an empty token"
+                return token
+
+        def headers(token):
+            return {"Authorization": f"Bearer {token}"}
+
+        def upload(address, token, content):
+            boundary = "----luckycloudfile-p3"
             body = (
                 f"--{boundary}\r\n"
                 'Content-Disposition: form-data; name="file"; filename="payload.bin"\r\n'
@@ -78,22 +105,39 @@ def main():
                 f"http://{address}/api/files",
                 data=body,
                 method="POST",
-                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    **headers(token),
+                },
             )
             with opener.open(request, timeout=30) as response:
                 assert response.status == 201, response.status
                 return json.load(response)
 
-        def download(address, file_id):
-            with opener.open(f"http://{address}/api/files/{file_id}", timeout=30) as response:
+        def download(address, token, file_id):
+            request = urllib.request.Request(
+                f"http://{address}/api/files/{file_id}", headers=headers(token)
+            )
+            with opener.open(request, timeout=30) as response:
                 assert response.status == 200, response.status
                 return response.read()
 
-        def delete(address, file_id):
+        def delete(address, token, file_id):
             request = urllib.request.Request(
-                f"http://{address}/api/files/{file_id}", method="DELETE"
+                f"http://{address}/api/files/{file_id}",
+                method="DELETE",
+                headers=headers(token),
             )
             with opener.open(request, timeout=30) as response:
+                assert response.status == 204, response.status
+
+        def logout(address, token):
+            request = urllib.request.Request(
+                f"http://{address}/api/auth/logout",
+                method="POST",
+                headers=headers(token),
+            )
+            with opener.open(request, timeout=10) as response:
                 assert response.status == 204, response.status
 
         try:
@@ -101,7 +145,9 @@ def main():
             before = hashlib.sha256(content).hexdigest()
 
             first, address = start()
-            record = upload(address, content)
+            token = login(address)
+            print("PASS: login A -> token received")
+            record = upload(address, token, content)
             file_id = record["id"]
             assert record["size"] == len(content), record
             print(f"PASS: upload -> id={file_id}, size={record['size']}")
@@ -109,13 +155,17 @@ def main():
 
             # 关键一步：同一个二进制、同一个库、同一个存储目录，重新启动。
             second, address = start()
-            downloaded = download(address, file_id)
+            # Token 和文件都存在 MySQL 里，进程重启不会让已登录的会话失效。
+            downloaded = download(address, token, file_id)
             after = hashlib.sha256(downloaded).hexdigest()
             assert after == before, f"SHA-256 changed: {before} != {after}"
             print("PASS: restart -> download by original ID, SHA-256 unchanged")
 
-            delete(address, file_id)
+            delete(address, token, file_id)
             print("PASS: delete after restart")
+
+            logout(address, token)
+            print("PASS: logout -> token revoked")
             stop(second)
         finally:
             for process in processes:

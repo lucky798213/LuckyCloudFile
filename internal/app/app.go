@@ -17,6 +17,7 @@ import (
 	"os"
 	"time"
 
+	"luckyCloudFile/internal/auth"
 	"luckyCloudFile/internal/config"
 	"luckyCloudFile/internal/database"
 	"luckyCloudFile/internal/file"
@@ -43,16 +44,17 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 	defer db.Close()
 
-	// 第三步：创建“存储 → 文件业务 → 路由”这条调用链。
+	// 第三步：创建“存储 → 文件业务 → 认证 → 路由”这条调用链。
 	// 这里是整个程序唯一一处把它们组装起来的地方，
 	// 以后换成 S3，只要改这一行的存储实现。
 	store := storage.NewLocal(cfg.Storage.LocalRoot)
 	fileService := file.NewService(db, store)
+	authService := auth.NewService(db)
 
 	// 第四步：创建 HTTP Server。它只是一个“配置好的对象”，还没开始监听。
 	// Handler 就是路由表，来自 internal/httpapi。
 	server := &http.Server{
-		Handler: httpapi.NewRouter(logger, fileService),
+		Handler: httpapi.NewRouter(logger, fileService, authService),
 		// 读请求头的超时，防止有人只连接不发数据把连接一直占着。
 		ReadHeaderTimeout: 5 * time.Second,
 		// 读整个请求（含上传的文件）最多花 5 分钟。

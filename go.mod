@@ -7,6 +7,8 @@ require (
 	github.com/gin-gonic/gin v1.11.0
 	github.com/go-ini/ini v1.50.0
 	github.com/go-sql-driver/mysql v1.9.3
+	golang.org/x/crypto v0.40.0
+	golang.org/x/term v0.34.0
 )
 
 require (
@@ -47,7 +49,6 @@ require (
 	github.com/zclconf/go-cty-yaml v1.1.0 // indirect
 	go.uber.org/mock v0.5.0 // indirect
 	golang.org/x/arch v0.20.0 // indirect
-	golang.org/x/crypto v0.40.0 // indirect
 	golang.org/x/mod v0.25.0 // indirect
 	golang.org/x/net v0.42.0 // indirect
 	golang.org/x/sync v0.16.0 // indirect

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"luckyCloudFile/internal/ent/entity"
 	"luckyCloudFile/internal/ent/file"
+	"luckyCloudFile/internal/ent/user"
 
 	"entgo.io/ent/dialect/sql/sqlgraph"
 	"entgo.io/ent/schema/field"
@@ -40,17 +41,9 @@ func (_c *FileCreate) SetNillableParent(v *string) *FileCreate {
 	return _c
 }
 
-// SetOwner sets the "owner" field.
-func (_c *FileCreate) SetOwner(v string) *FileCreate {
-	_c.mutation.SetOwner(v)
-	return _c
-}
-
-// SetNillableOwner sets the "owner" field if the given value is not nil.
-func (_c *FileCreate) SetNillableOwner(v *string) *FileCreate {
-	if v != nil {
-		_c.SetOwner(*v)
-	}
+// SetOwnerID sets the "owner_id" field.
+func (_c *FileCreate) SetOwnerID(v int) *FileCreate {
+	_c.mutation.SetOwnerID(v)
 	return _c
 }
 
@@ -69,6 +62,11 @@ func (_c *FileCreate) SetEntityID(id int) *FileCreate {
 // SetEntity sets the "entity" edge to the Entity entity.
 func (_c *FileCreate) SetEntity(v *Entity) *FileCreate {
 	return _c.SetEntityID(v.ID)
+}
+
+// SetOwner sets the "owner" edge to the User entity.
+func (_c *FileCreate) SetOwner(v *User) *FileCreate {
+	return _c.SetOwnerID(v.ID)
 }
 
 // Mutation returns the FileMutation object of the builder.
@@ -110,10 +108,6 @@ func (_c *FileCreate) defaults() {
 		v := file.DefaultParent
 		_c.mutation.SetParent(v)
 	}
-	if _, ok := _c.mutation.Owner(); !ok {
-		v := file.DefaultOwner
-		_c.mutation.SetOwner(v)
-	}
 }
 
 // check runs all checks and user-defined validators on the builder.
@@ -129,11 +123,14 @@ func (_c *FileCreate) check() error {
 	if _, ok := _c.mutation.Parent(); !ok {
 		return &ValidationError{Name: "parent", err: errors.New(`ent: missing required field "File.parent"`)}
 	}
-	if _, ok := _c.mutation.Owner(); !ok {
-		return &ValidationError{Name: "owner", err: errors.New(`ent: missing required field "File.owner"`)}
+	if _, ok := _c.mutation.OwnerID(); !ok {
+		return &ValidationError{Name: "owner_id", err: errors.New(`ent: missing required field "File.owner_id"`)}
 	}
 	if len(_c.mutation.EntityIDs()) == 0 {
 		return &ValidationError{Name: "entity", err: errors.New(`ent: missing required edge "File.entity"`)}
+	}
+	if len(_c.mutation.OwnerIDs()) == 0 {
+		return &ValidationError{Name: "owner", err: errors.New(`ent: missing required edge "File.owner"`)}
 	}
 	return nil
 }
@@ -178,10 +175,6 @@ func (_c *FileCreate) createSpec() (*File, *sqlgraph.CreateSpec) {
 		_spec.SetField(file.FieldParent, field.TypeString, value)
 		_node.Parent = value
 	}
-	if value, ok := _c.mutation.Owner(); ok {
-		_spec.SetField(file.FieldOwner, field.TypeString, value)
-		_node.Owner = value
-	}
 	if nodes := _c.mutation.EntityIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
 			Rel:     sqlgraph.M2O,
@@ -197,6 +190,23 @@ func (_c *FileCreate) createSpec() (*File, *sqlgraph.CreateSpec) {
 			edge.Target.Nodes = append(edge.Target.Nodes, k)
 		}
 		_node.file_entity = &nodes[0]
+		_spec.Edges = append(_spec.Edges, edge)
+	}
+	if nodes := _c.mutation.OwnerIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.M2O,
+			Inverse: true,
+			Table:   file.OwnerTable,
+			Columns: []string{file.OwnerColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(user.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_node.OwnerID = nodes[0]
 		_spec.Edges = append(_spec.Edges, edge)
 	}
 	return _node, _spec

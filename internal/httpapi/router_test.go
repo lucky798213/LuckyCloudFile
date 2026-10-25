@@ -14,7 +14,7 @@ import (
 
 func TestRoutes(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	r := NewRouter(logger, newFakeFileService())
+	r := NewRouter(logger, newFakeFileService(), newFakeAuthService())
 	r.GET("/panic", func(c *gin.Context) { panic("SECRET") })
 	for _, tc := range []struct {
 		method, path string

@@ -8,6 +8,27 @@ import (
 )
 
 var (
+	// AuthSessionsColumns holds the columns for the "auth_sessions" table.
+	AuthSessionsColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeInt, Increment: true},
+		{Name: "token_hash", Type: field.TypeString, Unique: true},
+		{Name: "expires_at", Type: field.TypeTime},
+		{Name: "user_id", Type: field.TypeInt},
+	}
+	// AuthSessionsTable holds the schema information for the "auth_sessions" table.
+	AuthSessionsTable = &schema.Table{
+		Name:       "auth_sessions",
+		Columns:    AuthSessionsColumns,
+		PrimaryKey: []*schema.Column{AuthSessionsColumns[0]},
+		ForeignKeys: []*schema.ForeignKey{
+			{
+				Symbol:     "auth_sessions_users_sessions",
+				Columns:    []*schema.Column{AuthSessionsColumns[3]},
+				RefColumns: []*schema.Column{UsersColumns[0]},
+				OnDelete:   schema.NoAction,
+			},
+		},
+	}
 	// EntitiesColumns holds the columns for the "entities" table.
 	EntitiesColumns = []*schema.Column{
 		{Name: "id", Type: field.TypeInt, Increment: true},
@@ -27,8 +48,8 @@ var (
 		{Name: "id", Type: field.TypeString, Unique: true},
 		{Name: "name", Type: field.TypeString},
 		{Name: "parent", Type: field.TypeString, Default: "/"},
-		{Name: "owner", Type: field.TypeString, Default: "local"},
 		{Name: "file_entity", Type: field.TypeInt},
+		{Name: "owner_id", Type: field.TypeInt},
 	}
 	// FilesTable holds the schema information for the "files" table.
 	FilesTable = &schema.Table{
@@ -38,19 +59,41 @@ var (
 		ForeignKeys: []*schema.ForeignKey{
 			{
 				Symbol:     "files_entities_entity",
-				Columns:    []*schema.Column{FilesColumns[4]},
+				Columns:    []*schema.Column{FilesColumns[3]},
 				RefColumns: []*schema.Column{EntitiesColumns[0]},
+				OnDelete:   schema.NoAction,
+			},
+			{
+				Symbol:     "files_users_files",
+				Columns:    []*schema.Column{FilesColumns[4]},
+				RefColumns: []*schema.Column{UsersColumns[0]},
 				OnDelete:   schema.NoAction,
 			},
 		},
 	}
+	// UsersColumns holds the columns for the "users" table.
+	UsersColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeInt, Increment: true},
+		{Name: "username", Type: field.TypeString, Unique: true},
+		{Name: "password_hash", Type: field.TypeString},
+	}
+	// UsersTable holds the schema information for the "users" table.
+	UsersTable = &schema.Table{
+		Name:       "users",
+		Columns:    UsersColumns,
+		PrimaryKey: []*schema.Column{UsersColumns[0]},
+	}
 	// Tables holds all the tables in the schema.
 	Tables = []*schema.Table{
+		AuthSessionsTable,
 		EntitiesTable,
 		FilesTable,
+		UsersTable,
 	}
 )
 
 func init() {
+	AuthSessionsTable.ForeignKeys[0].RefTable = UsersTable
 	FilesTable.ForeignKeys[0].RefTable = EntitiesTable
+	FilesTable.ForeignKeys[1].RefTable = UsersTable
 }

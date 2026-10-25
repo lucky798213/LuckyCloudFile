@@ -16,10 +16,12 @@ const (
 	FieldName = "name"
 	// FieldParent holds the string denoting the parent field in the database.
 	FieldParent = "parent"
-	// FieldOwner holds the string denoting the owner field in the database.
-	FieldOwner = "owner"
+	// FieldOwnerID holds the string denoting the owner_id field in the database.
+	FieldOwnerID = "owner_id"
 	// EdgeEntity holds the string denoting the entity edge name in mutations.
 	EdgeEntity = "entity"
+	// EdgeOwner holds the string denoting the owner edge name in mutations.
+	EdgeOwner = "owner"
 	// Table holds the table name of the file in the database.
 	Table = "files"
 	// EntityTable is the table that holds the entity relation/edge.
@@ -29,6 +31,13 @@ const (
 	EntityInverseTable = "entities"
 	// EntityColumn is the table column denoting the entity relation/edge.
 	EntityColumn = "file_entity"
+	// OwnerTable is the table that holds the owner relation/edge.
+	OwnerTable = "files"
+	// OwnerInverseTable is the table name for the User entity.
+	// It exists in this package in order to avoid circular dependency with the "user" package.
+	OwnerInverseTable = "users"
+	// OwnerColumn is the table column denoting the owner relation/edge.
+	OwnerColumn = "owner_id"
 )
 
 // Columns holds all SQL columns for file fields.
@@ -36,7 +45,7 @@ var Columns = []string{
 	FieldID,
 	FieldName,
 	FieldParent,
-	FieldOwner,
+	FieldOwnerID,
 }
 
 // ForeignKeys holds the SQL foreign-keys that are owned by the "files"
@@ -65,8 +74,6 @@ var (
 	NameValidator func(string) error
 	// DefaultParent holds the default value on creation for the "parent" field.
 	DefaultParent string
-	// DefaultOwner holds the default value on creation for the "owner" field.
-	DefaultOwner string
 )
 
 // OrderOption defines the ordering options for the File queries.
@@ -87,9 +94,9 @@ func ByParent(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldParent, opts...).ToFunc()
 }
 
-// ByOwner orders the results by the owner field.
-func ByOwner(opts ...sql.OrderTermOption) OrderOption {
-	return sql.OrderByField(FieldOwner, opts...).ToFunc()
+// ByOwnerID orders the results by the owner_id field.
+func ByOwnerID(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldOwnerID, opts...).ToFunc()
 }
 
 // ByEntityField orders the results by entity field.
@@ -98,10 +105,24 @@ func ByEntityField(field string, opts ...sql.OrderTermOption) OrderOption {
 		sqlgraph.OrderByNeighborTerms(s, newEntityStep(), sql.OrderByField(field, opts...))
 	}
 }
+
+// ByOwnerField orders the results by owner field.
+func ByOwnerField(field string, opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newOwnerStep(), sql.OrderByField(field, opts...))
+	}
+}
 func newEntityStep() *sqlgraph.Step {
 	return sqlgraph.NewStep(
 		sqlgraph.From(Table, FieldID),
 		sqlgraph.To(EntityInverseTable, FieldID),
 		sqlgraph.Edge(sqlgraph.M2O, false, EntityTable, EntityColumn),
+	)
+}
+func newOwnerStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(OwnerInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.M2O, true, OwnerTable, OwnerColumn),
 	)
 }

@@ -74,9 +74,9 @@ func Parent(v string) predicate.File {
 	return predicate.File(sql.FieldEQ(FieldParent, v))
 }
 
-// Owner applies equality check predicate on the "owner" field. It's identical to OwnerEQ.
-func Owner(v string) predicate.File {
-	return predicate.File(sql.FieldEQ(FieldOwner, v))
+// OwnerID applies equality check predicate on the "owner_id" field. It's identical to OwnerIDEQ.
+func OwnerID(v int) predicate.File {
+	return predicate.File(sql.FieldEQ(FieldOwnerID, v))
 }
 
 // NameEQ applies the EQ predicate on the "name" field.
@@ -209,69 +209,24 @@ func ParentContainsFold(v string) predicate.File {
 	return predicate.File(sql.FieldContainsFold(FieldParent, v))
 }
 
-// OwnerEQ applies the EQ predicate on the "owner" field.
-func OwnerEQ(v string) predicate.File {
-	return predicate.File(sql.FieldEQ(FieldOwner, v))
+// OwnerIDEQ applies the EQ predicate on the "owner_id" field.
+func OwnerIDEQ(v int) predicate.File {
+	return predicate.File(sql.FieldEQ(FieldOwnerID, v))
 }
 
-// OwnerNEQ applies the NEQ predicate on the "owner" field.
-func OwnerNEQ(v string) predicate.File {
-	return predicate.File(sql.FieldNEQ(FieldOwner, v))
+// OwnerIDNEQ applies the NEQ predicate on the "owner_id" field.
+func OwnerIDNEQ(v int) predicate.File {
+	return predicate.File(sql.FieldNEQ(FieldOwnerID, v))
 }
 
-// OwnerIn applies the In predicate on the "owner" field.
-func OwnerIn(vs ...string) predicate.File {
-	return predicate.File(sql.FieldIn(FieldOwner, vs...))
+// OwnerIDIn applies the In predicate on the "owner_id" field.
+func OwnerIDIn(vs ...int) predicate.File {
+	return predicate.File(sql.FieldIn(FieldOwnerID, vs...))
 }
 
-// OwnerNotIn applies the NotIn predicate on the "owner" field.
-func OwnerNotIn(vs ...string) predicate.File {
-	return predicate.File(sql.FieldNotIn(FieldOwner, vs...))
-}
-
-// OwnerGT applies the GT predicate on the "owner" field.
-func OwnerGT(v string) predicate.File {
-	return predicate.File(sql.FieldGT(FieldOwner, v))
-}
-
-// OwnerGTE applies the GTE predicate on the "owner" field.
-func OwnerGTE(v string) predicate.File {
-	return predicate.File(sql.FieldGTE(FieldOwner, v))
-}
-
-// OwnerLT applies the LT predicate on the "owner" field.
-func OwnerLT(v string) predicate.File {
-	return predicate.File(sql.FieldLT(FieldOwner, v))
-}
-
-// OwnerLTE applies the LTE predicate on the "owner" field.
-func OwnerLTE(v string) predicate.File {
-	return predicate.File(sql.FieldLTE(FieldOwner, v))
-}
-
-// OwnerContains applies the Contains predicate on the "owner" field.
-func OwnerContains(v string) predicate.File {
-	return predicate.File(sql.FieldContains(FieldOwner, v))
-}
-
-// OwnerHasPrefix applies the HasPrefix predicate on the "owner" field.
-func OwnerHasPrefix(v string) predicate.File {
-	return predicate.File(sql.FieldHasPrefix(FieldOwner, v))
-}
-
-// OwnerHasSuffix applies the HasSuffix predicate on the "owner" field.
-func OwnerHasSuffix(v string) predicate.File {
-	return predicate.File(sql.FieldHasSuffix(FieldOwner, v))
-}
-
-// OwnerEqualFold applies the EqualFold predicate on the "owner" field.
-func OwnerEqualFold(v string) predicate.File {
-	return predicate.File(sql.FieldEqualFold(FieldOwner, v))
-}
-
-// OwnerContainsFold applies the ContainsFold predicate on the "owner" field.
-func OwnerContainsFold(v string) predicate.File {
-	return predicate.File(sql.FieldContainsFold(FieldOwner, v))
+// OwnerIDNotIn applies the NotIn predicate on the "owner_id" field.
+func OwnerIDNotIn(vs ...int) predicate.File {
+	return predicate.File(sql.FieldNotIn(FieldOwnerID, vs...))
 }
 
 // HasEntity applies the HasEdge predicate on the "entity" edge.
@@ -289,6 +244,29 @@ func HasEntity() predicate.File {
 func HasEntityWith(preds ...predicate.Entity) predicate.File {
 	return predicate.File(func(s *sql.Selector) {
 		step := newEntityStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
+// HasOwner applies the HasEdge predicate on the "owner" edge.
+func HasOwner() predicate.File {
+	return predicate.File(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, true, OwnerTable, OwnerColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasOwnerWith applies the HasEdge predicate on the "owner" edge with a given conditions (other predicates).
+func HasOwnerWith(preds ...predicate.User) predicate.File {
+	return predicate.File(func(s *sql.Selector) {
+		step := newOwnerStep()
 		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
 			for _, p := range preds {
 				p(s)
