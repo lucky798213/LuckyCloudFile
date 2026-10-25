@@ -1,0 +1,211 @@
+// Package config 只负责一件事：把 INI 配置文件读成程序可以直接使用的 Config 结构体。
+//
+// 它不启动 HTTP 服务、不连接数据库、也不创建目录。
+// “读配置”这一步只做翻译和检查，不做任何实际动作，
+// 这样配置写错时，程序会在启动前就明确报错，而不是跑到一半才出问题。
+package config
+
+import (
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/go-ini/ini"
+)
+
+// Config 是整份配置。
+//
+// 它的字段和 INI 文件里的 [Section] 一一对应：
+//
+//	[System]   → Config.System
+//	[HTTP]     → Config.HTTP
+//	[Storage]  → Config.Storage
+//	[Database] → Config.Database
+//
+// 而每个结构体里的字段名，又和 Section 里的 key 一一对应（大小写不敏感）。
+// 例如 HTTP.Listen 对应配置文件里的 [HTTP] Listen。
+type Config struct {
+	System   System
+	HTTP     HTTP
+	Storage  Storage
+	Database Database
+}
+
+// System 对应 [System]。
+type System struct {
+	LogLevel string // 日志级别：debug / info / warn / error
+}
+
+// HTTP 对应 [HTTP]。
+type HTTP struct {
+	Listen                 string // 监听地址，格式 host:port；端口写 0 表示让操作系统分配
+	ShutdownTimeoutSeconds int    // 优雅关闭最多等多少秒
+}
+
+// Storage 对应 [Storage]。
+type Storage struct {
+	LocalRoot string // 文件保存目录；相对路径以配置文件所在目录为基准
+}
+
+// Database 对应 [Database]。
+//
+// 注意：当前阶段（P0）只是“读进来并校验格式”，并不会真的去连接数据库。
+// 所以你本机没装 MySQL，程序照样能跑起来。
+type Database struct {
+	Host     string
+	Port     int
+	User     string
+	Password string // 建议用环境变量 CLOUDREVE_DB_PASSWORD 覆盖，不要写进文件
+	Name     string
+}
+
+// Load 读取配置文件的完整流程，按顺序是：
+//
+//  1. 先给所有字段填默认值
+//  2. 打开配置文件
+//  3. 把每个 [Section] 映射到对应的结构体
+//  4. 用环境变量覆盖数据库密码
+//  5. 校验各项取值是否合法
+//  6. 把 Storage 的相对路径转成绝对路径
+//
+// 任何一步失败都会立刻返回错误，后面的步骤不再执行。
+func Load(path string) (Config, error) {
+	cfg := defaultConfig()
+
+	file, err := ini.Load(path)
+	if err != nil {
+		return Config{}, fmt.Errorf("read config: %w", err)
+	}
+
+	if err := mapSections(file, &cfg); err != nil {
+		return Config{}, err
+	}
+
+	applyEnvOverrides(&cfg)
+
+	if err := cfg.validate(); err != nil {
+		return Config{}, err
+	}
+
+	if err := cfg.resolveStoragePath(path); err != nil {
+		return Config{}, err
+	}
+
+	return cfg, nil
+}
+
+// defaultConfig 是所有字段的默认值。
+// 配置文件里没写的项就保持这里的值，所以配置文件可以只写想改的那几项。
+func defaultConfig() Config {
+	return Config{
+		System:   System{LogLevel: "info"},
+		HTTP:     HTTP{ShutdownTimeoutSeconds: 5},
+		Database: Database{Port: 3306},
+	}
+}
+
+// mapSections 把 INI 的每个 [Section] 复制进结构体。
+//
+// StrictMapTo 除了按字段名赋值，还会顺手做类型转换：
+// 配置文件里的值都是字符串，而 Port 是 int，它负责把 "3306" 转成 3306，
+// 转不了（比如写成 "nope"）就返回错误。
+//
+// 这里四个 Section 分开写，而不是用一个循环加反射：
+// 段数很少，分开写时“配置文件的哪一段 → 哪个结构体”一眼就能对上。
+func mapSections(file *ini.File, cfg *Config) error {
+	if err := file.Section("System").StrictMapTo(&cfg.System); err != nil {
+		return fmt.Errorf("parse [System]: %w", err)
+	}
+	if err := file.Section("HTTP").StrictMapTo(&cfg.HTTP); err != nil {
+		return fmt.Errorf("parse [HTTP]: %w", err)
+	}
+	if err := file.Section("Storage").StrictMapTo(&cfg.Storage); err != nil {
+		return fmt.Errorf("parse [Storage]: %w", err)
+	}
+	if err := file.Section("Database").StrictMapTo(&cfg.Database); err != nil {
+		return fmt.Errorf("parse [Database]: %w", err)
+	}
+	return nil
+}
+
+// applyEnvOverrides 用环境变量覆盖配置里的数据库密码。
+//
+// 密码属于敏感信息，不应该写进会被提交到 Git 的配置文件，
+// 所以允许用 CLOUDREVE_DB_PASSWORD 在运行时传入。
+// 其它字段目前不支持用环境变量覆盖。
+func applyEnvOverrides(cfg *Config) {
+	if password, ok := os.LookupEnv("CLOUDREVE_DB_PASSWORD"); ok {
+		cfg.Database.Password = password
+	}
+}
+
+// validate 检查各项取值是否合理。
+//
+// 这里检查的是“业务规则”，比如端口范围、只允许监听本机；
+// 而“能不能转成整数”这种类型问题，前面的 StrictMapTo 已经处理过了。
+func (c Config) validate() error {
+	// 日志级别必须是 slog 认识的四个之一，提前检查，免得启动后才发现写错。
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(c.System.LogLevel)); err != nil {
+		return fmt.Errorf("System.LogLevel must be debug, info, warn or error")
+	}
+
+	// 监听地址必须写成 host:port 的形式，比如 127.0.0.1:8080。
+	host, port, err := net.SplitHostPort(c.HTTP.Listen)
+	if err != nil {
+		return fmt.Errorf("HTTP.Listen must use host:port format: %w", err)
+	}
+
+	// 端口必须是 0~65535 的整数；0 是特殊值，表示让操作系统挑一个空闲端口。
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 0 || n > 65535 {
+		return fmt.Errorf("HTTP.Listen port must be an integer between 0 and 65535")
+	}
+
+	// 当前还没有登录认证，所以只允许监听本机（127.0.0.1、::1、localhost），
+	// 防止有人把开发中的服务不小心暴露到公网。
+	ip := net.ParseIP(host)
+	if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+		return fmt.Errorf("HTTP.Listen must use a loopback address during P0")
+	}
+
+	// 关闭超时太短会来不及处理完正在进行的请求，太长又会让退出很慢。
+	if c.HTTP.ShutdownTimeoutSeconds < 1 || c.HTTP.ShutdownTimeoutSeconds > 300 {
+		return fmt.Errorf("HTTP.ShutdownTimeoutSeconds must be between 1 and 300")
+	}
+
+	// 存储目录必须写。至于它到底能不能写，要等启动时实际试一下才知道（见 internal/app）。
+	if strings.TrimSpace(c.Storage.LocalRoot) == "" {
+		return fmt.Errorf("Storage.LocalRoot is required")
+	}
+
+	// 数据库端口这里只检查格式；当前阶段根本不会连接数据库。
+	if c.Database.Port < 1 || c.Database.Port > 65535 {
+		return fmt.Errorf("Database.Port must be between 1 and 65535")
+	}
+
+	return nil
+}
+
+// resolveStoragePath 把存储目录统一成绝对路径。
+//
+// 如果配置文件里写的是相对路径（比如 ../data），就以“配置文件所在的目录”为基准，
+// 而不是以你执行 go run 时所在的目录为基准。
+// 否则从不同目录启动程序，文件会被写到不同位置，很容易搞混。
+func (c *Config) resolveStoragePath(configPath string) error {
+	root := c.Storage.LocalRoot
+	if !filepath.IsAbs(root) {
+		root = filepath.Join(filepath.Dir(configPath), root)
+	}
+
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("resolve Storage.LocalRoot: %w", err)
+	}
+	c.Storage.LocalRoot = abs
+	return nil
+}

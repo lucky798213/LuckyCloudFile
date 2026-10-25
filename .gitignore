@@ -1,0 +1,5 @@
+/bin/
+/data/
+/configs/conf.ini
+*.out
+.DS_Store
