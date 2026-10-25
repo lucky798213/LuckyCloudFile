@@ -29,7 +29,8 @@ import (
 //
 // 整个启动过程是“一步一步来”的，任何一步失败都直接返回错误：
 //
-//	检查存储目录 → 连接 MySQL → 创建 HTTP Server → 绑定端口 → 开始服务
+//	检查存储目录 → 连接 MySQL → 创建 HTTP Server → 绑定端口
+//	→ 启动后台清理 → 开始服务
 func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	// 第一步：确认存储目录存在且可写。放在最前面，避免服务跑起来后才发现存不了文件。
 	if err := checkStorage(cfg.Storage.LocalRoot); err != nil {
@@ -42,13 +43,13 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("initialize database: %w", err)
 	}
-	defer db.Close()
+	defer database.Close(db)
 
 	// 第三步：创建“存储 → 文件业务 → 认证 → 路由”这条调用链。
 	// 这里是整个程序唯一一处把它们组装起来的地方，
 	// 以后换成 S3，只要改这一行的存储实现。
 	store := storage.NewLocal(cfg.Storage.LocalRoot)
-	fileService := file.NewService(db, store)
+	fileService := file.NewService(db, store).WithLogger(logger)
 	authService := auth.NewService(db)
 
 	// 第四步：创建 HTTP Server。它只是一个“配置好的对象”，还没开始监听。
@@ -73,9 +74,25 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 	defer listener.Close()
 
-	// 第六步：开始服务，直到收到退出信号。
+	// 第六步：开始后台物理清理。
+	// 先立即扫描一次（补上上次进程崩溃留下的 pending_delete），之后定时扫描。
+	// 它只在监听成功后启动；Run 返回时一定先取消并等它退出，不留下孤儿 goroutine。
+	cleanupCtx, stopCleanup := context.WithCancel(ctx)
+	cleanupDone := make(chan struct{})
+	go func() {
+		defer close(cleanupDone)
+		fileService.CleanupLoop(cleanupCtx, file.DefaultCleanupInterval, file.DefaultCleanupBatchSize)
+	}()
+
+	// 第七步：开始服务，直到收到退出信号。
 	shutdownTimeout := time.Duration(cfg.HTTP.ShutdownTimeoutSeconds) * time.Second
-	return serve(ctx, server, listener, shutdownTimeout, logger)
+	serveErr := serve(ctx, server, listener, shutdownTimeout, logger)
+
+	// 显式取消并等待后台清理退出，保证 Run 返回前没有孤儿 goroutine。
+	// ctx 被取消时清理循环已经开始退出；这里再做一次是为了覆盖 serve 自己出错退出的情况。
+	stopCleanup()
+	<-cleanupDone
+	return serveErr
 }
 
 // serve 让服务器一直跑，直到下面两件事之一发生：

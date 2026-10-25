@@ -36,15 +36,70 @@ var (
 	errWrongField = errors.New("file part must be named file")
 )
 
+// createDirectoryRequest 是 POST /api/directories 的请求体。
+// parent_id 为空表示建在当前用户的根目录下。
+type createDirectoryRequest struct {
+	ParentID string `json:"parent_id"`
+	Name     string `json:"name"`
+}
+
+// createDirectory 处理 POST /api/directories。
+//
+//	curl -X POST "$BASE/api/directories" \
+//	  -H "Authorization: Bearer $TOKEN" \
+//	  -H 'Content-Type: application/json' \
+//	  -d '{"name":"学习资料"}'
+//
+// 成功返回 201 和这个目录的 {id,name,kind,parent_id}。
+func createDirectory(logger *slog.Logger, svc fileService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ownerID, ok := currentUserID(c)
+		if !ok {
+			respondInternalError(c, logger, "create directory: missing authenticated user")
+			return
+		}
+
+		var request createDirectoryRequest
+		if err := c.ShouldBindJSON(&request); err != nil {
+			c.JSON(http.StatusBadRequest, ErrorResponse{
+				Code:    "invalid_json",
+				Message: `request body must be JSON like {"name":"docs","parent_id":"..."}`,
+			})
+			return
+		}
+
+		record, err := svc.CreateDirectory(
+			c.Request.Context(),
+			ownerID,
+			request.ParentID,
+			request.Name,
+		)
+		if err != nil {
+			if handleFileError(c, err, "parent_not_found", "parent directory not found") {
+				return
+			}
+			logger.Error("create directory", "error", err)
+			c.JSON(http.StatusInternalServerError, ErrorResponse{
+				Code:    "create_failed",
+				Message: "failed to create directory",
+			})
+			return
+		}
+
+		c.JSON(http.StatusCreated, record)
+	}
+}
+
 // uploadFile 处理 POST /api/files。
 //
-// 请求必须是 multipart/form-data，文件放在名为 file 的字段里：
+// 请求必须是 multipart/form-data，文件放在名为 file 的字段里；
+// 目标目录用查询参数 parent_id 指定，不传就是当前用户的根目录：
 //
-//	curl -F "file=@/path/to/a.txt" http://127.0.0.1:8080/api/files
+//	curl -F "file=@/path/to/a.txt" "$BASE/api/files?parent_id=<目录ID>"
 //
 // 成功返回 201：
 //
-//	{"id":"3f2a...","name":"a.txt","size":1234}
+//	{"id":"3f2a...","name":"a.txt","size":1234,"kind":"file","parent_id":"..."}
 func uploadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 用户 ID 只能来自鉴权中间件写入的登录会话。
@@ -53,6 +108,8 @@ func uploadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 			respondInternalError(c, logger, "upload file: missing authenticated user")
 			return
 		}
+
+		parentID := c.Query("parent_id")
 
 		// 第一道限制：整个请求体不能无限大，防止有人往死里发。
 		// 注意这里加上了 multipart 的余量，真正的“32 MiB”由下面的 Service 精确检查。
@@ -92,10 +149,16 @@ func uploadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 
 		// part 是一个“还没读完的数据流”，直接交给 Service。
 		// 文件名只作为元数据保存，磁盘上的文件名用服务端生成的 ID。
-		record, err := svc.Upload(c.Request.Context(), ownerID, filepath.Base(part.FileName()), part)
+		record, err := svc.Upload(
+			c.Request.Context(),
+			ownerID,
+			parentID,
+			filepath.Base(part.FileName()),
+			part,
+		)
 		if err != nil {
-			if isTooLarge(err) {
-				respondTooLarge(c)
+			// 父目录不存在/不是目录、名字非法、同名冲突都在这里统一映射。
+			if handleFileError(c, err, "parent_not_found", "parent directory not found") {
 				return
 			}
 			// 服务端自己的问题（磁盘满了、没权限等）：细节只写日志，不返回给客户端。
@@ -111,11 +174,64 @@ func uploadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	}
 }
 
+// listFiles 处理 GET /api/files。
+//
+// 只返回 parentID 这一层的直接子节点，不递归整棵树。
+// parent_id 为空表示当前用户的根目录；page 从 1 开始。
+func listFiles(logger *slog.Logger, svc fileService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ownerID, ok := currentUserID(c)
+		if !ok {
+			respondInternalError(c, logger, "list files: missing authenticated user")
+			return
+		}
+
+		page, err := queryInt(c, "page", 1)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, ErrorResponse{
+				Code:    "invalid_pagination",
+				Message: "page must be a positive integer",
+			})
+			return
+		}
+		pageSize, err := queryInt(c, "page_size", 20)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, ErrorResponse{
+				Code:    "invalid_pagination",
+				Message: "page_size must be a positive integer",
+			})
+			return
+		}
+
+		result, err := svc.ListChildren(
+			c.Request.Context(),
+			ownerID,
+			c.Query("parent_id"),
+			page,
+			pageSize,
+		)
+		if err != nil {
+			if handleFileError(c, err, "parent_not_found", "parent directory not found") {
+				return
+			}
+			logger.Error("list files", "error", err)
+			c.JSON(http.StatusInternalServerError, ErrorResponse{
+				Code:    "list_failed",
+				Message: "failed to list directory",
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, result)
+	}
+}
+
 // downloadFile 处理 GET /api/files/:id。
 //
 // Service 会同时按文件 ID 和当前用户 ID 查询：查不到直接 404，
 // 既不会拿任意字符串去拼磁盘路径，也不会把别人的文件暴露给当前用户。
 // 查到了就打开文件，用 io.Copy 流式写回响应，不把整个文件读进内存。
+// 目录没有内容，返回 400 is_directory。
 func downloadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ownerID, ok := currentUserID(c)
@@ -125,14 +241,10 @@ func downloadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 		}
 
 		record, f, err := svc.Open(c.Request.Context(), ownerID, c.Param("id"))
-		if errors.Is(err, file.ErrNotFound) {
-			c.JSON(http.StatusNotFound, ErrorResponse{
-				Code:    "file_not_found",
-				Message: "file not found",
-			})
-			return
-		}
 		if err != nil {
+			if handleFileError(c, err, "file_not_found", "file not found") {
+				return
+			}
 			logger.Error("open file", "error", err)
 			c.JSON(http.StatusInternalServerError, ErrorResponse{
 				Code:    "download_failed",
@@ -160,8 +272,12 @@ func downloadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 
 // deleteFile 处理 DELETE /api/files/:id。
 //
-// 成功返回 204（No Content，没有响应正文）；
+// 成功返回 204（No Content，没有响应正文）。
+// 204 只表示逻辑文件已经删除，不承诺磁盘空间已经立即释放：
+// Service 在事务提交后尝试物理清理，失败会保留 pending_delete 标记，
+// 由启动扫描和后台定时扫描继续重试。
 // 文件不存在或不属于当前用户，统一返回 404。
+// 目录暂时不允许删除，返回 400 is_directory。
 func deleteFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ownerID, ok := currentUserID(c)
@@ -171,22 +287,68 @@ func deleteFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 		}
 
 		err := svc.Delete(c.Request.Context(), ownerID, c.Param("id"))
-		switch {
-		case errors.Is(err, file.ErrNotFound):
-			c.JSON(http.StatusNotFound, ErrorResponse{
-				Code:    "file_not_found",
-				Message: "file not found",
-			})
-		case err != nil:
+		if err != nil {
+			if handleFileError(c, err, "file_not_found", "file not found") {
+				return
+			}
 			logger.Error("delete file", "error", err)
 			c.JSON(http.StatusInternalServerError, ErrorResponse{
 				Code:    "delete_failed",
 				Message: "failed to delete file",
 			})
-		default:
-			c.Status(http.StatusNoContent)
+			return
 		}
+		c.Status(http.StatusNoContent)
 	}
+}
+
+// handleFileError 把业务层的哨兵错误映射成 HTTP 状态码。
+//
+// 返回 true 表示已经写过响应；false 表示这是未知错误，交给调用方记日志并返回 500。
+// notFoundCode/notFoundMessage 让“文件不存在”和“父目录不存在”可以用不同的提示。
+func handleFileError(c *gin.Context, err error, notFoundCode, notFoundMessage string) bool {
+	switch {
+	case errors.Is(err, file.ErrNotFound):
+		c.JSON(http.StatusNotFound, ErrorResponse{Code: notFoundCode, Message: notFoundMessage})
+	case errors.Is(err, file.ErrTooLarge):
+		respondTooLarge(c)
+	case errors.Is(err, file.ErrInvalidName):
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Code:    "invalid_name",
+			Message: "name must not be empty, '.', '..', or contain path separators",
+		})
+	case errors.Is(err, file.ErrNotDirectory):
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Code:    "not_a_directory",
+			Message: "parent_id must refer to a directory",
+		})
+	case errors.Is(err, file.ErrIsDirectory):
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Code:    "is_directory",
+			Message: "this endpoint only operates on files, not directories",
+		})
+	case errors.Is(err, file.ErrAlreadyExists):
+		c.JSON(http.StatusConflict, ErrorResponse{
+			Code:    "already_exists",
+			Message: "an entry with the same name already exists in this directory",
+		})
+	default:
+		return false
+	}
+	return true
+}
+
+// queryInt 读取整数查询参数，缺省时返回 defaultValue。
+func queryInt(c *gin.Context, name string, defaultValue int) (int, error) {
+	raw := c.Query(name)
+	if raw == "" {
+		return defaultValue, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, err
+	}
+	return value, nil
 }
 
 // firstFilePart 从 multipart 请求里取出“字段名是 file、并且带文件名”的那个 part。

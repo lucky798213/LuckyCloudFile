@@ -14,19 +14,18 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
 
 	"luckyCloudFile/internal/auth"
 	"luckyCloudFile/internal/database"
-	"luckyCloudFile/internal/ent"
-	entsession "luckyCloudFile/internal/ent/authsession"
-	entfile "luckyCloudFile/internal/ent/file"
-	entuser "luckyCloudFile/internal/ent/user"
 	cloudfile "luckyCloudFile/internal/file"
 	"luckyCloudFile/internal/httpapi"
+	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/storage"
 )
 
@@ -56,11 +55,11 @@ func TestAuthenticationAndFileIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = client.Close() })
+	t.Cleanup(func() { _ = database.Close(client) })
 	resetAuthTables(t, client)
 
 	// 账号必须显式创建；清空后数据库里应为 0 个用户。
-	if count := client.User.Query().CountX(ctx); count != 0 {
+	if count := countRows(t, client, &model.User{}); count != 0 {
 		t.Fatalf("clean database should have no users, got %d", count)
 	}
 	for _, account := range []struct {
@@ -87,6 +86,19 @@ func TestAuthenticationAndFileIsolation(t *testing.T) {
 	if err := bcrypt.CompareHashAndPassword([]byte(userA.PasswordHash), []byte(testPasswordA)); err != nil {
 		t.Fatalf("user A's stored password_hash cannot verify the real password: %v", err)
 	}
+	// 建账号时根目录必须在同一个事务里一起建好。
+	for _, user := range []*model.User{userA, userB} {
+		if user.RootFileID == nil {
+			t.Fatalf("user %q has no root directory", user.Username)
+		}
+		var root model.File
+		if err := client.WithContext(ctx).First(&root, "id = ?", *user.RootFileID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if root.Kind != model.KindDirectory || root.Name != "/" || root.ParentID != nil {
+			t.Fatalf("unexpected root directory: %+v", root)
+		}
+	}
 
 	fileService := cloudfile.NewService(client, storage.NewLocal(t.TempDir()))
 	authService := auth.NewService(client)
@@ -105,7 +117,7 @@ func TestAuthenticationAndFileIsolation(t *testing.T) {
 				req.Method, req.URL.Path, recorder.Code, recorder.Body.String())
 		}
 	}
-	if count := client.File.Query().CountX(ctx); count != 0 {
+	if count := countWhere(t, client, &model.File{}, "kind = ?", model.KindFile); count != 0 {
 		t.Fatalf("unauthenticated uploads left %d files", count)
 	}
 	t.Log("PASS: no token -> upload/download/delete all rejected with 401")
@@ -115,14 +127,17 @@ func TestAuthenticationAndFileIsolation(t *testing.T) {
 	if wrongPassword.Code != http.StatusUnauthorized {
 		t.Fatalf("wrong password: wanted 401, got %d: %s", wrongPassword.Code, wrongPassword.Body.String())
 	}
-	if count := client.AuthSession.Query().CountX(ctx); count != 0 {
+	if count := countRows(t, client, &model.AuthSession{}); count != 0 {
 		t.Fatalf("wrong password created %d sessions", count)
 	}
 	t.Log("PASS: wrong password rejected (401) and no session created")
 
 	// 3. A 登录，检查数据库只保存 Token 哈希。
 	tokenA := login(t, router, testUsernameA, testPasswordA)
-	sessionA := client.AuthSession.Query().OnlyX(ctx)
+	var sessionA model.AuthSession
+	if err := client.WithContext(ctx).First(&sessionA).Error; err != nil {
+		t.Fatal(err)
+	}
 	if sessionA.UserID != userA.ID {
 		t.Fatalf("session user_id = %d, want A=%d", sessionA.UserID, userA.ID)
 	}
@@ -149,7 +164,10 @@ func TestAuthenticationAndFileIsolation(t *testing.T) {
 	if err := json.Unmarshal(uploaded.Body.Bytes(), &recordA); err != nil {
 		t.Fatal(err)
 	}
-	storedA := client.File.Query().Where(entfile.ID(recordA.ID)).OnlyX(ctx)
+	var storedA model.File
+	if err := client.WithContext(ctx).Where("id = ?", recordA.ID).First(&storedA).Error; err != nil {
+		t.Fatal(err)
+	}
 	if storedA.OwnerID != userA.ID {
 		t.Fatalf("file owner_id = %d, want A=%d (client header must be ignored)", storedA.OwnerID, userA.ID)
 	}
@@ -191,7 +209,7 @@ func TestAuthenticationAndFileIsolation(t *testing.T) {
 	if stillThere.Code != http.StatusOK || !bytes.Equal(stillThere.Body.Bytes(), payloadA) {
 		t.Fatalf("B's failed operations damaged A's file: status=%d body=%q", stillThere.Code, stillThere.Body.Bytes())
 	}
-	if count := client.File.Query().CountX(ctx); count != 1 {
+	if count := countWhere(t, client, &model.File{}, "kind = ?", model.KindFile); count != 1 {
 		t.Fatalf("B's failed operations changed file count to %d", count)
 	}
 	t.Log("PASS: B's failures did not affect A's file or content")
@@ -212,9 +230,7 @@ func TestAuthenticationAndFileIsolation(t *testing.T) {
 	if logout.Code != http.StatusNoContent {
 		t.Fatalf("logout: wanted 204, got %d: %s", logout.Code, logout.Body.String())
 	}
-	if count := client.AuthSession.Query().
-		Where(entsession.TokenHash(sha256Hex(tokenA))).
-		CountX(ctx); count != 0 {
+	if count := countWhere(t, client, &model.AuthSession{}, "token_hash = ?", sha256Hex(tokenA)); count != 0 {
 		t.Fatalf("logout left A's session in the database: %d", count)
 	}
 	afterLogout := serve(t, router, authorize(httptest.NewRequest(http.MethodGet, "/api/files/anything", nil), tokenA))
@@ -240,15 +256,18 @@ func TestAuthenticationAndFileIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sessionA2 := client.AuthSession.Query().
-		Where(
-			entsession.TokenHash(sha256Hex(tokenA2)),
-			entsession.UserID(userA.ID),
-		).
-		OnlyX(ctx)
-	client.AuthSession.UpdateOneID(sessionA2.ID).
-		SetExpiresAt(time.Now().Add(-time.Minute)).
-		SaveX(ctx)
+	var sessionA2 model.AuthSession
+	if err := client.WithContext(ctx).
+		Where("token_hash = ? AND user_id = ?", sha256Hex(tokenA2), userA.ID).
+		First(&sessionA2).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := client.WithContext(ctx).
+		Model(&model.AuthSession{}).
+		Where("id = ?", sessionA2.ID).
+		Update("expires_at", time.Now().Add(-time.Minute)).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	expired := serve(t, router, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+recordA2.ID, nil), tokenA2))
 	if expired.Code != http.StatusUnauthorized {
@@ -269,31 +288,56 @@ func TestAuthenticationAndFileIsolation(t *testing.T) {
 	t.Log("PASS: expired token rejected with 401; file remained intact and readable by a fresh login")
 }
 
-func mustUser(t *testing.T, client *ent.Client, username string) *ent.User {
+func mustUser(t *testing.T, db *gorm.DB, username string) *model.User {
 	t.Helper()
-	user, err := client.User.Query().Where(entuser.Username(username)).Only(context.Background())
-	if err != nil {
+	var user model.User
+	if err := db.WithContext(context.Background()).
+		Where("username = ?", username).
+		First(&user).Error; err != nil {
 		t.Fatal(err)
 	}
-	return user
+	return &user
 }
 
-func resetAuthTables(t *testing.T, client *ent.Client) {
+func resetAuthTables(t *testing.T, db *gorm.DB) {
 	t.Helper()
-	ctx := context.Background()
-	for _, step := range []struct {
-		name string
-		run  func() (int, error)
-	}{
-		{"auth_sessions", func() (int, error) { return client.AuthSession.Delete().Exec(ctx) }},
-		{"files", func() (int, error) { return client.File.Delete().Exec(ctx) }},
-		{"entities", func() (int, error) { return client.Entity.Delete().Exec(ctx) }},
-		{"users", func() (int, error) { return client.User.Delete().Exec(ctx) }},
-	} {
-		if _, err := step.run(); err != nil {
-			t.Fatalf("clear %s: %v", step.name, err)
+	// files.parent_id 是自引用外键，逐行按顺序删很容易出现“父节点先被删”。
+	// 测试里在同一个连接上临时关掉外键检查，清空后立刻打开。
+	err := db.Connection(func(conn *gorm.DB) error {
+		if err := conn.Exec("SET FOREIGN_KEY_CHECKS = 0").Error; err != nil {
+			return err
 		}
+		for _, table := range []string{"auth_sessions", "files", "entities", "users"} {
+			if err := conn.Exec("DELETE FROM " + table).Error; err != nil {
+				_ = conn.Exec("SET FOREIGN_KEY_CHECKS = 1").Error
+				return err
+			}
+		}
+		return conn.Exec("SET FOREIGN_KEY_CHECKS = 1").Error
+	})
+	if err != nil {
+		t.Fatalf("clear tables: %v", err)
 	}
+}
+
+// countRows 数一张表有多少行。传 &model.X{} 给 GORM 决定表名。
+func countRows(t *testing.T, db *gorm.DB, value any) int64 {
+	t.Helper()
+	var count int64
+	if err := db.Model(value).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+// countWhere 数满足条件的行数。
+func countWhere(t *testing.T, db *gorm.DB, value any, query string, args ...any) int64 {
+	t.Helper()
+	var count int64
+	if err := db.Model(value).Where(query, args...).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	return count
 }
 
 func login(t *testing.T, router http.Handler, username, password string) string {
@@ -361,4 +405,123 @@ func serve(t *testing.T, router http.Handler, req *http.Request) *httptest.Respo
 func sha256Hex(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
+}
+
+// TestDirectoryFlowOverHTTP 用真实 MySQL + 真实 Service 走一遍新接口：
+// 建目录 → 往目录里传文件 → 列目录 → 拒绝下载/删除目录 → 别的用户进不来。
+func TestDirectoryFlowOverHTTP(t *testing.T) {
+	dsn := os.Getenv("CLOUDREVE_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("set CLOUDREVE_TEST_MYSQL_DSN to run the directory flow")
+	}
+
+	ctx := context.Background()
+	client, err := database.OpenDSN(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close(client) })
+	resetAuthTables(t, client)
+
+	for _, account := range []struct{ username, password string }{
+		{testUsernameA, testPasswordA},
+		{testUsernameB, testPasswordB},
+	} {
+		if _, err := auth.CreateUser(ctx, client, account.username, account.password); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fileService := cloudfile.NewService(client, storage.NewLocal(t.TempDir()))
+	router := httpapi.NewRouter(slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		fileService, auth.NewService(client))
+
+	tokenA := login(t, router, testUsernameA, testPasswordA)
+	tokenB := login(t, router, testUsernameB, testPasswordB)
+
+	// 1. 建目录。
+	body := strings.NewReader(`{"name":"学习资料"}`)
+	createReq := httptest.NewRequest(http.MethodPost, "/api/directories", body)
+	createReq.Header.Set("Content-Type", "application/json")
+	createReq = authorize(createReq, tokenA)
+	created := serve(t, router, createReq)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create directory: wanted 201, got %d: %s", created.Code, created.Body.String())
+	}
+	var dir cloudfile.File
+	if err := json.Unmarshal(created.Body.Bytes(), &dir); err != nil {
+		t.Fatal(err)
+	}
+	if dir.Kind != "directory" || dir.Name != "学习资料" || dir.ParentID == nil {
+		t.Fatalf("unexpected directory response: %+v", dir)
+	}
+
+	// 2. 往目录里上传文件。
+	upload := newUploadRequest(t, tokenA, []byte("hello"))
+	query := upload.URL.Query()
+	query.Set("parent_id", dir.ID)
+	upload.URL.RawQuery = query.Encode()
+	uploaded := serve(t, router, upload)
+	if uploaded.Code != http.StatusCreated {
+		t.Fatalf("upload into directory: wanted 201, got %d: %s", uploaded.Code, uploaded.Body.String())
+	}
+	var note cloudfile.File
+	if err := json.Unmarshal(uploaded.Body.Bytes(), &note); err != nil {
+		t.Fatal(err)
+	}
+	if note.ParentID == nil || *note.ParentID != dir.ID || note.Kind != "file" || note.Size != 5 {
+		t.Fatalf("unexpected upload response: %+v", note)
+	}
+
+	// 3. 列目录：只有刚传的那一个文件。
+	listReq := httptest.NewRequest(http.MethodGet, "/api/files?parent_id="+dir.ID, nil)
+	list := serve(t, router, authorize(listReq, tokenA))
+	if list.Code != http.StatusOK {
+		t.Fatalf("list directory: wanted 200, got %d: %s", list.Code, list.Body.String())
+	}
+	var listing cloudfile.ListResult
+	if err := json.Unmarshal(list.Body.Bytes(), &listing); err != nil {
+		t.Fatal(err)
+	}
+	if listing.Total != 1 || len(listing.Items) != 1 || listing.Items[0].ID != note.ID {
+		t.Fatalf("unexpected listing: %+v", listing)
+	}
+
+	// 4. 列根目录：只有“学习资料”这一个目录。
+	rootReq := httptest.NewRequest(http.MethodGet, "/api/files", nil)
+	rootList := serve(t, router, authorize(rootReq, tokenA))
+	if rootList.Code != http.StatusOK {
+		t.Fatalf("list root: wanted 200, got %d", rootList.Code)
+	}
+	var rootListing cloudfile.ListResult
+	if err := json.Unmarshal(rootList.Body.Bytes(), &rootListing); err != nil {
+		t.Fatal(err)
+	}
+	if rootListing.Total != 1 || rootListing.Items[0].ID != dir.ID {
+		t.Fatalf("unexpected root listing: %+v", rootListing)
+	}
+
+	// 5. 目录不能下载、不能删除。
+	download := serve(t, router, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+dir.ID, nil), tokenA))
+	if download.Code != http.StatusBadRequest {
+		t.Fatalf("download directory: wanted 400, got %d", download.Code)
+	}
+	remove := serve(t, router, authorize(httptest.NewRequest(http.MethodDelete, "/api/files/"+dir.ID, nil), tokenA))
+	if remove.Code != http.StatusBadRequest {
+		t.Fatalf("delete directory: wanted 400, got %d", remove.Code)
+	}
+
+	// 6. B 不能往 A 的目录里传文件，也看不到 A 的目录内容。
+	intruder := newUploadRequest(t, tokenB, []byte("intrusion"))
+	query = intruder.URL.Query()
+	query.Set("parent_id", dir.ID)
+	intruder.URL.RawQuery = query.Encode()
+	intruded := serve(t, router, intruder)
+	if intruded.Code != http.StatusNotFound {
+		t.Fatalf("B upload into A's directory: wanted 404, got %d: %s", intruded.Code, intruded.Body.String())
+	}
+	peek := serve(t, router, authorize(httptest.NewRequest(http.MethodGet, "/api/files?parent_id="+dir.ID, nil), tokenB))
+	if peek.Code != http.StatusNotFound {
+		t.Fatalf("B list A's directory: wanted 404, got %d", peek.Code)
+	}
 }

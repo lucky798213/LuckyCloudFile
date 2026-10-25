@@ -6,66 +6,130 @@ package file
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
+	"strings"
+	"unicode/utf8"
 
-	"luckyCloudFile/internal/ent"
-	entfile "luckyCloudFile/internal/ent/file"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
+	"luckyCloudFile/internal/idgen"
+	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/storage"
 )
 
-// MaxUploadBytes 是单个文件内容的大小上限：32 MiB。
-// 注意它限制的是“文件内容”，不包含 multipart 的表单头和边界。
-const MaxUploadBytes int64 = 32 << 20
+const (
+	// MaxUploadBytes 是单个文件内容的大小上限：32 MiB。
+	// 注意它限制的是“文件内容”，不包含 multipart 的表单头和边界。
+	MaxUploadBytes int64 = 32 << 20
 
-var (
-	// ErrNotFound 表示这个 ID 没有对应的文件。
-	ErrNotFound = errors.New("file not found")
-	// ErrTooLarge 表示上传的文件内容超过了 MaxUploadBytes。
-	ErrTooLarge = errors.New("file too large")
+	// defaultPageSize / maxPageSize 限制列表接口一次返回多少条。
+	defaultPageSize = 20
+	maxPageSize     = 100
+
+	// maxNameRunes 和 files.name 的 varchar(255) 对齐。
+	maxNameRunes = 255
 )
 
-// File 是返回给 HTTP 层的文件信息（不包含数据库内部字段）。
+var (
+	// ErrNotFound 表示这个 ID 没有对应的节点，或者不属于当前用户。
+	ErrNotFound = errors.New("file not found")
+
+	// ErrTooLarge 表示上传的文件内容超过了 MaxUploadBytes。
+	ErrTooLarge = errors.New("file too large")
+
+	// ErrNotDirectory 表示 parent_id 指向的不是目录。
+	ErrNotDirectory = errors.New("parent is not a directory")
+
+	// ErrIsDirectory 表示对一个目录调用了只适用于文件的操作（下载、删除）。
+	ErrIsDirectory = errors.New("file is a directory")
+
+	// ErrInvalidName 表示名字为空、是 "." / ".."、含路径分隔符或太长。
+	ErrInvalidName = errors.New("invalid file name")
+
+	// ErrAlreadyExists 表示同一目录下已经有同名节点。
+	ErrAlreadyExists = errors.New("an entry with the same name already exists")
+)
+
+// File 是返回给 HTTP 层的节点信息（不包含数据库内部字段）。
 //
-// 它和 ent 生成的 ent.File 不是同一个类型：
-// ent.File 是数据库记录，下面这个只是“客户端需要看到的三个字段”。
+// 它和 model.File 不是同一个类型：
+// model.File 是数据库记录，下面这个只是“客户端需要看到的字段”。
+// 目录没有 Entity，所以 Size 是 0。
 type File struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Size int64  `json:"size"`
+	ID       string  `json:"id"`
+	Name     string  `json:"name"`
+	Size     int64   `json:"size"`
+	Kind     string  `json:"kind"`
+	ParentID *string `json:"parent_id"`
+}
+
+// ListResult 是目录列表的一页。
+type ListResult struct {
+	Items    []File `json:"items"`
+	Total    int64  `json:"total"`
+	Page     int    `json:"page"`
+	PageSize int    `json:"page_size"`
 }
 
 // Service 负责文件业务：落盘 + 写数据库。
 type Service struct {
-	client *ent.Client
+	db     *gorm.DB
 	store  *storage.Local
+	logger *slog.Logger
 }
 
 // NewService 创建文件服务。
-func NewService(client *ent.Client, store *storage.Local) *Service {
-	return &Service{client: client, store: store}
+func NewService(db *gorm.DB, store *storage.Local) *Service {
+	return &Service{
+		db:    db,
+		store: store,
+		// 默认丢弃日志：构造 Service 的人不一定关心后台清理，
+		// 生产代码可以用 WithLogger 换成真正的 logger。
+		logger: slog.New(slog.DiscardHandler),
+	}
 }
 
-// Upload 把 r 的内容存成 ownerID 用户的文件，并在数据库里登记 File 和 Entity。
+// WithLogger 给后台清理任务设置日志输出，返回自身方便链式调用。
+func (s *Service) WithLogger(logger *slog.Logger) *Service {
+	if logger != nil {
+		s.logger = logger
+	}
+	return s
+}
+
+// Upload 把 r 的内容存成 ownerID 用户 parentID 目录下的文件。
 //
 // ownerID 只能来自登录会话，不能来自请求体或 URL。
+// parentID 为空时使用当前用户的根目录。
 //
 // 顺序是：
-//  1. 生成两个随机 ID：File 的公开 ID、Entity 的磁盘 key
-//  2. 先把内容写进磁盘（临时文件 → Rename）
-//  3. 再在一个事务里写 Entity 和 File 两行，File 的 owner_id 填当前用户
+//  1. 先确认父目录存在、属于当前用户、而且真的是目录
+//  2. 生成两个随机 ID：File 的公开 ID、Entity 的磁盘 key
+//  3. 把内容写进磁盘（临时文件 → Rename）
+//  4. 再开一个短事务：重新核对父目录 → 写 Entity 和 File
 //
-// 如果第 3 步失败，会把第 2 步写好的磁盘文件删掉，避免“磁盘有、库里没有”的孤儿文件。
-func (s *Service) Upload(ctx context.Context, ownerID int, name string, r io.Reader) (File, error) {
-	fileID, err := newID()
+// 为什么不整个上传都包在事务里？因为 32 MiB 可能要传几十秒，
+// 一直占着数据库事务会拖住其他请求。
+func (s *Service) Upload(ctx context.Context, ownerID int, parentID, name string, r io.Reader) (File, error) {
+	if err := validateName(name); err != nil {
+		return File{}, err
+	}
+
+	parent, err := s.requireDirectory(ctx, ownerID, parentID)
 	if err != nil {
 		return File{}, err
 	}
-	storageKey, err := newID()
+
+	fileID, err := idgen.New()
+	if err != nil {
+		return File{}, err
+	}
+	storageKey, err := idgen.New()
 	if err != nil {
 		return File{}, err
 	}
@@ -80,68 +144,167 @@ func (s *Service) Upload(ctx context.Context, ownerID int, name string, r io.Rea
 	}
 
 	// 再写数据库。失败就回滚磁盘，保证两边一致。
-	if err := s.saveRecords(ctx, ownerID, fileID, storageKey, name, size); err != nil {
+	if err := s.saveRecords(ctx, ownerID, parent.ID, fileID, storageKey, name, size); err != nil {
 		_ = s.store.Remove(storageKey)
 		return File{}, err
 	}
 
-	return File{ID: fileID, Name: name, Size: size}, nil
+	return File{
+		ID:       fileID,
+		Name:     name,
+		Size:     size,
+		Kind:     model.KindFile,
+		ParentID: &parent.ID,
+	}, nil
 }
 
-// saveRecords 在一个事务里写入 Entity 和 File。
+// saveRecords 在一个短事务里写入 Entity 和 File。
 //
 // 两个表必须一起成功：只有 File 没有 Entity，就不知道内容在哪；
 // 只有 Entity 没有 File，就是一份没人引用的孤儿内容。
-func (s *Service) saveRecords(ctx context.Context, ownerID int, fileID, storageKey, name string, size int64) error {
-	tx, err := s.client.Tx(ctx)
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
-	}
+//
+// 事务里会重新核对一次父目录：接收文件的过程中，目录可能已经被删掉，
+// 或者被换到了别人名下。
+func (s *Service) saveRecords(ctx context.Context, ownerID int, parentID, fileID, storageKey, name string, size int64) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := queryDirectory(ctx, tx, ownerID, parentID); err != nil {
+			return err
+		}
 
-	entity, err := tx.Entity.Create().
-		SetStorageKey(storageKey).
-		SetSize(size).
-		SetPolicy("local").
-		SetRefCount(1).
-		Save(ctx)
-	if err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("create entity: %w", err)
-	}
+		entity := model.Entity{
+			StorageKey: storageKey,
+			Size:       size,
+			Policy:     "local",
+			RefCount:   1,
+			// 新内容一定可以被引用。以后做去重、复用现有 Entity 时，
+			// 必须先锁住 Entity 并确认它仍是 active，pending_delete 不允许再加引用。
+			Status: model.EntityStatusActive,
+		}
+		// Create 会把自增 ID 回填到 entity.ID，下面 File 要用。
+		if err := tx.Create(&entity).Error; err != nil {
+			return fmt.Errorf("create entity: %w", err)
+		}
 
-	if _, err := tx.File.Create().
-		SetID(fileID).
-		SetName(name).
-		SetEntity(entity).
-		SetOwnerID(ownerID).
-		Save(ctx); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("create file: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit transaction: %w", err)
-	}
-	return nil
+		record := model.File{
+			ID:       fileID,
+			Name:     name,
+			Kind:     model.KindFile,
+			ParentID: &parentID,
+			EntityID: &entity.ID,
+			OwnerID:  ownerID,
+		}
+		if err := tx.Create(&record).Error; err != nil {
+			if errors.Is(err, gorm.ErrDuplicatedKey) {
+				return ErrAlreadyExists
+			}
+			return fmt.Errorf("create file: %w", err)
+		}
+		return nil
+	})
 }
 
-// Open 只打开 ownerID 用户自己的文件。
+// CreateDirectory 在 parentID（为空表示根目录）下创建一个空目录。
+//
+// 目录只是 files 表里的一行：不写磁盘、不创建 Entity。
+func (s *Service) CreateDirectory(ctx context.Context, ownerID int, parentID, name string) (File, error) {
+	if err := validateName(name); err != nil {
+		return File{}, err
+	}
+
+	parent, err := s.requireDirectory(ctx, ownerID, parentID)
+	if err != nil {
+		return File{}, err
+	}
+
+	id, err := idgen.New()
+	if err != nil {
+		return File{}, err
+	}
+
+	record := model.File{
+		ID:       id,
+		Name:     name,
+		Kind:     model.KindDirectory,
+		ParentID: &parent.ID,
+		OwnerID:  ownerID,
+	}
+	if err := s.db.WithContext(ctx).Create(&record).Error; err != nil {
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			return File{}, ErrAlreadyExists
+		}
+		return File{}, fmt.Errorf("create directory: %w", err)
+	}
+
+	return toFile(record), nil
+}
+
+// ListChildren 返回 parentID 目录下的直接子节点，不递归。
+//
+// page 从 1 开始，pageSize 会被限制在 1～100。
+func (s *Service) ListChildren(ctx context.Context, ownerID int, parentID string, page, pageSize int) (ListResult, error) {
+	parent, err := s.requireDirectory(ctx, ownerID, parentID)
+	if err != nil {
+		return ListResult{}, err
+	}
+
+	page, pageSize = normalizePagination(page, pageSize)
+	const where = "owner_id = ? AND parent_id = ?"
+
+	var total int64
+	if err := s.db.WithContext(ctx).
+		Model(&model.File{}).
+		Where(where, ownerID, parent.ID).
+		Count(&total).Error; err != nil {
+		return ListResult{}, fmt.Errorf("count directory children: %w", err)
+	}
+
+	var records []model.File
+	if err := s.db.WithContext(ctx).
+		Preload("Entity").
+		Where(where, ownerID, parent.ID).
+		Order("name ASC").
+		Order("id ASC").
+		Limit(pageSize).
+		Offset((page - 1) * pageSize).
+		Find(&records).Error; err != nil {
+		return ListResult{}, fmt.Errorf("query directory children: %w", err)
+	}
+
+	items := make([]File, 0, len(records))
+	for _, record := range records {
+		items = append(items, toFile(record))
+	}
+
+	return ListResult{
+		Items:    items,
+		Total:    total,
+		Page:     page,
+		PageSize: pageSize,
+	}, nil
+}
+
+// Open 只打开 ownerID 用户自己的普通文件。
 //
 // “ID 存在”不代表“当前用户能下载”：查询必须同时匹配文件 ID 和 owner_id。
 // 别人的文件与不存在的文件都返回 ErrNotFound，避免泄露文件是否存在。
+// 目录没有内容，明确返回 ErrIsDirectory，而不是让上层去读空关联。
 func (s *Service) Open(ctx context.Context, ownerID int, id string) (File, io.ReadCloser, error) {
-	record, err := s.client.File.Query().
-		Where(entfile.ID(id), entfile.OwnerID(ownerID)).
-		WithEntity().
-		Only(ctx)
+	var record model.File
+	err := s.db.WithContext(ctx).
+		Preload("Entity").
+		Where("id = ? AND owner_id = ?", id, ownerID).
+		First(&record).Error
 	if err != nil {
-		if ent.IsNotFound(err) {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return File{}, nil, ErrNotFound
 		}
 		return File{}, nil, fmt.Errorf("query file: %w", err)
 	}
+	if record.Kind != model.KindFile {
+		return File{}, nil, ErrIsDirectory
+	}
 
-	entity := record.Edges.Entity
+	entity := record.Entity
 	if entity == nil {
 		return File{}, nil, fmt.Errorf("file %s has no entity", id)
 	}
@@ -155,77 +318,267 @@ func (s *Service) Open(ctx context.Context, ownerID int, id string) (File, io.Re
 		return File{}, nil, fmt.Errorf("open content: %w", err)
 	}
 
-	return File{ID: record.ID, Name: record.Name, Size: entity.Size}, f, nil
+	return toFile(record), f, nil
 }
 
-// Delete 只允许 ownerID 用户删除自己的文件：先删磁盘内容，再在事务里删数据库记录。
+// Delete 删除 ownerID 用户自己的普通文件。
 //
-// 为什么先删磁盘？如果磁盘删除失败，数据库不动，文件还能下载、也能重试删除。
-// 反过来先删数据库，磁盘失败就会留下永远没人认识的孤儿文件。
+// 删除分两段：先在事务里只改逻辑关系，提交成功后再尝试清理磁盘。
 //
-// 如果磁盘删完、事务却失败了：数据库里还有记录，但磁盘文件已经没了。
-// 再调一次 Delete 时，磁盘不存在会被当成“已经删了”，然后继续把数据库记录删掉，
-// 所以重试是安全的。
+//	BEGIN
+//	  SELECT files   ... FOR UPDATE   (id + owner_id)
+//	  SELECT entities ... FOR UPDATE
+//	  DELETE files WHERE id = ...
+//	  UPDATE entities SET ref_count = ref_count - 1 WHERE id = ... AND ref_count > 0
+//	  ref_count == 0 → status = pending_delete
+//	COMMIT
+//	  → 立即尝试一次物理清理；失败只记日志，不回滚已经提交的逻辑删除
+//
+// 为什么先锁 File 再锁 Entity：这是所有事务统一的加锁顺序
+// （以后实现 Copy 时也必须先锁源 File、再锁 Entity），
+// 否则两个事务可能一个先锁 File、另一个先锁 Entity，互相等待成环。
+//
+// 为什么不在事务里删磁盘：磁盘操作可能很慢，未来换成 S3 更慢。
+// 事务只保护“引用计数 + 逻辑记录”这一小段，物理清理交给 cleanup.go。
+//
+// 目录暂时不允许删除：递归删除整棵子树涉及“先删文件还是先删记录”，
+// 这一阶段明确返回 ErrIsDirectory，而不是留下半棵树。
 func (s *Service) Delete(ctx context.Context, ownerID int, id string) error {
-	record, err := s.client.File.Query().
-		Where(entfile.ID(id), entfile.OwnerID(ownerID)).
-		WithEntity().
-		Only(ctx)
+	var pendingEntityID int64
+
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		record, err := lockOwnedFile(ctx, tx, ownerID, id)
+		if err != nil {
+			return err
+		}
+		if record.Kind != model.KindFile {
+			return ErrIsDirectory
+		}
+		if record.EntityID == nil {
+			return fmt.Errorf("file %s has no entity", id)
+		}
+
+		entity, err := lockEntity(ctx, tx, *record.EntityID)
+		if err != nil {
+			return err
+		}
+		// 到这里 File 和 Entity 都被锁住了，entity.RefCount 是事务内的最新值，
+		// 不再是事务外预读的旧值。
+		if entity.RefCount <= 0 {
+			return fmt.Errorf(
+				"entity %d has ref_count %d while file %s still references it",
+				entity.ID, entity.RefCount, id,
+			)
+		}
+
+		// 先删 File 行。RowsAffected 必须正好是 1，否则说明这一行已经被别的事务删掉了，
+		// 继续扣引用就会重复计数，所以直接回滚。
+		deleted := tx.WithContext(ctx).
+			Where("id = ? AND owner_id = ?", record.ID, ownerID).
+			Delete(&model.File{})
+		if deleted.Error != nil {
+			return fmt.Errorf("delete file: %w", deleted.Error)
+		}
+		if deleted.RowsAffected != 1 {
+			return fmt.Errorf(
+				"delete file %s: expected 1 row affected, got %d",
+				id, deleted.RowsAffected,
+			)
+		}
+
+		// 用带 ref_count > 0 条件的原子自减，防止重复扣引用。
+		decremented := tx.WithContext(ctx).
+			Model(&model.Entity{}).
+			Where("id = ? AND ref_count > 0", entity.ID).
+			UpdateColumn("ref_count", gorm.Expr("ref_count - 1"))
+		if decremented.Error != nil {
+			return fmt.Errorf("decrement ref count: %w", decremented.Error)
+		}
+		if decremented.RowsAffected != 1 {
+			return fmt.Errorf(
+				"decrement ref count of entity %d: expected 1 row affected, got %d",
+				entity.ID, decremented.RowsAffected,
+			)
+		}
+
+		// 还有其他 File 引用这份内容：保持 active，不碰磁盘。
+		if entity.RefCount > 1 {
+			return nil
+		}
+
+		// 最后一个引用也删掉了。这里不删 Entity，只标记 pending_delete，
+		// 交给 cleanup.go 在事务提交后删物理对象；这样两个崩溃点都能收敛。
+		marked := tx.WithContext(ctx).
+			Model(&model.Entity{}).
+			Where("id = ? AND ref_count = 0 AND status = ?", entity.ID, model.EntityStatusActive).
+			UpdateColumn("status", model.EntityStatusPendingDelete)
+		if marked.Error != nil {
+			return fmt.Errorf("mark entity pending deletion: %w", marked.Error)
+		}
+		if marked.RowsAffected != 1 {
+			return fmt.Errorf(
+				"mark entity %d pending deletion: expected 1 row affected, got %d",
+				entity.ID, marked.RowsAffected,
+			)
+		}
+		pendingEntityID = entity.ID
+		return nil
+	})
 	if err != nil {
-		if ent.IsNotFound(err) {
-			return ErrNotFound
+		return err
+	}
+
+	// 事务已经提交，逻辑删除完成。物理清理失败不能让接口返回错误：
+	// 否则客户端会以为没删掉，而数据库里其实已经删了。
+	if pendingEntityID != 0 {
+		if cleanupErr := s.cleanupEntity(ctx, pendingEntityID); cleanupErr != nil {
+			s.logger.Warn("physical cleanup deferred",
+				"entity_id", pendingEntityID,
+				"error", cleanupErr,
+			)
 		}
-		return fmt.Errorf("query file: %w", err)
-	}
-
-	entity := record.Edges.Entity
-	if entity == nil {
-		return fmt.Errorf("file %s has no entity", id)
-	}
-
-	if err := s.store.Remove(entity.StorageKey); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("remove content: %w", err)
-	}
-
-	tx, err := s.client.Tx(ctx)
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
-	}
-
-	if err := tx.File.DeleteOneID(record.ID).Exec(ctx); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("delete file: %w", err)
-	}
-
-	// 引用数减到 0 才删 Entity，这样以后多个 File 共享一份内容时不会被误删。
-	if entity.RefCount <= 1 {
-		if err := tx.Entity.DeleteOneID(entity.ID).Exec(ctx); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("delete entity: %w", err)
-		}
-	} else {
-		if _, err := tx.Entity.UpdateOneID(entity.ID).
-			SetRefCount(entity.RefCount - 1).
-			Save(ctx); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("update ref count: %w", err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit transaction: %w", err)
 	}
 	return nil
 }
 
-// newID 生成 32 个字符的随机十六进制 ID（16 字节随机数）。
+// lockOwnedFile 在事务里按 id + owner_id 锁住一行 files。
 //
-// 用随机数而不是 1、2、3 这样的自增数字，
-// 别人就没法靠猜 ID 访问到不属于他的文件。
-func newID() (string, error) {
-	buf := make([]byte, 16)
-	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("generate file id: %w", err)
+// SELECT ... FOR UPDATE 会一直持有到事务提交或回滚。重复删除同一个文件时，
+// 第二个事务会在这里等第一个提交，然后看到记录已经不存在（ErrNotFound），
+// 不会重复扣 Entity 的引用数。
+func lockOwnedFile(ctx context.Context, tx *gorm.DB, ownerID int, id string) (*model.File, error) {
+	var record model.File
+	err := tx.WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND owner_id = ?", id, ownerID).
+		First(&record).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("lock file: %w", err)
 	}
-	return hex.EncodeToString(buf), nil
+	return &record, nil
+}
+
+// lockEntity 在事务里锁住一行 entities，并读出最新的 ref_count 和 status。
+//
+// 调用者必须已经持有对应的 File 行锁，保证所有事务的加锁顺序都是 File → Entity。
+func lockEntity(ctx context.Context, tx *gorm.DB, entityID int64) (*model.Entity, error) {
+	var entity model.Entity
+	err := tx.WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		First(&entity, entityID).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// File 指向不存在的 Entity：数据库已经不一致，不能继续扣引用。
+			return nil, fmt.Errorf("entity %d not found for file reference", entityID)
+		}
+		return nil, fmt.Errorf("lock entity: %w", err)
+	}
+	return &entity, nil
+}
+
+// requireDirectory 校验 parentID 是 ownerID 自己的目录。
+//
+// parentID 为空时先解析成当前用户的根目录 ID。
+//
+// “不存在”和“属于别人”都返回 ErrNotFound：不能通过错误类型区分，
+// 否则客户端可以拿它探测别人的目录 ID 是否存在。
+func (s *Service) requireDirectory(ctx context.Context, ownerID int, parentID string) (*model.File, error) {
+	return queryDirectory(ctx, s.db, ownerID, parentID)
+}
+
+// queryDirectory 是 requireDirectory 的底层实现，传入 tx 就能在事务里复用。
+func queryDirectory(ctx context.Context, db *gorm.DB, ownerID int, parentID string) (*model.File, error) {
+	if parentID == "" {
+		resolved, err := rootDirectoryID(ctx, db, ownerID)
+		if err != nil {
+			return nil, err
+		}
+		parentID = resolved
+	}
+
+	var parent model.File
+	err := db.WithContext(ctx).
+		Where("id = ? AND owner_id = ?", parentID, ownerID).
+		First(&parent).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query parent directory: %w", err)
+	}
+	if parent.Kind != model.KindDirectory {
+		return nil, ErrNotDirectory
+	}
+	return &parent, nil
+}
+
+// rootDirectoryID 取出用户的根目录 ID。
+func rootDirectoryID(ctx context.Context, db *gorm.DB, ownerID int) (string, error) {
+	var user model.User
+	err := db.WithContext(ctx).
+		Select("id", "root_file_id").
+		First(&user, ownerID).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", fmt.Errorf("user %d not found", ownerID)
+		}
+		return "", fmt.Errorf("query user root directory: %w", err)
+	}
+	if user.RootFileID == nil || *user.RootFileID == "" {
+		return "", fmt.Errorf("user %d has no root directory", ownerID)
+	}
+	return *user.RootFileID, nil
+}
+
+// validateName 拒绝不能安全落库的名字。
+//
+// 不允许路径分隔符：这个名字只用于展示，绝不能参与拼磁盘路径。
+// 根目录 "/" 由服务端自己创建，不会走这里。
+func validateName(name string) error {
+	if name == "" || name == "." || name == ".." {
+		return ErrInvalidName
+	}
+	if !utf8.ValidString(name) || strings.ContainsRune(name, 0) {
+		return ErrInvalidName
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return ErrInvalidName
+	}
+	if utf8.RuneCountInString(name) > maxNameRunes {
+		return ErrInvalidName
+	}
+	return nil
+}
+
+// normalizePagination 把越界的页码收敛到合法范围，而不是报错。
+func normalizePagination(page, pageSize int) (int, int) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = defaultPageSize
+	}
+	if pageSize > maxPageSize {
+		pageSize = maxPageSize
+	}
+	return page, pageSize
+}
+
+// toFile 把数据库记录转成 HTTP 层要展示的结构。
+// 目录没有 Entity，Size 保持 0。
+func toFile(record model.File) File {
+	var size int64
+	if record.Entity != nil {
+		size = record.Entity.Size
+	}
+	return File{
+		ID:       record.ID,
+		Name:     record.Name,
+		Size:     size,
+		Kind:     record.Kind,
+		ParentID: record.ParentID,
+	}
 }

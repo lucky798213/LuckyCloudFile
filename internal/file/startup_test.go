@@ -15,6 +15,7 @@ import (
 	"luckyCloudFile/internal/app"
 	"luckyCloudFile/internal/config"
 	"luckyCloudFile/internal/database"
+	"luckyCloudFile/internal/model"
 )
 
 // TestNormalStartupDoesNotCreateUsers 验证正常启动只初始化服务，
@@ -33,10 +34,10 @@ func TestNormalStartupDoesNotCreateUsers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = client.Close() })
+	t.Cleanup(func() { _ = database.Close(client) })
 	resetAuthTables(t, client)
 
-	if count := client.User.Query().CountX(ctx); count != 0 {
+	if count := countRows(t, client, &model.User{}); count != 0 {
 		t.Fatalf("clean database should have no users, got %d", count)
 	}
 
@@ -60,7 +61,7 @@ func TestNormalStartupDoesNotCreateUsers(t *testing.T) {
 		t.Fatalf("wanted occupied-port error, got %v", err)
 	}
 
-	if count := client.User.Query().CountX(ctx); count != 0 {
+	if count := countRows(t, client, &model.User{}); count != 0 {
 		t.Fatalf("normal startup created %d default user(s), want 0", count)
 	}
 	t.Log("PASS: normal startup created no users")

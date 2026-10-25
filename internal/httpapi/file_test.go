@@ -11,15 +11,17 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
 	"luckyCloudFile/internal/file"
+	"luckyCloudFile/internal/model"
 )
 
-// fakeFileService 实现和 *file.Service 相同的三个方法，但不连数据库、不写磁盘。
+// fakeFileService 实现和 *file.Service 相同的接口，但不连数据库、不写磁盘。
 //
 // HTTP 层的测试只关心“状态码、响应头、JSON 对不对”，
 // 真正的数据库和磁盘行为由 internal/file 的集成测试覆盖。
@@ -39,7 +41,45 @@ func newFakeFileService() *fakeFileService {
 	}
 }
 
-func (f *fakeFileService) Upload(ctx context.Context, ownerID int, name string, r io.Reader) (file.File, error) {
+// checkParent 模拟 requireDirectory：父目录必须属于当前用户、而且真的是目录。
+// 调用时必须已经持有 f.mu。
+func (f *fakeFileService) checkParent(ownerID int, parentID string) error {
+	if parentID == "" {
+		// 假实现里不建根目录节点，空字符串直接当作根。
+		return nil
+	}
+	record, ok := f.records[parentID]
+	if !ok || f.owners[parentID] != ownerID {
+		return file.ErrNotFound
+	}
+	if record.Kind != model.KindDirectory {
+		return file.ErrNotDirectory
+	}
+	return nil
+}
+
+// nameTaken 模拟 (owner_id, parent_id, name) 唯一约束。
+// 调用时必须已经持有 f.mu。
+func (f *fakeFileService) nameTaken(ownerID int, parentID, name string) bool {
+	for id, record := range f.records {
+		if f.owners[id] != ownerID || record.Name != name {
+			continue
+		}
+		if sameParent(record.ParentID, parentID) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameParent(parent *string, parentID string) bool {
+	if parent == nil {
+		return parentID == ""
+	}
+	return *parent == parentID
+}
+
+func (f *fakeFileService) Upload(ctx context.Context, ownerID int, parentID, name string, r io.Reader) (file.File, error) {
 	// 测试替身把内容读进内存就够了，不用真的写磁盘。
 	data, err := io.ReadAll(io.LimitReader(r, file.MaxUploadBytes+1))
 	if err != nil {
@@ -51,21 +91,106 @@ func (f *fakeFileService) Upload(ctx context.Context, ownerID int, name string, 
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if err := f.checkParent(ownerID, parentID); err != nil {
+		return file.File{}, err
+	}
+	if f.nameTaken(ownerID, parentID, name) {
+		return file.File{}, file.ErrAlreadyExists
+	}
+
 	f.nextID++
 	id := fmt.Sprintf("fake-%d", f.nextID)
-	record := file.File{ID: id, Name: name, Size: int64(len(data))}
+	record := file.File{ID: id, Name: name, Size: int64(len(data)), Kind: model.KindFile}
+	if parentID != "" {
+		record.ParentID = &parentID
+	}
 	f.records[id] = record
 	f.contents[id] = data
 	f.owners[id] = ownerID
 	return record, nil
 }
 
+func (f *fakeFileService) CreateDirectory(ctx context.Context, ownerID int, parentID, name string) (file.File, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if err := f.checkParent(ownerID, parentID); err != nil {
+		return file.File{}, err
+	}
+	if f.nameTaken(ownerID, parentID, name) {
+		return file.File{}, file.ErrAlreadyExists
+	}
+
+	f.nextID++
+	id := fmt.Sprintf("fake-%d", f.nextID)
+	record := file.File{ID: id, Name: name, Kind: model.KindDirectory}
+	if parentID != "" {
+		record.ParentID = &parentID
+	}
+	f.records[id] = record
+	f.owners[id] = ownerID
+	return record, nil
+}
+
+func (f *fakeFileService) ListChildren(ctx context.Context, ownerID int, parentID string, page, pageSize int) (file.ListResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if err := f.checkParent(ownerID, parentID); err != nil {
+		return file.ListResult{}, err
+	}
+
+	items := make([]file.File, 0)
+	for id, record := range f.records {
+		if f.owners[id] == ownerID && sameParent(record.ParentID, parentID) {
+			items = append(items, record)
+		}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Name == items[j].Name {
+			return items[i].ID < items[j].ID
+		}
+		return items[i].Name < items[j].Name
+	})
+
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	total := int64(len(items))
+	start := (page - 1) * pageSize
+	if start > len(items) {
+		start = len(items)
+	}
+	end := start + pageSize
+	if end > len(items) {
+		end = len(items)
+	}
+
+	return file.ListResult{
+		Items:    items[start:end],
+		Total:    total,
+		Page:     page,
+		PageSize: pageSize,
+	}, nil
+}
+
 func (f *fakeFileService) Open(ctx context.Context, ownerID int, id string) (file.File, io.ReadCloser, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
 	record, ok := f.records[id]
 	if !ok || f.owners[id] != ownerID {
 		return file.File{}, nil, file.ErrNotFound
+	}
+	if record.Kind != model.KindFile {
+		return file.File{}, nil, file.ErrIsDirectory
 	}
 	return record, io.NopCloser(bytes.NewReader(f.contents[id])), nil
 }
@@ -73,8 +198,13 @@ func (f *fakeFileService) Open(ctx context.Context, ownerID int, id string) (fil
 func (f *fakeFileService) Delete(ctx context.Context, ownerID int, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.records[id]; !ok || f.owners[id] != ownerID {
+
+	record, ok := f.records[id]
+	if !ok || f.owners[id] != ownerID {
 		return file.ErrNotFound
+	}
+	if record.Kind != model.KindFile {
+		return file.ErrIsDirectory
 	}
 	delete(f.records, id)
 	delete(f.contents, id)
@@ -140,6 +270,90 @@ func upload(t *testing.T, router http.Handler, content []byte) file.File {
 		t.Fatal(err)
 	}
 	return record
+}
+
+// withParent 给请求加上 parent_id 查询参数。
+func withParent(req *http.Request, parentID string) *http.Request {
+	query := req.URL.Query()
+	query.Set("parent_id", parentID)
+	req.URL.RawQuery = query.Encode()
+	return req
+}
+
+// createDir 通过 HTTP 在 parentID 下创建一个目录，默认以 A 登录。
+func createDir(t *testing.T, router http.Handler, parentID, name string) file.File {
+	t.Helper()
+
+	payload, err := json.Marshal(createDirectoryRequest{ParentID: parentID, Name: name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/directories", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	authorize(req, testTokenA)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("create directory: wanted 201, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var record file.File
+	if err := json.Unmarshal(recorder.Body.Bytes(), &record); err != nil {
+		t.Fatal(err)
+	}
+	return record
+}
+
+// uploadInto 把文件上传到指定目录。
+func uploadInto(t *testing.T, router http.Handler, parentID, filename string, content []byte) file.File {
+	t.Helper()
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, withParent(uploadRequest(t, "file", filename, content), parentID))
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("upload into %q: wanted 201, got %d: %s", parentID, recorder.Code, recorder.Body.String())
+	}
+
+	var record file.File
+	if err := json.Unmarshal(recorder.Body.Bytes(), &record); err != nil {
+		t.Fatal(err)
+	}
+	return record
+}
+
+// listChildren 调用 GET /api/files 并解析响应。
+func listChildren(t *testing.T, router http.Handler, parentID, page, pageSize string) file.ListResult {
+	t.Helper()
+
+	target := "/api/files?page=" + page + "&page_size=" + pageSize
+	if parentID != "" {
+		target += "&parent_id=" + parentID
+	}
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	authorize(req, testTokenA)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("list files: wanted 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var result file.ListResult
+	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+// errorCode 解析错误响应里的 code。
+func errorCode(t *testing.T, recorder *httptest.ResponseRecorder) string {
+	t.Helper()
+	var response ErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	return response.Code
 }
 
 func TestUploadFile(t *testing.T) {
@@ -384,8 +598,10 @@ func TestFileEndpointsRequireLogin(t *testing.T) {
 
 	requests := []*http.Request{
 		uploadRequest(t, "file", "a.txt", []byte("x")),
+		httptest.NewRequest(http.MethodGet, "/api/files", nil),
 		httptest.NewRequest(http.MethodGet, "/api/files/whatever", nil),
 		httptest.NewRequest(http.MethodDelete, "/api/files/whatever", nil),
+		httptest.NewRequest(http.MethodPost, "/api/directories", strings.NewReader(`{"name":"docs"}`)),
 	}
 	for _, req := range requests {
 		// uploadRequest 默认带 A 的 Token；这里统一去掉，验证未登录行为。
@@ -444,5 +660,166 @@ func TestDeleteUnknownID(t *testing.T) {
 
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("wanted 404, got %d", recorder.Code)
+	}
+}
+
+// TestCreateDirectoryAndList 覆盖目录接口的闭环：
+// 建目录 → 往里传文件 → 列目录 → 列根目录。
+func TestCreateDirectoryAndList(t *testing.T) {
+	router, _ := newTestRouter(t)
+
+	dir := createDir(t, router, "", "学习资料")
+	if dir.ID == "" || dir.Name != "学习资料" || dir.Kind != model.KindDirectory || dir.Size != 0 {
+		t.Fatalf("unexpected directory: %+v", dir)
+	}
+
+	uploaded := uploadInto(t, router, dir.ID, "笔记.txt", []byte("hello"))
+	if uploaded.ParentID == nil || *uploaded.ParentID != dir.ID {
+		t.Fatalf("uploaded parent = %v, want %q", uploaded.ParentID, dir.ID)
+	}
+
+	list := listChildren(t, router, dir.ID, "1", "20")
+	if list.Total != 1 || len(list.Items) != 1 {
+		t.Fatalf("unexpected directory listing: %+v", list)
+	}
+	if item := list.Items[0]; item.ID != uploaded.ID || item.Name != "笔记.txt" ||
+		item.Size != 5 || item.Kind != model.KindFile {
+		t.Fatalf("unexpected child: %+v", list.Items[0])
+	}
+
+	// 根目录只看得到这个目录，看不到目录里的文件。
+	rootList := listChildren(t, router, "", "1", "20")
+	if rootList.Total != 1 || len(rootList.Items) != 1 || rootList.Items[0].ID != dir.ID {
+		t.Fatalf("unexpected root listing: %+v", rootList)
+	}
+
+	// 第二页为空，但 total 仍然是 1。
+	emptyPage := listChildren(t, router, dir.ID, "2", "1")
+	if emptyPage.Total != 1 || len(emptyPage.Items) != 0 {
+		t.Fatalf("unexpected second page: %+v", emptyPage)
+	}
+}
+
+func TestCreateDirectoryDuplicateName(t *testing.T) {
+	router, _ := newTestRouter(t)
+	createDir(t, router, "", "docs")
+
+	payload, err := json.Marshal(createDirectoryRequest{Name: "docs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/directories", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	authorize(req, testTokenA)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("wanted 409, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if code := errorCode(t, recorder); code != "already_exists" {
+		t.Fatalf("code = %q, want already_exists", code)
+	}
+}
+
+func TestDirectoryDownloadAndDeleteRejected(t *testing.T) {
+	router, _ := newTestRouter(t)
+	dir := createDir(t, router, "", "docs")
+
+	download := httptest.NewRecorder()
+	router.ServeHTTP(download, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+dir.ID, nil), testTokenA))
+	if download.Code != http.StatusBadRequest {
+		t.Fatalf("download directory: wanted 400, got %d: %s", download.Code, download.Body.String())
+	}
+	if code := errorCode(t, download); code != "is_directory" {
+		t.Fatalf("code = %q, want is_directory", code)
+	}
+
+	remove := httptest.NewRecorder()
+	router.ServeHTTP(remove, authorize(httptest.NewRequest(http.MethodDelete, "/api/files/"+dir.ID, nil), testTokenA))
+	if remove.Code != http.StatusBadRequest {
+		t.Fatalf("delete directory: wanted 400, got %d: %s", remove.Code, remove.Body.String())
+	}
+}
+
+func TestParentValidation(t *testing.T) {
+	router, _ := newTestRouter(t)
+	fileRecord := upload(t, router, []byte("x"))
+
+	// parent_id 指向普通文件：400 not_a_directory。
+	intoFile := httptest.NewRecorder()
+	router.ServeHTTP(intoFile, withParent(uploadRequest(t, "file", "child.txt", []byte("y")), fileRecord.ID))
+	if intoFile.Code != http.StatusBadRequest {
+		t.Fatalf("upload into a file: wanted 400, got %d: %s", intoFile.Code, intoFile.Body.String())
+	}
+	if code := errorCode(t, intoFile); code != "not_a_directory" {
+		t.Fatalf("code = %q, want not_a_directory", code)
+	}
+
+	// parent_id 根本不存在：404 parent_not_found。
+	missing := httptest.NewRecorder()
+	router.ServeHTTP(missing, withParent(uploadRequest(t, "file", "a.txt", []byte("x")), "does-not-exist"))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("upload into missing directory: wanted 404, got %d", missing.Code)
+	}
+	if code := errorCode(t, missing); code != "parent_not_found" {
+		t.Fatalf("code = %q, want parent_not_found", code)
+	}
+
+	// 列一个不存在的目录同样 404。
+	listMissing := httptest.NewRecorder()
+	router.ServeHTTP(listMissing, authorize(
+		httptest.NewRequest(http.MethodGet, "/api/files?parent_id=does-not-exist", nil), testTokenA))
+	if listMissing.Code != http.StatusNotFound {
+		t.Fatalf("list missing directory: wanted 404, got %d", listMissing.Code)
+	}
+
+	// 在别人的目录下建目录：假实现里 B 不是父目录的 owner，等价于不存在。
+	dir := createDir(t, router, "", "mine")
+	payload, err := json.Marshal(createDirectoryRequest{ParentID: dir.ID, Name: "hack"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/directories", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	authorize(req, testTokenB)
+	foreign := httptest.NewRecorder()
+	router.ServeHTTP(foreign, req)
+	if foreign.Code != http.StatusNotFound {
+		t.Fatalf("B create in A's directory: wanted 404, got %d: %s", foreign.Code, foreign.Body.String())
+	}
+}
+
+func TestListPaginationValidation(t *testing.T) {
+	router, _ := newTestRouter(t)
+
+	for _, target := range []string{
+		"/api/files?page=abc",
+		"/api/files?page_size=abc",
+	} {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, authorize(httptest.NewRequest(http.MethodGet, target, nil), testTokenA))
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("%s: wanted 400, got %d", target, recorder.Code)
+		}
+		if code := errorCode(t, recorder); code != "invalid_pagination" {
+			t.Fatalf("%s: code = %q, want invalid_pagination", target, code)
+		}
+	}
+}
+
+func TestUploadDuplicateName(t *testing.T) {
+	router, _ := newTestRouter(t)
+	upload(t, router, []byte("one"))
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, uploadRequest(t, "file", "test.bin", []byte("two")))
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("wanted 409, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if code := errorCode(t, recorder); code != "already_exists" {
+		t.Fatalf("code = %q, want already_exists", code)
 	}
 }

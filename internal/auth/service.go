@@ -16,10 +16,9 @@ import (
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
 
-	"luckyCloudFile/internal/ent"
-	entsession "luckyCloudFile/internal/ent/authsession"
-	entuser "luckyCloudFile/internal/ent/user"
+	"luckyCloudFile/internal/model"
 )
 
 const (
@@ -48,21 +47,22 @@ type LoginResult struct {
 
 // Service 负责登录、会话校验和退出。
 type Service struct {
-	client *ent.Client
+	db *gorm.DB
 }
 
 // NewService 创建认证服务。
-func NewService(client *ent.Client) *Service {
-	return &Service{client: client}
+func NewService(db *gorm.DB) *Service {
+	return &Service{db: db}
 }
 
 // Login 校验用户名和密码，成功时创建会话并返回新的原始 Token。
 func (s *Service) Login(ctx context.Context, username, password string) (LoginResult, error) {
-	user, err := s.client.User.Query().
-		Where(entuser.Username(username)).
-		Only(ctx)
+	var user model.User
+	err := s.db.WithContext(ctx).
+		Where("username = ?", username).
+		First(&user).Error
 	if err != nil {
-		if ent.IsNotFound(err) {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return LoginResult{}, ErrInvalidCredentials
 		}
 		return LoginResult{}, fmt.Errorf("query user: %w", err)
@@ -84,11 +84,12 @@ func (s *Service) Login(ctx context.Context, username, password string) (LoginRe
 	}
 	expiresAt := time.Now().Add(TokenTTL)
 
-	if _, err := s.client.AuthSession.Create().
-		SetTokenHash(tokenHash).
-		SetExpiresAt(expiresAt).
-		SetUserID(user.ID).
-		Save(ctx); err != nil {
+	session := model.AuthSession{
+		TokenHash: tokenHash,
+		ExpiresAt: expiresAt,
+		UserID:    user.ID,
+	}
+	if err := s.db.WithContext(ctx).Create(&session).Error; err != nil {
 		return LoginResult{}, fmt.Errorf("create session: %w", err)
 	}
 
@@ -104,24 +105,23 @@ func (s *Service) Authenticate(ctx context.Context, rawToken string) (int, error
 		return 0, ErrUnauthorized
 	}
 
-	session, err := s.client.AuthSession.Query().
-		Where(
-			entsession.TokenHash(hashToken(rawToken)),
-			entsession.ExpiresAtGT(time.Now()),
-		).
-		WithUser().
-		Only(ctx)
+	var session model.AuthSession
+	err := s.db.WithContext(ctx).
+		Preload("User").
+		Where("token_hash = ? AND expires_at > ?", hashToken(rawToken), time.Now()).
+		First(&session).Error
 	if err != nil {
-		if ent.IsNotFound(err) {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return 0, ErrUnauthorized
 		}
 		return 0, fmt.Errorf("query session: %w", err)
 	}
-	if session.Edges.User == nil {
+	// Preload 没有找到关联用户时，User 会是 nil。
+	if session.User == nil {
 		return 0, ErrUnauthorized
 	}
 
-	return session.Edges.User.ID, nil
+	return session.User.ID, nil
 }
 
 // Logout 删除当前 Token 对应的会话。删除成功后，旧 Token 立即失效。
@@ -130,16 +130,13 @@ func (s *Service) Logout(ctx context.Context, rawToken string) error {
 		return ErrUnauthorized
 	}
 
-	deleted, err := s.client.AuthSession.Delete().
-		Where(
-			entsession.TokenHash(hashToken(rawToken)),
-			entsession.ExpiresAtGT(time.Now()),
-		).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("delete session: %w", err)
+	result := s.db.WithContext(ctx).
+		Where("token_hash = ? AND expires_at > ?", hashToken(rawToken), time.Now()).
+		Delete(&model.AuthSession{})
+	if result.Error != nil {
+		return fmt.Errorf("delete session: %w", result.Error)
 	}
-	if deleted == 0 {
+	if result.RowsAffected == 0 {
 		return ErrUnauthorized
 	}
 	return nil

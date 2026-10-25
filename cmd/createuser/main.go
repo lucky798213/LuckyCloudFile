@@ -62,7 +62,7 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "连接数据库失败:", err)
 		return 1
 	}
-	defer client.Close()
+	defer database.Close(client)
 
 	user, err := auth.CreateUser(ctx, client, *username, password)
 	if err != nil {

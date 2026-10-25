@@ -23,14 +23,16 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 }
 
-// fileService 是路由需要文件服务提供的三个能力。
+// fileService 是路由需要文件服务提供的能力。
 //
 // 这里用接口而不是直接写 *file.Service，是为了让 HTTP 层的测试
 // 可以用一个不连数据库的假实现；生产代码传进去的仍然是 *file.Service。
 type fileService interface {
-	Upload(ctx context.Context, ownerID int, name string, r io.Reader) (file.File, error)
+	Upload(ctx context.Context, ownerID int, parentID, name string, r io.Reader) (file.File, error)
 	Open(ctx context.Context, ownerID int, id string) (file.File, io.ReadCloser, error)
 	Delete(ctx context.Context, ownerID int, id string) error
+	CreateDirectory(ctx context.Context, ownerID int, parentID, name string) (file.File, error)
+	ListChildren(ctx context.Context, ownerID int, parentID string, page, pageSize int) (file.ListResult, error)
 }
 
 // NewRouter 创建并配置好路由。
@@ -61,8 +63,13 @@ func NewRouter(logger *slog.Logger, fileService fileService, authService authSer
 	protected := r.Group("/api")
 	protected.Use(requireAuth(logger, authService))
 	protected.POST("/auth/logout", logout(logger, authService))
-	// 文件上传：请求体是 multipart/form-data，文件放在 file 字段里。
+	// 目录：只插入一行 File，不写磁盘。
+	protected.POST("/directories", createDirectory(logger, fileService))
+	// 文件上传：请求体是 multipart/form-data，文件放在 file 字段里；
+	// parent_id 是查询参数，不传表示当前用户的根目录。
 	protected.POST("/files", uploadFile(logger, fileService))
+	// 目录列表：GET /api/files?parent_id=...&page=1&page_size=20
+	protected.GET("/files", listFiles(logger, fileService))
 	// 文件下载和删除：:id 是上传时返回的服务端 ID，且必须属于当前用户。
 	protected.GET("/files/:id", downloadFile(logger, fileService))
 	protected.DELETE("/files/:id", deleteFile(logger, fileService))
