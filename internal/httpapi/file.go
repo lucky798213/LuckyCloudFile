@@ -473,7 +473,7 @@ func handleFileError(c *gin.Context, err error, notFoundCode, notFoundMessage st
 	case errors.Is(err, file.ErrInvalidSize):
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Code:    "invalid_size",
-			Message: "size must be greater than or equal to 0; chunked uploads require a non-empty file",
+			Message: "size must be greater than or equal to 0",
 		})
 	case errors.Is(err, file.ErrInvalidName):
 		c.JSON(http.StatusBadRequest, ErrorResponse{

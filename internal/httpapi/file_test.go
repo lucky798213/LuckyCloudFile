@@ -21,6 +21,7 @@ import (
 
 	"luckyCloudFile/internal/file"
 	"luckyCloudFile/internal/model"
+	uploadpkg "luckyCloudFile/internal/upload"
 )
 
 // fakeUploadSession 是假服务里的一条上传会话，只用来验证 HTTP 层。
@@ -386,12 +387,18 @@ func (f *fakeFileService) CreateUploadSessionWithMode(ctx context.Context, owner
 
 	var chunkSize int64
 	var chunkCount int
+	status := model.UploadStatusPending
 	if mode == model.UploadModeChunked {
-		if size == 0 {
-			return file.UploadSessionInfo{}, file.ErrInvalidSize
-		}
 		chunkSize = file.UploadChunkSize
-		chunkCount = int((size + chunkSize - 1) / chunkSize)
+		count, err := uploadpkg.ChunkCount(size, chunkSize)
+		if err != nil {
+			return file.UploadSessionInfo{}, err
+		}
+		chunkCount = count
+		if size == 0 {
+			// 空文件没有分片，创建后直接可以完成。
+			status = model.UploadStatusReady
+		}
 	}
 
 	f.mu.Lock()
@@ -411,7 +418,7 @@ func (f *fakeFileService) CreateUploadSessionWithMode(ctx context.Context, owner
 		Mode:         mode,
 		ChunkSize:    chunkSize,
 		ChunkCount:   chunkCount,
-		Status:       model.UploadStatusPending,
+		Status:       status,
 		ExpiresAt:    time.Now().Add(file.UploadSessionTTL),
 	}
 	f.sessions[info.ID] = fakeUploadSession{info: info, ownerID: ownerID}

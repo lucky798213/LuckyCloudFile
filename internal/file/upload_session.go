@@ -11,6 +11,7 @@ import (
 	"luckyCloudFile/internal/idgen"
 	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/quota"
+	"luckyCloudFile/internal/upload"
 )
 
 // UploadSessionTTL 是上传会话的固定有效期。
@@ -62,7 +63,8 @@ func (s *Service) CreateUploadSession(
 // CreateUploadSessionWithMode 创建一个只有占位实体的上传会话。
 //
 // mode 为空时按 full 处理；chunked 的分片大小由服务端固定为 UploadChunkSize，
-// 客户端不能指定。空文件没有分片可传，所以 chunked + size=0 返回 ErrInvalidSize。
+// 客户端不能指定。空文件在 chunked 下 chunkCount=0，创建后直接是 ready，
+// 不需要上传任何分片，直接调用完成接口即可。
 //
 // 本阶段不接收文件内容，也不创建 File 或磁盘文件：
 // 会话和占位 Entity 只是为后续传输建立“上传单”。
@@ -103,12 +105,14 @@ func (s *Service) CreateUploadSessionWithMode(
 	}
 
 	// full 模式没有分片大小；chunked 由服务端规定，客户端只能知道不能指定。
+	// 空文件在 chunked 下没有分片可传，创建后直接是 ready，客户端直接走完成接口。
 	var chunkSize int64
+	status := model.UploadStatusPending
 	if mode == model.UploadModeChunked {
-		if size == 0 {
-			return UploadSessionInfo{}, ErrInvalidSize
-		}
 		chunkSize = UploadChunkSize
+		if size == 0 {
+			status = model.UploadStatusReady
+		}
 	}
 
 	// 先做一次目录校验，快速拒绝明显不合法的请求；事务里还会再查一次。
@@ -143,7 +147,7 @@ func (s *Service) CreateUploadSessionWithMode(
 		Mode:          mode,
 		ChunkSize:     chunkSize,
 		ReservedBytes: size,
-		Status:        model.UploadStatusPending,
+		Status:        status,
 		ExpiresAt:     time.Now().Add(UploadSessionTTL),
 	}
 
@@ -227,7 +231,9 @@ func toUploadSessionInfo(session model.UploadSession) UploadSessionInfo {
 	var chunkCount int
 	if mode == model.UploadModeChunked {
 		chunkSize = session.ChunkSize
-		chunkCount = uploadChunkCount(session.ExpectedSize, chunkSize)
+		if count, err := upload.ChunkCount(session.ExpectedSize, chunkSize); err == nil {
+			chunkCount = count
+		}
 	}
 
 	return UploadSessionInfo{
@@ -243,14 +249,4 @@ func toUploadSessionInfo(session model.UploadSession) UploadSessionInfo {
 		ExpiresAt:    session.ExpiresAt,
 		ResultFileID: session.ResultFileID,
 	}
-}
-
-// uploadChunkCount 返回按固定分片大小切分后一共有多少片。
-//
-// 大小或分片大小不合法时返回 0；正常情况下分片数不会超过 MaxUploadBytes/1MiB。
-func uploadChunkCount(size, chunkSize int64) int {
-	if size <= 0 || chunkSize <= 0 {
-		return 0
-	}
-	return int((size-1)/chunkSize + 1)
 }

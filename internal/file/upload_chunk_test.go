@@ -211,8 +211,8 @@ func TestUploadModesRejectMismatchedEndpoints(t *testing.T) {
 	}
 }
 
-// TestCreateChunkedUploadSessionRejectsInvalidModeAndEmptyFile 覆盖创建参数。
-func TestCreateChunkedUploadSessionRejectsInvalidModeAndEmptyFile(t *testing.T) {
+// TestCreateChunkedUploadSessionRejectsInvalidMode 覆盖创建参数。
+func TestCreateChunkedUploadSessionRejectsInvalidMode(t *testing.T) {
 	env := newTestEnv(t)
 	ctx := context.Background()
 
@@ -221,13 +221,96 @@ func TestCreateChunkedUploadSessionRejectsInvalidModeAndEmptyFile(t *testing.T) 
 	); !errors.Is(err, ErrInvalidUploadMode) {
 		t.Fatalf("invalid mode: wanted ErrInvalidUploadMode, got %v", err)
 	}
-	if _, err := env.service.CreateUploadSessionWithMode(
-		ctx, env.ownerA.ID, "", "empty.bin", 0, model.UploadModeChunked,
-	); !errors.Is(err, ErrInvalidSize) {
-		t.Fatalf("empty chunked file: wanted ErrInvalidSize, got %v", err)
-	}
 	if got := countRows(t, env.db, &model.UploadSession{}); got != 0 {
-		t.Fatalf("invalid requests left %d sessions", got)
+		t.Fatalf("invalid request left %d sessions", got)
+	}
+}
+
+// TestEmptyChunkedUploadSessionCompletesWithoutChunks 验证空文件：
+// chunkCount=0，不发送任何分片，创建后直接 ready，可以直接走完成接口；
+// 完成后必须能正常下载到一个 0 字节文件。
+func TestEmptyChunkedUploadSessionCompletesWithoutChunks(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	info, err := env.service.CreateUploadSessionWithMode(
+		ctx, env.ownerA.ID, "", "empty.bin", 0, model.UploadModeChunked,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode != model.UploadModeChunked ||
+		info.ChunkSize != UploadChunkSize ||
+		info.ChunkCount != 0 {
+		t.Fatalf("empty chunked session = %+v", info)
+	}
+	if info.Status != model.UploadStatusReady || info.ActualSize != 0 {
+		t.Fatalf("empty chunked session is not ready: %+v", info)
+	}
+	if entries := diskEntries(t, env.rootA); len(entries) != 0 {
+		t.Fatalf("empty chunked session wrote content to disk: %v", entries)
+	}
+
+	completed, err := env.service.CompleteUploadSession(ctx, env.ownerA.ID, info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != model.UploadStatusCompleted || completed.ResultFileID == nil {
+		t.Fatalf("completed empty session = %+v", completed)
+	}
+
+	// 关键回归：完成后的文件必须能从存储层打开，而且内容长度为 0。
+	// 先确认磁盘上真的存在这个对象，再看下载路径读到的是空内容。
+	session := reloadSession(t, env, info.ID)
+	var entity model.Entity
+	if err := env.db.First(&entity, session.EntityID).Error; err != nil {
+		t.Fatal(err)
+	}
+	stat, err := os.Stat(filepath.Join(env.rootA, entity.StorageKey))
+	if err != nil {
+		t.Fatalf("completed empty file has no physical object: %v", err)
+	}
+	if stat.Size() != 0 {
+		t.Fatalf("physical empty file size = %d, want 0", stat.Size())
+	}
+
+	record, reader, err := env.service.Open(ctx, env.ownerA.ID, *completed.ResultFileID)
+	if err != nil {
+		t.Fatalf("open completed empty file: %v", err)
+	}
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read completed empty file: %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close completed empty file: %v", err)
+	}
+	if record.Size != 0 || len(got) != 0 {
+		t.Fatalf("completed empty file size=%d content_length=%d, want 0/0",
+			record.Size, len(got))
+	}
+
+	// 重复确认完成是幂等的，仍然能下载同一个空文件。
+	again, err := env.service.CompleteUploadSession(ctx, env.ownerA.ID, info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ResultFileID == nil || *again.ResultFileID != *completed.ResultFileID {
+		t.Fatalf("repeated completion returned %v, want %q",
+			again.ResultFileID, *completed.ResultFileID)
+	}
+
+	// 任何分片编号都没有意义。
+	if _, err := env.service.UploadSessionChunk(
+		ctx, env.ownerA.ID, info.ID, 0, bytes.NewReader(nil),
+	); err == nil {
+		t.Fatal("empty chunked session accepted chunk index 0")
+	}
+
+	user := reloadUser(t, env, env.ownerA.ID)
+	if user.ReservedBytes != 0 || user.UsedBytes != 0 {
+		t.Fatalf("quota after empty upload: reserved=%d used=%d",
+			user.ReservedBytes, user.UsedBytes)
 	}
 }
 

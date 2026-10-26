@@ -134,6 +134,45 @@ func TestUploadSessionHTTPChunkModeGuards(t *testing.T) {
 	assertErrorCode(t, wrongEndpoint, "upload_mode_mismatch")
 }
 
+// TestUploadSessionHTTPEmptyChunkedCompletes 验证空文件没有分片：
+// 创建后直接 ready，不需要调用分片接口，直接确认完成。
+func TestUploadSessionHTTPEmptyChunkedCompletes(t *testing.T) {
+	router, _ := newTestRouter(t)
+
+	created := httptest.NewRecorder()
+	router.ServeHTTP(created, uploadSessionJSONRequest(
+		t, http.MethodPost, "/api/upload-sessions",
+		`{"name":"empty.bin","size":0,"mode":"chunked"}`, testTokenA,
+	))
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create empty chunked session: wanted 201, got %d: %s",
+			created.Code, created.Body.String())
+	}
+	var info file.UploadSessionInfo
+	if err := json.Unmarshal(created.Body.Bytes(), &info); err != nil {
+		t.Fatal(err)
+	}
+	if info.ChunkCount != 0 || info.Status != model.UploadStatusReady {
+		t.Fatalf("empty chunked session = %+v", info)
+	}
+
+	completed := httptest.NewRecorder()
+	router.ServeHTTP(completed, uploadSessionJSONRequest(
+		t, http.MethodPost, "/api/upload-sessions/"+info.ID+"/complete", "", testTokenA,
+	))
+	if completed.Code != http.StatusOK {
+		t.Fatalf("complete empty chunked session: wanted 200, got %d: %s",
+			completed.Code, completed.Body.String())
+	}
+	var done file.UploadSessionInfo
+	if err := json.Unmarshal(completed.Body.Bytes(), &done); err != nil {
+		t.Fatal(err)
+	}
+	if done.Status != model.UploadStatusCompleted || done.ResultFileID == nil {
+		t.Fatalf("completed empty chunked session = %+v", done)
+	}
+}
+
 func assertErrorCode(t *testing.T, recorder *httptest.ResponseRecorder, want string) {
 	t.Helper()
 	var body ErrorResponse

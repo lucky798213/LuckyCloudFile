@@ -11,6 +11,7 @@ import (
 
 	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/storage"
+	"luckyCloudFile/internal/upload"
 )
 
 // UploadSessionChunk 接收 chunked 会话的一个分片。
@@ -50,30 +51,21 @@ func (s *Service) UploadSessionChunk(
 		return UploadSessionInfo{}, ErrUploadSessionConflict
 	}
 
-	chunkSize := session.ChunkSize
-	if chunkSize <= 0 {
+	// 片数、偏移和本片长度全部由纯计算函数给出。
+	// 已确认的 ActualSize 必须正好是这一片的起点，否则就是跳片或重复上传。
+	offset, chunkBytes, err := upload.ChunkAt(
+		session.ExpectedSize, session.ChunkSize, index,
+	)
+	if err != nil {
+		if errors.Is(err, upload.ErrChunkIndexOutOfRange) {
+			return UploadSessionInfo{}, ErrInvalidChunkIndex
+		}
 		return UploadSessionInfo{}, fmt.Errorf(
-			"upload session %s is chunked but has invalid chunk_size %d",
-			session.ID, chunkSize,
+			"compute upload chunk geometry for session %s: %w", session.ID, err,
 		)
 	}
-	chunkCount := uploadChunkCount(session.ExpectedSize, chunkSize)
-	if index < 0 || index >= chunkCount {
-		return UploadSessionInfo{}, ErrInvalidChunkIndex
-	}
-
-	// 已确认的字节数一定是分片大小的整数倍；下一片序号由它直接算出。
-	expectedIndex := int(session.ActualSize / chunkSize)
-	if index != expectedIndex {
+	if offset != session.ActualSize {
 		return UploadSessionInfo{}, ErrUploadSessionConflict
-	}
-	remaining := session.ExpectedSize - session.ActualSize
-	if remaining <= 0 {
-		return UploadSessionInfo{}, ErrUploadSessionConflict
-	}
-	chunkBytes := chunkSize
-	if remaining < chunkBytes {
-		chunkBytes = remaining
 	}
 
 	var entity model.Entity
@@ -124,7 +116,7 @@ func (s *Service) UploadSessionChunk(
 	}
 
 	size, err := store.Append(
-		uploadCtx, entity.StorageKey, session.ActualSize, r, chunkBytes,
+		uploadCtx, entity.StorageKey, offset, r, chunkBytes,
 	)
 	if err != nil {
 		cause := err
@@ -140,7 +132,7 @@ func (s *Service) UploadSessionChunk(
 	}
 
 	info, err := s.finalizeUploadChunk(
-		ctx, ownerID, session, session.ActualSize+size,
+		ctx, ownerID, session, offset+size,
 	)
 	if err != nil {
 		return UploadSessionInfo{}, err

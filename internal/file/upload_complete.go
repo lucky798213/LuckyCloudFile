@@ -1,6 +1,7 @@
 package file
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -130,6 +131,25 @@ func (s *Service) CompleteUploadSession(
 				"%w: reserved_bytes=%d entity_size=%d",
 				ErrUploadSessionConflict, session.ReservedBytes, entity.Size,
 			)
+		}
+
+		// 空的分片会话没有调用过分片接口，磁盘上还没有对象；直接发布会让
+		// 完成后的文件下载不到。发布前幂等地补一个 0 字节对象。
+		//
+		// 用 Save 写空内容：同一个 key 重复写结果仍然是 0 字节，重试完成
+		// 不会产生多份内容。放在事务内是为了和会话/Entity 的发布共用同一个
+		// 提交边界，避免取消或过期清理与这次补写交错。
+		if session.ExpectedSize == 0 {
+			store, err := s.stores.Get(entity.StoragePolicyID)
+			if err != nil {
+				return fmt.Errorf(
+					"resolve storage policy %d for empty upload session %s: %w",
+					entity.StoragePolicyID, session.ID, err,
+				)
+			}
+			if _, err := store.Save(ctx, entity.StorageKey, bytes.NewReader(nil), 0); err != nil {
+				return fmt.Errorf("create empty upload content: %w", err)
+			}
 		}
 
 		// 先把预留转成已用。它和创建 File、激活 Entity、标记 completed
