@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // ErrTooLarge 表示写进来的内容超过了调用方允许的最大字节数。
@@ -23,6 +24,11 @@ var ErrTooLarge = errors.New("content too large")
 // 业务层只依赖 Store 接口；以后接 S3 时新增一个实现就行，不用改 internal/file。
 type Local struct {
 	root string
+
+	// chunkMu 串行化分片文件的初始化、写入和发布。
+	// 每个写分片的请求都会打开、写、关闭自己的文件句柄，不跨请求保留；
+	// 这个锁只保证 FinalizeChunks 不会和 WriteChunkAt 同时进行。
+	chunkMu sync.Mutex
 }
 
 // Local 必须满足 Store 接口。接口签名一旦对不上，编译时就会失败，
