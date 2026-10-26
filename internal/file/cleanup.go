@@ -8,7 +8,8 @@
 //	磁盘已删，Entity 还没删 → 再删发现对象不存在，视为成功，再清记录
 //
 // 清理逻辑本身不直接把 active 内容标成 pending_delete：它只处理已经处于
-// 该状态的 Entity。上传会话过期时，CleanupPending 会先走一遍到期扫描，
+// 该状态的 Entity。上传会话失效（到期，或服务重启后被启动恢复作废）时，
+// CleanupPending 会先走一遍到期扫描和终态恢复扫描，
 // 由 handoffTerminatedSession 在确认写入退出后产生新的 pending_delete。
 package file
 
@@ -78,7 +79,9 @@ func (s *Service) CleanupPending(ctx context.Context, batchSize int) (CleanupRes
 	}
 
 	// 第 2 步：补做已经 canceled / expired 但还没移交的占位内容。
-	// 服务可能在“会话已经是终态、Entity 仍是 uploading/0”时崩溃。
+	// 服务可能在“会话已经是终态、Entity 仍是 uploading/0”时崩溃；
+	// 启动恢复也会在服务开始接受请求前把旧会话统一标成 expired，
+	// 那些残留同样由这一步接手。
 	s.resumeTerminatedSessions(ctx, batchSize)
 
 	var cursor int64

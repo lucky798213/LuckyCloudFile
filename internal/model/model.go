@@ -186,6 +186,11 @@ func (AuthSession) TableName() string { return "auth_sessions" }
 // pending/receiving/ready 都可以变成 canceled 或 expired；
 // 一旦 completed 就不能再取消或过期。canceled / expired 都是终态，
 // 保留各自的原因，只继续推进残留内容的物理清理。
+//
+// expired 表示“这次上传已经失效”，原因有两种：超过 expires_at，
+// 或者服务重启后启动恢复把重启前的未完成会话统一作废。
+// 所以 expired 会话的 expires_at 完全可能还在未来，判断是否还能继续
+// 上传不能只看时间，必须先看状态。
 const (
 	UploadStatusPending   = "pending"
 	UploadStatusReceiving = "receiving"
@@ -222,7 +227,9 @@ type UploadSession struct {
 	// 会话状态，取值见上面的 UploadStatus* 常量。
 	Status string `gorm:"type:varchar(16);not null;default:pending;index:idx_upload_sessions_owner_status,priority:2"`
 
-	// 过期时间。未完成的会话超过这个时间后变成 expired。
+	// 过期时间。正常情况下，未完成的会话超过这个时间后由到期扫描变成 expired。
+	// 服务重启时，启动恢复会把重启前的未完成会话提前置为 expired，
+	// 此时 expires_at 可能还没到，客户端不能只凭这个字段判断能否继续上传。
 	ExpiresAt time.Time `gorm:"not null;index"`
 
 	// 完成后生成的文件 ID。只有 completed 状态才有值；

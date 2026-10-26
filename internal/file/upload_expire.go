@@ -19,6 +19,10 @@ const DefaultExpireBatchSize = DefaultCleanupBatchSize
 
 // ExpireUploadSessions 把已经超过 expires_at 的未完成上传会话标记为 expired。
 //
+// 它只处理“超时”这一种失效原因；服务重启造成的失效由
+// InvalidateUnfinishedUploads 在启动时完成。两者最终都走同一条清理链：
+// 会话处于 expired，resumeTerminatedSessions 再回收残留占位内容。
+//
 // now 由调用方显式传入，测试可以直接构造“已经到期”的时刻，
 // 不需要真的等待一小时。生产路径由 CleanupPending 传 time.Now()。
 //

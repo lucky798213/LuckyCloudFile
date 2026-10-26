@@ -40,6 +40,8 @@ func uploadSessionContent(logger *slog.Logger, svc fileService) gin.HandlerFunc 
 					Message: "upload session not found",
 				})
 			case errors.Is(err, file.ErrUploadSessionExpired):
+				// 410 覆盖两种失效：超过 expires_at，以及服务重启后
+				// 启动恢复把旧会话作废（此时 expires_at 可能还没到）。
 				c.JSON(http.StatusGone, ErrorResponse{
 					Code:    "upload_session_expired",
 					Message: "upload session has expired",

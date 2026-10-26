@@ -28,13 +28,35 @@ import (
 	"luckyCloudFile/internal/storage"
 )
 
+// uploadRecoverer 是启动恢复这一步的调用签名。
+//
+// 单独抽成参数，而不是在 run 里直接调用具体方法，是为了让测试能稳定地
+// 构造“恢复失败”：真实数据库故障很难在启动测试里精确制造，而
+// “恢复失败必须终止启动”是这个阶段最关键的保证，不能只靠代码审查。
+type uploadRecoverer func(ctx context.Context, svc *file.Service, batchSize int) error
+
+// recoverUnfinishedUploads 是生产实现：交给文件服务作废旧会话。
+func recoverUnfinishedUploads(ctx context.Context, svc *file.Service, batchSize int) error {
+	return svc.InvalidateUnfinishedUploads(ctx, batchSize)
+}
+
 // Run 启动 HTTP 服务，并一直阻塞到 ctx 被取消（例如用户按下 Ctrl+C）才返回。
 //
 // 整个启动过程是“一步一步来”的，任何一步失败都直接返回错误：
 //
 //	检查存储目录 → 连接 MySQL → 创建 HTTP Server → 绑定端口
-//	→ 启动后台清理 → 开始服务
+//	→ 作废旧上传会话 → 启动后台清理 → 开始服务
 func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
+	return run(ctx, cfg, logger, recoverUnfinishedUploads)
+}
+
+// run 是 Run 的实际启动流程。recoverUploads 单独传入，供测试替换。
+func run(
+	ctx context.Context,
+	cfg config.Config,
+	logger *slog.Logger,
+	recoverUploads uploadRecoverer,
+) error {
 	// 第一步：确认存储目录存在且可写。放在最前面，避免服务跑起来后才发现存不了文件。
 	if err := checkStorage(cfg.Storage.LocalRoot); err != nil {
 		return err
@@ -83,9 +105,23 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 	defer listener.Close()
 
-	// 第六步：开始后台物理清理。
+	// 第六步：作废上一次进程留下的未完成上传会话。
+	//
+	// 这一步必须同步执行，而且必须在开始接受 HTTP 请求之前完成：
+	// 旧进程已经退出，旧会话不能再上传或发布。单个会话的 expires_at 可能
+	// 还在未来，所以不能只靠后面的到期扫描。
+	//
+	// 失败必须终止启动，不能只记日志继续：那样会有一部分旧会话仍然可用。
+	// 这里只切断数据库里的资格；磁盘、Entity、Session 都交给下面
+	// CleanupLoop 里的现有恢复扫描继续回收，启动不必等物理删除完成。
+	if err := recoverUploads(ctx, fileService, file.DefaultRecoveryBatchSize); err != nil {
+		return fmt.Errorf("invalidate unfinished upload sessions: %w", err)
+	}
+
+	// 第七步：开始后台物理清理。
 	// 先立即扫描一次（补上上次进程崩溃留下的 pending_delete），之后定时扫描。
-	// 它只在监听成功后启动；Run 返回时一定先取消并等它退出，不留下孤儿 goroutine。
+	// 它只在监听和旧会话作废都成功后才启动；Run 返回时一定先取消并等它退出，
+	// 不留下孤儿 goroutine。
 	cleanupCtx, stopCleanup := context.WithCancel(ctx)
 	cleanupDone := make(chan struct{})
 	go func() {
@@ -93,7 +129,7 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		fileService.CleanupLoop(cleanupCtx, file.DefaultCleanupInterval, file.DefaultCleanupBatchSize)
 	}()
 
-	// 第七步：开始服务，直到收到退出信号。
+	// 第八步：开始服务，直到收到退出信号。
 	shutdownTimeout := time.Duration(cfg.HTTP.ShutdownTimeoutSeconds) * time.Second
 	serveErr := serve(ctx, server, listener, shutdownTimeout, logger)
 

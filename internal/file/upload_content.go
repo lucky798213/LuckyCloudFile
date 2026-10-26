@@ -16,7 +16,11 @@ import (
 )
 
 var (
-	// ErrUploadSessionExpired 表示会话已经超过 expires_at，不能再写入内容。
+	// ErrUploadSessionExpired 表示会话已经失效，不能再写入内容或发布文件。
+	//
+	// 失效原因不只“超过 expires_at”：服务重启后，启动恢复会把重启前
+	// 所有未完成会话标成 expired，此时 expires_at 可能还在未来。
+	// 所以调用方要同时看状态和时间，不能只比较 expires_at。
 	ErrUploadSessionExpired = errors.New("upload session expired")
 
 	// ErrUploadSessionConflict 表示会话当前不能接收内容：
@@ -33,7 +37,8 @@ var (
 // 正式发布留给“确认完成”接口。
 //
 // 处理顺序：
-//  1. 按 sessionID + ownerID 查询会话，检查过期、状态和占位实体；
+//  1. 按 sessionID + ownerID 查询会话，检查是否已失效（状态 expired 或超过 expires_at）、
+//     状态和占位实体；
 //  2. 用 Entity.StoragePolicyID 找存储位置，不使用用户当前默认策略；
 //  3. 用条件 UPDATE 原子地把 pending 抢成 receiving；
 //  4. 流式写入内容，按 ExpectedSize 限制读取并核对实际大小；
@@ -51,7 +56,10 @@ func (s *Service) UploadSessionContent(
 	if err != nil {
 		return UploadSessionInfo{}, err
 	}
-	if !session.ExpiresAt.After(time.Now()) {
+	// 先判断“已经失效”，再判断状态能不能写入。
+	// 服务重启作废的会话可能还没到 expires_at，只看时间会把它当成 pending，
+	// 随后返回 409；这里必须让客户端明确知道是 410 会话失效。
+	if isUploadSessionInvalid(*session) {
 		return UploadSessionInfo{}, ErrUploadSessionExpired
 	}
 	if session.Status != model.UploadStatusPending {
@@ -105,9 +113,9 @@ func (s *Service) UploadSessionContent(
 		return UploadSessionInfo{}, err
 	}
 	if !claimed {
-		// 可能是另一个请求先抢到了，也可能在预检查之后刚好过期。
+		// 可能是另一个请求先抢到了，也可能在预检查之后刚好失效。
 		current, findErr := s.findOwnedUploadSession(ctx, ownerID, sessionID)
-		if findErr == nil && !current.ExpiresAt.After(time.Now()) {
+		if findErr == nil && isUploadSessionInvalid(*current) {
 			return UploadSessionInfo{}, ErrUploadSessionExpired
 		}
 		return UploadSessionInfo{}, ErrUploadSessionConflict
@@ -155,6 +163,19 @@ func (s *Service) UploadSessionContent(
 	return UploadSessionInfo{}, s.failUploadContent(
 		ctx, ownerID, session, entity.StorageKey, store, err,
 	)
+}
+
+// isUploadSessionInvalid 判断会话是否已经失效，不能再继续上传或发布。
+//
+// 失效有两个来源：
+//   - 到期：超过 expires_at，由到期扫描标记 expired；
+//   - 服务重启：启动恢复把重启前所有未完成会话标记 expired，
+//     这时 expires_at 可能还在未来。
+//
+// 因此必须同时看状态和时间，不能只比较 expires_at。
+func isUploadSessionInvalid(session model.UploadSession) bool {
+	return session.Status == model.UploadStatusExpired ||
+		!session.ExpiresAt.After(time.Now())
 }
 
 // findOwnedUploadSession 同时按会话 ID 和 owner ID 查询，避免读到别人的会话。
@@ -212,8 +233,7 @@ func (s *Service) markUploadSessionReady(
 		if updated.RowsAffected != 1 {
 			var current model.UploadSession
 			if err := tx.Where("id = ? AND owner_id = ?", session.ID, ownerID).
-				First(&current).Error; err == nil &&
-				!current.ExpiresAt.After(time.Now()) {
+				First(&current).Error; err == nil && isUploadSessionInvalid(current) {
 				return ErrUploadSessionExpired
 			}
 			return ErrUploadSessionConflict

@@ -139,6 +139,8 @@ func (s *Service) CreateUploadSession(
 // 不存在和属于别人都返回 ErrUploadSessionNotFound，HTTP 层统一映射成 404。
 //
 // 本方法只读：不自动修改过期状态，也不清理占位实体。
+// 返回的 Status 才是权威依据：expired 可能来自超时，也可能来自服务重启，
+// 后一种情况下 ExpiresAt 可能还在未来。
 func (s *Service) GetUploadSession(
 	ctx context.Context,
 	ownerID int,

@@ -20,6 +20,7 @@ import (
 
 	"luckyCloudFile/internal/config"
 	"luckyCloudFile/internal/database"
+	"luckyCloudFile/internal/file"
 	"luckyCloudFile/internal/model"
 )
 
@@ -270,6 +271,78 @@ func TestRunRejectsOccupiedPort(t *testing.T) {
 	}
 	if err := Run(context.Background(), cfg, testLogger()); err == nil || !strings.Contains(err.Error(), "listen HTTP") {
 		t.Fatalf("wanted occupied-port error, got %v", err)
+	}
+}
+
+// freeAddress 借一个空闲端口再立即释放，让 Run 能真正完成绑定。
+//
+// 这里只测试“恢复失败就终止启动”，不会真的开始服务，所以不会和
+// 其它测试包争用同一个测试库里的上传会话。
+func freeAddress(t *testing.T) string {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return address
+}
+
+// TestRunStopsBeforeServingWhenUploadRecoveryFails 覆盖启动恢复失败：
+// Run 必须返回错误并释放端口，不能开始处理 HTTP 请求。
+//
+// 通过替换恢复函数来制造失败：真实数据库故障很难在启动测试里稳定复现，
+// 但“恢复失败必须终止启动”是这个阶段最关键的保证。
+func TestRunStopsBeforeServingWhenUploadRecoveryFails(t *testing.T) {
+	dsn := os.Getenv("CLOUDREVE_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("set CLOUDREVE_TEST_MYSQL_DSN to run tests that start the full app")
+	}
+	db, err := database.OpenDSN(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close(db)
+
+	cfg := config.Config{
+		HTTP:     config.HTTP{Listen: freeAddress(t), ShutdownTimeoutSeconds: 1},
+		Storage:  testStorageConfig(t, db),
+		Database: testDatabaseConfig(t),
+	}
+
+	sentinel := errors.New("forced upload recovery failure")
+	gotBatchSize := -1
+	recovery := func(_ context.Context, svc *file.Service, batchSize int) error {
+		if svc == nil {
+			t.Error("recovery received a nil file service")
+		}
+		if batchSize != file.DefaultRecoveryBatchSize {
+			t.Errorf("recovery batch size = %d, want %d", batchSize, file.DefaultRecoveryBatchSize)
+		}
+		gotBatchSize = batchSize
+		return sentinel
+	}
+
+	err = run(context.Background(), cfg, testLogger(), recovery)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("run error = %v, want wrapped recovery failure", err)
+	}
+	if !strings.Contains(err.Error(), "invalidate unfinished upload sessions") {
+		t.Fatalf("run error = %v, want the startup step name", err)
+	}
+	if gotBatchSize == -1 {
+		t.Fatal("recovery was never called")
+	}
+
+	// Run 已经返回，说明它没有进入 Serve；绑定过的端口也必须已经释放。
+	conn, dialErr := net.DialTimeout("tcp", cfg.HTTP.Listen, 300*time.Millisecond)
+	if dialErr == nil {
+		_ = conn.Close()
+		t.Fatalf("server still accepts connections on %s after recovery failure", cfg.HTTP.Listen)
 	}
 }
 

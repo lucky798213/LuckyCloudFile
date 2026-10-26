@@ -20,8 +20,9 @@ var terminatedUploadStatuses = []string{
 	model.UploadStatusExpired,
 }
 
-// unfinishedUploadStatuses 是仍可能继续、因此允许被到期扫描终止的状态。
-// completed 已经发布文件，必须跳过；canceled / expired 已经是终态。
+// unfinishedUploadStatuses 是仍可能继续、因此允许被“结束”的状态。
+// 到期扫描和启动恢复都只处理这三种；completed 已经发布文件，必须跳过；
+// canceled / expired 已经是终态。
 var unfinishedUploadStatuses = []string{
 	model.UploadStatusPending,
 	model.UploadStatusReceiving,

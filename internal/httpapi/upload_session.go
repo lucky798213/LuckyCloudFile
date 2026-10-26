@@ -75,8 +75,9 @@ func createUploadSession(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 // getUploadSession 处理 GET /api/upload-sessions/:id。
 //
 // 只返回当前用户自己的会话；别人的和不存在的都返回同一个 404，
-// 不泄露会话是否存在。这里不自动处理过期，客户端拿到 expires_at 后
-// 由后续传输/完成接口自己检查。
+// 不泄露会话是否存在。这里不自动处理过期：客户端从 status 和 expires_at
+// 判断会话还能不能继续。注意 expired 不一定代表 expires_at 已过：
+// 服务重启也会让重启前的未完成会话立即失效，此时 expires_at 可能还在未来。
 func getUploadSession(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ownerID, ok := currentUserID(c)
