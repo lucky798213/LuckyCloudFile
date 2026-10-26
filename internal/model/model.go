@@ -213,6 +213,17 @@ const (
 	UploadStatusExpired   = "expired"
 )
 
+// UploadSession 的两种上传模式。
+//
+//	full     整文件上传：请求一次 /content 写完整个文件，保持原有行为。
+//	chunked  分片上传：按固定大小逐片写入，最后一片完成后会话变成 ready。
+//
+// Mode 为空表示旧数据（迁移前的会话），业务层按 full 处理。
+const (
+	UploadModeFull    = "full"
+	UploadModeChunked = "chunked"
+)
+
 // UploadSession 是一次上传的持久化状态。
 //
 // 它把“客户端说要传什么”和“服务端已经收到多少”分开记录：
@@ -236,6 +247,14 @@ type UploadSession struct {
 	// 状态变成 ready 时，两者必须相等（由业务层检查）。
 	ExpectedSize int64 `gorm:"not null"`
 	ActualSize   int64 `gorm:"not null"`
+
+	// 上传模式：full（整文件）或 chunked（分片）。
+	// 旧会话和旧请求没有这个字段，数据库默认成 full，行为保持不变。
+	Mode string `gorm:"type:varchar(16);not null;default:full"`
+
+	// 分片大小，单位字节。full 模式固定为 0；chunked 模式由服务端决定，
+	// 客户端不能指定。分片数由 ExpectedSize 和它计算，不单独落库。
+	ChunkSize int64 `gorm:"not null;default:0"`
 
 	// 本会话还没有结算或释放的预留量。
 	//

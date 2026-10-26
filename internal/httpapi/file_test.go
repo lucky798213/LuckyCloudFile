@@ -360,9 +360,20 @@ func validFakeName(name string) bool {
 	return !strings.ContainsAny(name, `/\`) && !strings.ContainsRune(name, 0)
 }
 
-// CreateUploadSession 模拟真实服务：校验参数和目录后只登记会话，
-// 不创建 File，也不占用文件内容。
+// CreateUploadSession 模拟真实服务：默认创建 full 会话。
 func (f *fakeFileService) CreateUploadSession(ctx context.Context, ownerID int, parentID, name string, size int64) (file.UploadSessionInfo, error) {
+	return f.CreateUploadSessionWithMode(ctx, ownerID, parentID, name, size, model.UploadModeFull)
+}
+
+// CreateUploadSessionWithMode 模拟真实服务：校验参数和目录后只登记会话，
+// 不创建 File，也不占用文件内容。分片大小固定由服务端给出。
+func (f *fakeFileService) CreateUploadSessionWithMode(ctx context.Context, ownerID int, parentID, name string, size int64, mode string) (file.UploadSessionInfo, error) {
+	if mode == "" {
+		mode = model.UploadModeFull
+	}
+	if mode != model.UploadModeFull && mode != model.UploadModeChunked {
+		return file.UploadSessionInfo{}, file.ErrInvalidUploadMode
+	}
 	if !validFakeName(name) {
 		return file.UploadSessionInfo{}, file.ErrInvalidName
 	}
@@ -371,6 +382,16 @@ func (f *fakeFileService) CreateUploadSession(ctx context.Context, ownerID int, 
 	}
 	if size > file.MaxUploadBytes {
 		return file.UploadSessionInfo{}, file.ErrTooLarge
+	}
+
+	var chunkSize int64
+	var chunkCount int
+	if mode == model.UploadModeChunked {
+		if size == 0 {
+			return file.UploadSessionInfo{}, file.ErrInvalidSize
+		}
+		chunkSize = file.UploadChunkSize
+		chunkCount = int((size + chunkSize - 1) / chunkSize)
 	}
 
 	f.mu.Lock()
@@ -387,6 +408,9 @@ func (f *fakeFileService) CreateUploadSession(ctx context.Context, ownerID int, 
 		Name:         name,
 		ExpectedSize: size,
 		ActualSize:   0,
+		Mode:         mode,
+		ChunkSize:    chunkSize,
+		ChunkCount:   chunkCount,
 		Status:       model.UploadStatusPending,
 		ExpiresAt:    time.Now().Add(file.UploadSessionTTL),
 	}
@@ -417,6 +441,9 @@ func (f *fakeFileService) UploadSessionContent(ctx context.Context, ownerID int,
 	if !session.info.ExpiresAt.After(time.Now()) {
 		return file.UploadSessionInfo{}, file.ErrUploadSessionExpired
 	}
+	if session.info.Mode == model.UploadModeChunked {
+		return file.UploadSessionInfo{}, file.ErrUploadModeMismatch
+	}
 	if session.info.Status != model.UploadStatusPending {
 		return file.UploadSessionInfo{}, file.ErrUploadSessionConflict
 	}
@@ -432,6 +459,54 @@ func (f *fakeFileService) UploadSessionContent(ctx context.Context, ownerID int,
 	session.info.ActualSize = int64(len(data))
 	session.info.Status = model.UploadStatusReady
 	session.content = data
+	f.sessions[sessionID] = session
+	return session.info, nil
+}
+
+// UploadSessionChunk 模拟真实服务：只接受 chunked 会话，分片必须按顺序、
+// 长度必须正好等于服务端算出的这一片大小。
+func (f *fakeFileService) UploadSessionChunk(ctx context.Context, ownerID int, sessionID string, index int, r io.Reader) (file.UploadSessionInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	session, ok := f.sessions[sessionID]
+	if !ok || session.ownerID != ownerID {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionNotFound
+	}
+	if !session.info.ExpiresAt.After(time.Now()) {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionExpired
+	}
+	if session.info.Mode != model.UploadModeChunked {
+		return file.UploadSessionInfo{}, file.ErrUploadModeMismatch
+	}
+	if session.info.Status != model.UploadStatusPending {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionConflict
+	}
+	if index < 0 || index >= session.info.ChunkCount {
+		return file.UploadSessionInfo{}, file.ErrInvalidChunkIndex
+	}
+	expectedIndex := int(session.info.ActualSize / session.info.ChunkSize)
+	if index != expectedIndex {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionConflict
+	}
+
+	chunkBytes := session.info.ChunkSize
+	if remaining := session.info.ExpectedSize - session.info.ActualSize; remaining < chunkBytes {
+		chunkBytes = remaining
+	}
+	data, err := io.ReadAll(io.LimitReader(r, chunkBytes+1))
+	if err != nil {
+		return file.UploadSessionInfo{}, err
+	}
+	if int64(len(data)) != chunkBytes {
+		return file.UploadSessionInfo{}, file.ErrUploadSizeMismatch
+	}
+
+	session.content = append(session.content, data...)
+	session.info.ActualSize += int64(len(data))
+	if session.info.ActualSize >= session.info.ExpectedSize {
+		session.info.Status = model.UploadStatusReady
+	}
 	f.sessions[sessionID] = session
 	return session.info, nil
 }

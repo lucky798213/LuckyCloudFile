@@ -37,8 +37,10 @@ type fileService interface {
 	Rename(ctx context.Context, ownerID int, id, name string) (file.File, error)
 	Move(ctx context.Context, ownerID int, id, parentID string) (file.File, error)
 	CreateUploadSession(ctx context.Context, ownerID int, parentID, name string, size int64) (file.UploadSessionInfo, error)
+	CreateUploadSessionWithMode(ctx context.Context, ownerID int, parentID, name string, size int64, mode string) (file.UploadSessionInfo, error)
 	GetUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error)
 	UploadSessionContent(ctx context.Context, ownerID int, sessionID string, r io.Reader) (file.UploadSessionInfo, error)
+	UploadSessionChunk(ctx context.Context, ownerID int, sessionID string, index int, r io.Reader) (file.UploadSessionInfo, error)
 	CompleteUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error)
 	CancelUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error)
 }
@@ -91,7 +93,10 @@ func NewRouter(logger *slog.Logger, fileService fileService, authService authSer
 	protected.POST("/upload-sessions", createUploadSession(logger, fileService))
 	protected.GET("/upload-sessions/:id", getUploadSession(logger, fileService))
 	// 内容上传：请求体是原始字节，写入会话创建时选定的占位位置。
+	// 只用于 full 模式；chunked 会话必须用下面的分片接口。
 	protected.PUT("/upload-sessions/:id/content", uploadSessionContent(logger, fileService))
+	// 分片上传：:index 从 0 开始，必须按顺序逐片上传。
+	protected.PUT("/upload-sessions/:id/chunks/:index", uploadSessionChunk(logger, fileService))
 	// 确认完成：把已经 ready 的内容正式发布成用户目录里的文件。
 	protected.POST("/upload-sessions/:id/complete", completeUploadSession(logger, fileService))
 	// 取消上传：未完成会话标记 canceled；已过期会话保持 expired，

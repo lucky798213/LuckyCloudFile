@@ -29,6 +29,10 @@ const (
 	// 注意它限制的是“文件内容”，不包含 multipart 的表单头和边界。
 	MaxUploadBytes int64 = 32 << 20
 
+	// UploadChunkSize 是 chunked 会话固定的分片大小：1 MiB。
+	// 分片大小由服务端决定，客户端不能自己指定。
+	UploadChunkSize int64 = 1 << 20
+
 	// defaultPageSize / maxPageSize 限制列表接口一次返回多少条。
 	defaultPageSize = 20
 	maxPageSize     = 100
@@ -73,6 +77,17 @@ var (
 	// ErrQuotaExceeded 表示用户的逻辑容量已经不足，本次发布/预留必须整体回滚。
 	// 它来自 internal/quota，HTTP 层映射成 507 insufficient_storage。
 	ErrQuotaExceeded = quota.ErrExceeded
+
+	// ErrInvalidUploadMode 表示创建会话时传了不认识的 mode。
+	// 只允许 full（默认）和 chunked。
+	ErrInvalidUploadMode = errors.New("invalid upload mode")
+
+	// ErrUploadModeMismatch 表示接口和会话创建时的模式不匹配：
+	// full 会话不能调用分片接口，chunked 会话不能调用整文件接口。
+	ErrUploadModeMismatch = errors.New("upload session mode does not match this endpoint")
+
+	// ErrInvalidChunkIndex 表示分片序号超出了 [0, chunk_count)。
+	ErrInvalidChunkIndex = errors.New("invalid upload chunk index")
 )
 
 // File 是返回给 HTTP 层的节点信息（不包含数据库内部字段）。

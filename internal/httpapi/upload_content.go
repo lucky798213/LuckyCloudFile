@@ -46,6 +46,11 @@ func uploadSessionContent(logger *slog.Logger, svc fileService) gin.HandlerFunc 
 					Code:    "upload_session_expired",
 					Message: "upload session has expired",
 				})
+			case errors.Is(err, file.ErrUploadModeMismatch):
+				c.JSON(http.StatusConflict, ErrorResponse{
+					Code:    "upload_mode_mismatch",
+					Message: "chunked sessions must upload through the chunk endpoint",
+				})
 			case errors.Is(err, file.ErrUploadSessionConflict):
 				c.JSON(http.StatusConflict, ErrorResponse{
 					Code:    "upload_session_conflict",

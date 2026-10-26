@@ -62,6 +62,10 @@ func (s *Service) UploadSessionContent(
 	if isUploadSessionInvalid(*session) {
 		return UploadSessionInfo{}, ErrUploadSessionExpired
 	}
+	// chunked 会话必须走分片接口；混用会让 ActualSize 和分片序号对不上。
+	if session.Mode == model.UploadModeChunked {
+		return UploadSessionInfo{}, ErrUploadModeMismatch
+	}
 	if session.Status != model.UploadStatusPending {
 		return UploadSessionInfo{}, ErrUploadSessionConflict
 	}

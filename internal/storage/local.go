@@ -134,6 +134,83 @@ func (r *contextReader) Read(p []byte) (int, error) {
 	return r.r.Read(p)
 }
 
+// Append 从 offset 开始写入一段内容，并把文件截断到这次写入的末尾。
+//
+// 分片上传一片一片写入同一个文件，所以不能像 Save 那样先写临时文件再重命名：
+// 第一片写入时正式文件就必须存在，后续片才能接着写。
+//
+// offset 是服务端已经确认收到的大小。写入前先 Seek 到 offset，写入后把
+// offset 之后的内容全部截断，因此：
+//   - 上一次请求写了半片、数据库却没记上时，重试会把残留尾巴覆盖掉；
+//   - 客户端多传时返回 ErrTooLarge，并把文件恢复成 offset 之前的样子。
+//
+// 上限仍然采用“最多读 maxBytes+1 字节”的判断方式，不把整片读进内存。
+// 文件权限显式收紧到 0600，和 Save 发布后的内容权限一致。
+func (l *Local) Append(
+	ctx context.Context,
+	key string,
+	offset int64,
+	r io.Reader,
+	maxBytes int64,
+) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if offset < 0 {
+		return 0, fmt.Errorf("append chunk: negative offset %d", offset)
+	}
+	if maxBytes < 0 {
+		return 0, fmt.Errorf("append chunk: negative max bytes %d", maxBytes)
+	}
+
+	file, err := os.OpenFile(l.Path(key), os.O_WRONLY|os.O_CREATE, 0o600)
+	if err != nil {
+		return 0, fmt.Errorf("open chunk file: %w", err)
+	}
+
+	// O_CREATE 不会修改已存在文件的权限，这里和 Save 一样再收紧一次。
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return 0, fmt.Errorf("set chunk file permissions: %w", err)
+	}
+
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		_ = file.Close()
+		return 0, fmt.Errorf("seek chunk file: %w", err)
+	}
+
+	src := io.LimitReader(&contextReader{ctx: ctx, r: r}, maxBytes+1)
+	size, err := io.Copy(file, src)
+	if err != nil {
+		// 写到一半失败：丢掉 offset 之后的内容，保留已经确认的分片。
+		_ = file.Truncate(offset)
+		_ = file.Close()
+		return 0, fmt.Errorf("write chunk: %w", err)
+	}
+	if size > maxBytes {
+		_ = file.Truncate(offset)
+		_ = file.Close()
+		return 0, fmt.Errorf("%w: limit is %d bytes", ErrTooLarge, maxBytes)
+	}
+
+	// 内容已经读完但请求取消：这片不算成功，恢复 offset 之前的内容。
+	if err := ctx.Err(); err != nil {
+		_ = file.Truncate(offset)
+		_ = file.Close()
+		return 0, err
+	}
+
+	// 截掉上一次失败尝试留下的尾巴，保证文件长度就是“已确认大小 + 本片”。
+	if err := file.Truncate(offset + size); err != nil {
+		_ = file.Close()
+		return 0, fmt.Errorf("truncate chunk file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return 0, fmt.Errorf("close chunk file: %w", err)
+	}
+	return size, nil
+}
+
 // Open 打开一个已经存好的文件，用来读取（下载会用到）。
 // 用完必须由调用方 Close。
 func (l *Local) Open(ctx context.Context, key string) (io.ReadCloser, error) {

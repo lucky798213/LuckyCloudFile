@@ -37,36 +37,61 @@ type UploadSessionInfo struct {
 	Name         string    `json:"name"`
 	ExpectedSize int64     `json:"expected_size"`
 	ActualSize   int64     `json:"actual_size"`
+	Mode         string    `json:"mode"`
+	ChunkSize    int64     `json:"chunk_size"`
+	ChunkCount   int       `json:"chunk_count"`
 	Status       string    `json:"status"`
 	ExpiresAt    time.Time `json:"expires_at"`
 	ResultFileID *string   `json:"result_file_id"`
 }
 
-// CreateUploadSession 创建一个只有占位实体的上传会话。
+// CreateUploadSession 创建一个 full（整文件）模式的上传会话。
 //
-// 本阶段不接收文件内容，也不创建 File 或磁盘文件：
-// 会话和占位 Entity 只是为后续传输建立“上传单”。
-//
-// 顺序：
-//  1. 校验名字和大小；
-//  2. 校验目标目录（为空时解析成当前用户根目录）；
-//  3. 读取一次用户默认存储策略，确认驱动已注册；
-//  4. 生成会话 ID 和占位内容的 storage key；
-//  5. 在一个事务里：锁用户 → 原子预留容量 → 重新检查目录
-//     → 写入占位 Entity 和 UploadSession。
-//
-// 预留、占位记录和会话必须一起成功：预留用的是一条受条件约束的
-// UPDATE（见 internal/quota.Reserve），不是“先查剩余再无条件扣减”。
-// 剩余容量不足时返回 ErrQuotaExceeded；后面任何一步失败都会让整个事务回滚，
-// 预留和占位 Entity 一起撤销。
-//
-// 空文件（size=0）不占容量，也不能因为 UPDATE 影响零行而被误判成容量不足。
+// 保留这个签名是为了让旧调用方和旧测试不用改：不传 mode 就是原来的行为。
 func (s *Service) CreateUploadSession(
 	ctx context.Context,
 	ownerID int,
 	parentID, name string,
 	size int64,
 ) (UploadSessionInfo, error) {
+	return s.CreateUploadSessionWithMode(
+		ctx, ownerID, parentID, name, size, model.UploadModeFull,
+	)
+}
+
+// CreateUploadSessionWithMode 创建一个只有占位实体的上传会话。
+//
+// mode 为空时按 full 处理；chunked 的分片大小由服务端固定为 UploadChunkSize，
+// 客户端不能指定。空文件没有分片可传，所以 chunked + size=0 返回 ErrInvalidSize。
+//
+// 本阶段不接收文件内容，也不创建 File 或磁盘文件：
+// 会话和占位 Entity 只是为后续传输建立“上传单”。
+//
+// 顺序：
+//  1. 校验模式、名字和大小；
+//  2. 校验目标目录（为空时解析成当前用户根目录）；
+//  3. 读取一次用户默认存储策略，确认驱动已注册；
+//  4. 生成会话 ID 和占位内容的 storage key；
+//  5. 在一个事务里：锁用户 → 原子预留容量 → 重新检查目录
+//     → 写入占位 Entity 和 UploadSession。
+//
+// 容量始终按整个文件大小预留一次，分片上传不会重复预留；预留、占位记录
+// 和会话必须一起成功。剩余容量不足时返回 ErrQuotaExceeded；后面任何一步
+// 失败都会让整个事务回滚，预留和占位 Entity 一起撤销。
+// 空文件（size=0）只允许 full 模式，不占容量。
+func (s *Service) CreateUploadSessionWithMode(
+	ctx context.Context,
+	ownerID int,
+	parentID, name string,
+	size int64,
+	mode string,
+) (UploadSessionInfo, error) {
+	if mode == "" {
+		mode = model.UploadModeFull
+	}
+	if mode != model.UploadModeFull && mode != model.UploadModeChunked {
+		return UploadSessionInfo{}, ErrInvalidUploadMode
+	}
 	if err := validateName(name); err != nil {
 		return UploadSessionInfo{}, err
 	}
@@ -75,6 +100,15 @@ func (s *Service) CreateUploadSession(
 	}
 	if size > MaxUploadBytes {
 		return UploadSessionInfo{}, ErrTooLarge
+	}
+
+	// full 模式没有分片大小；chunked 由服务端规定，客户端只能知道不能指定。
+	var chunkSize int64
+	if mode == model.UploadModeChunked {
+		if size == 0 {
+			return UploadSessionInfo{}, ErrInvalidSize
+		}
+		chunkSize = UploadChunkSize
 	}
 
 	// 先做一次目录校验，快速拒绝明显不合法的请求；事务里还会再查一次。
@@ -106,6 +140,8 @@ func (s *Service) CreateUploadSession(
 		Name:          name,
 		ExpectedSize:  size,
 		ActualSize:    0,
+		Mode:          mode,
+		ChunkSize:     chunkSize,
 		ReservedBytes: size,
 		Status:        model.UploadStatusPending,
 		ExpiresAt:     time.Now().Add(UploadSessionTTL),
@@ -181,14 +217,40 @@ func (s *Service) GetUploadSession(
 
 // toUploadSessionInfo 只挑客户端需要的字段，内部存储信息不对外返回。
 func toUploadSessionInfo(session model.UploadSession) UploadSessionInfo {
+	mode := session.Mode
+	if mode == "" {
+		// 迁移前的旧会话没有 mode，按 full 处理。
+		mode = model.UploadModeFull
+	}
+
+	var chunkSize int64
+	var chunkCount int
+	if mode == model.UploadModeChunked {
+		chunkSize = session.ChunkSize
+		chunkCount = uploadChunkCount(session.ExpectedSize, chunkSize)
+	}
+
 	return UploadSessionInfo{
 		ID:           session.ID,
 		ParentID:     session.ParentID,
 		Name:         session.Name,
 		ExpectedSize: session.ExpectedSize,
 		ActualSize:   session.ActualSize,
+		Mode:         mode,
+		ChunkSize:    chunkSize,
+		ChunkCount:   chunkCount,
 		Status:       session.Status,
 		ExpiresAt:    session.ExpiresAt,
 		ResultFileID: session.ResultFileID,
 	}
+}
+
+// uploadChunkCount 返回按固定分片大小切分后一共有多少片。
+//
+// 大小或分片大小不合法时返回 0；正常情况下分片数不会超过 MaxUploadBytes/1MiB。
+func uploadChunkCount(size, chunkSize int64) int {
+	if size <= 0 || chunkSize <= 0 {
+		return 0
+	}
+	return int((size-1)/chunkSize + 1)
 }

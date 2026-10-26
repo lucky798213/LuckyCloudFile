@@ -15,10 +15,13 @@ import (
 //
 // size 用指针是为了区分“没传”和“传了 0”：
 // 没传是参数错误，传 0 是合法的空文件。
+//
+// mode 可选，不传就是 full；分片大小由服务端决定，请求里不接受 chunk_size。
 type createUploadSessionRequest struct {
 	ParentID string `json:"parent_id"`
 	Name     string `json:"name"`
 	Size     *int64 `json:"size"`
+	Mode     string `json:"mode"`
 }
 
 // createUploadSession 处理 POST /api/upload-sessions。
@@ -49,14 +52,22 @@ func createUploadSession(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 			return
 		}
 
-		info, err := svc.CreateUploadSession(
+		info, err := svc.CreateUploadSessionWithMode(
 			c.Request.Context(),
 			ownerID,
 			request.ParentID,
 			request.Name,
 			*request.Size,
+			request.Mode,
 		)
 		if err != nil {
+			if errors.Is(err, file.ErrInvalidUploadMode) {
+				c.JSON(http.StatusBadRequest, ErrorResponse{
+					Code:    "invalid_mode",
+					Message: `mode must be "full" or "chunked"; omit it for full`,
+				})
+				return
+			}
 			if handleFileError(c, err, "parent_not_found", "parent directory not found") {
 				return
 			}
