@@ -73,6 +73,49 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 	}
 }
 
+func TestLoadStorageRootsByConfigKey(t *testing.T) {
+	content := validINI + `
+[StorageLocal]
+archive = data-archive
+`
+	path := writeConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base := filepath.Dir(path)
+	local, ok := cfg.Storage.RootFor("local")
+	if !ok || local != filepath.Join(base, "data") {
+		t.Fatalf("local root = %q, ok=%v", local, ok)
+	}
+	archive, ok := cfg.Storage.RootFor("archive")
+	if !ok || archive != filepath.Join(base, "data-archive") {
+		t.Fatalf("archive root = %q, ok=%v", archive, ok)
+	}
+	if _, ok := cfg.Storage.RootFor("missing"); ok {
+		t.Fatal("missing config key must not resolve to another directory")
+	}
+}
+
+func TestLoadRejectsInvalidStorageLocal(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		section string
+		want    string
+	}{
+		{"empty root", "[StorageLocal]\narchive =\n", "must not be empty"},
+		{"reserved key", "[StorageLocal]\nlocal = other-data\n", "reserved"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, validINI+tc.section))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("wanted error containing %q; got %v", tc.want, err)
+			}
+		})
+	}
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	_, err := Load(filepath.Join(t.TempDir(), "missing.ini"))
 	if err == nil || !strings.Contains(err.Error(), "read config") {

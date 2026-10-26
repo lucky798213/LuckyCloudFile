@@ -6,6 +6,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -114,6 +115,11 @@ func runMigrations(ctx context.Context, db *gorm.DB) error {
 		return fmt.Errorf("prepare legacy schema: %w", err)
 	}
 
+	// 存储策略必须最先迁移：users/entities 的新列要在回填之后才能收紧约束。
+	if err := migrateStoragePolicies(db); err != nil {
+		return fmt.Errorf("migrate storage policies: %w", err)
+	}
+
 	if err := autoMigrate(db); err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
 	}
@@ -158,11 +164,245 @@ func newLogger() logger.Interface {
 // 所以它适合当前阶段快速迭代；真正上线前应换成分版本的 migration。
 func autoMigrate(db *gorm.DB) error {
 	return db.AutoMigrate(
+		&model.StoragePolicy{},
 		&model.User{},
 		&model.Entity{},
 		&model.File{},
 		&model.AuthSession{},
 	)
+}
+
+// localPolicyName 是初始化出来的本地策略的展示名。
+// 已经存在同名配置键时不会覆盖它，所以运维后来改过名字也不会被启动覆盖。
+const localPolicyName = "本地存储"
+
+// migrateStoragePolicies 完成存储策略的分步迁移：
+//
+//  1. 建 storage_policies 表；
+//  2. 保证 users/entities 表存在，但只给旧表补“可空”的新列；
+//  3. 初始化本地策略；
+//  4. 给已有 users/entities 回填这个策略；
+//  5. 校验所有引用都有效；
+//  6. 把新列收紧成 NOT NULL；
+//  7. 交给 AutoMigrate 补索引和外键约束。
+//
+// 为什么不能只改 struct 直接 AutoMigrate：旧库里已经有 users/entities 行，
+// 直接加 NOT NULL 列要么失败，要么把 0 写进去当默认值。先可空、回填、
+// 再收紧，才能保证旧数据明确落到当前使用的本地目录。
+func migrateStoragePolicies(db *gorm.DB) error {
+	// 被 users/entities 引用的表必须先存在。
+	if err := db.AutoMigrate(&model.StoragePolicy{}); err != nil {
+		return fmt.Errorf("create storage_policies: %w", err)
+	}
+
+	// CreateTable 不会自己跳过已存在的表，所以先判断。
+	// 新库按最终结构一次建好；旧库保持原样，后面只补可空列。
+	// 顺序满足外键依赖，避免建表时引用还不存在的表。
+	for _, value := range []any{
+		&model.User{},
+		&model.Entity{},
+		&model.File{},
+		&model.AuthSession{},
+	} {
+		if db.Migrator().HasTable(value) {
+			continue
+		}
+		if err := db.Migrator().CreateTable(value); err != nil {
+			return fmt.Errorf("create table for %T: %w", value, err)
+		}
+	}
+
+	if err := addNullableStorageColumns(db); err != nil {
+		return err
+	}
+
+	policyID, err := ensureStoragePolicy(
+		db,
+		model.LocalStorageConfigKey,
+		localPolicyName,
+		model.StorageTypeLocal,
+	)
+	if err != nil {
+		return err
+	}
+
+	if err := backfillStoragePolicies(db, policyID); err != nil {
+		return err
+	}
+
+	if err := validateStoragePolicyReferences(db); err != nil {
+		return err
+	}
+
+	return tightenStorageColumnTypes(db)
+}
+
+// addNullableStorageColumns 只给“已经存在但还没有新列”的表补可空列。
+//
+// 新库由 CreateTable 直接按最终结构建表，这里的 hasColumn 会跳过。
+func addNullableStorageColumns(db *gorm.DB) error {
+	for _, column := range []struct {
+		table  string
+		name   string
+		column string
+	}{
+		{"users", "default_storage_policy_id", "BIGINT NULL"},
+		{"entities", "storage_policy_id", "BIGINT NULL"},
+	} {
+		exists, err := hasColumn(db, column.table, column.name)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		sql := fmt.Sprintf(
+			"ALTER TABLE %s ADD COLUMN %s %s",
+			column.table, column.name, column.column,
+		)
+		if err := db.Exec(sql).Error; err != nil {
+			return fmt.Errorf("add %s.%s: %w", column.table, column.name, err)
+		}
+	}
+	return nil
+}
+
+// ensureStoragePolicy 按 ConfigKey 找策略，没有才创建。
+//
+// 已经存在的策略一个字都不改：重复启动不会多建一行，也不会把
+// 运维调整过的 Name/Type 覆盖回默认值。
+func ensureStoragePolicy(db *gorm.DB, configKey, name, policyType string) (int, error) {
+	var policy model.StoragePolicy
+	err := db.Where("config_key = ?", configKey).First(&policy).Error
+	if err == nil {
+		return policy.ID, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0, fmt.Errorf("query storage policy %q: %w", configKey, err)
+	}
+
+	policy = model.StoragePolicy{
+		Name:      name,
+		Type:      policyType,
+		ConfigKey: configKey,
+	}
+	if err := db.Create(&policy).Error; err != nil {
+		// 多个实例同时启动时，另一个实例可能刚插入成功。
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			if err := db.Where("config_key = ?", configKey).First(&policy).Error; err != nil {
+				return 0, fmt.Errorf("reload storage policy %q: %w", configKey, err)
+			}
+			return policy.ID, nil
+		}
+		return 0, fmt.Errorf("create storage policy %q: %w", configKey, err)
+	}
+	return policy.ID, nil
+}
+
+// backfillStoragePolicies 把旧数据的空值指向初始本地策略。
+//
+// 只改 IS NULL 的行：已经显式设置过的默认策略和已经绑定位置的内容
+// 不会被重复启动改回去。
+func backfillStoragePolicies(db *gorm.DB, policyID int) error {
+	if err := db.Exec(
+		"UPDATE users SET default_storage_policy_id = ? WHERE default_storage_policy_id IS NULL",
+		policyID,
+	).Error; err != nil {
+		return fmt.Errorf("backfill users.default_storage_policy_id: %w", err)
+	}
+	if err := db.Exec(
+		"UPDATE entities SET storage_policy_id = ? WHERE storage_policy_id IS NULL",
+		policyID,
+	).Error; err != nil {
+		return fmt.Errorf("backfill entities.storage_policy_id: %w", err)
+	}
+	return nil
+}
+
+// validateStoragePolicyReferences 确认回填后没有空值，也没有指向不存在策略的引用。
+//
+// 这一步必须在收紧 NOT NULL 和外键之前完成，这样数据有问题时能给出明确错误，
+// 而不是让 ALTER TABLE 抛一句看不懂的数据库异常。
+func validateStoragePolicyReferences(db *gorm.DB) error {
+	checks := []struct {
+		table string
+		query string
+	}{
+		{
+			table: "users",
+			query: `SELECT COUNT(*) FROM users u
+				LEFT JOIN storage_policies p ON p.id = u.default_storage_policy_id
+				WHERE u.default_storage_policy_id IS NULL OR p.id IS NULL`,
+		},
+		{
+			table: "entities",
+			query: `SELECT COUNT(*) FROM entities e
+				LEFT JOIN storage_policies p ON p.id = e.storage_policy_id
+				WHERE e.storage_policy_id IS NULL OR p.id IS NULL`,
+		},
+	}
+	for _, check := range checks {
+		var invalid int64
+		if err := db.Raw(check.query).Scan(&invalid).Error; err != nil {
+			return fmt.Errorf("validate %s storage policy references: %w", check.table, err)
+		}
+		if invalid > 0 {
+			return fmt.Errorf(
+				"%d row(s) in %s do not reference an existing storage policy",
+				invalid, check.table,
+			)
+		}
+	}
+	return nil
+}
+
+// tightenStorageColumnTypes 把已经回填好的可空列收紧成 NOT NULL。
+//
+// 已经是 NOT NULL 时跳过，所以重复启动不会做无意义的 ALTER TABLE。
+func tightenStorageColumnTypes(db *gorm.DB) error {
+	for _, column := range []struct {
+		table string
+		name  string
+		typ   string
+	}{
+		{"users", "default_storage_policy_id", "BIGINT NOT NULL"},
+		{"entities", "storage_policy_id", "BIGINT NOT NULL"},
+	} {
+		nullable, err := isColumnNullable(db, column.table, column.name)
+		if err != nil {
+			return err
+		}
+		if !nullable {
+			continue
+		}
+		sql := fmt.Sprintf(
+			"ALTER TABLE %s MODIFY COLUMN %s %s",
+			column.table, column.name, column.typ,
+		)
+		if err := db.Exec(sql).Error; err != nil {
+			return fmt.Errorf("tighten %s.%s: %w", column.table, column.name, err)
+		}
+	}
+	return nil
+}
+
+// isColumnNullable 返回 information_schema 里的 IS_NULLABLE。
+// 列不存在时返回 false，让调用方把“已经不存在”当成不需要收紧。
+func isColumnNullable(db *gorm.DB, table, column string) (bool, error) {
+	var nullable string
+	err := db.Raw(`
+		SELECT IS_NULLABLE FROM information_schema.columns
+		WHERE table_schema = DATABASE()
+		  AND table_name = ?
+		  AND column_name = ?`, table, column).
+		Row().Scan(&nullable)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("check nullability of %s.%s: %w", table, column, err)
+	}
+	return nullable == "YES", nil
 }
 
 // errRootAlreadySet 表示另一个进程已经给这个用户补过根目录。

@@ -100,7 +100,7 @@ func TestAuthenticationAndFileIsolation(t *testing.T) {
 		}
 	}
 
-	fileService := cloudfile.NewService(client, storage.NewLocal(t.TempDir()))
+	fileService := newTestFileService(t, client)
 	authService := auth.NewService(client)
 	router := httpapi.NewRouter(slog.New(slog.NewJSONHandler(io.Discard, nil)), fileService, authService)
 
@@ -300,6 +300,23 @@ func mustUser(t *testing.T, db *gorm.DB, username string) *model.User {
 	return &user
 }
 
+// newTestFileService 用数据库里的本地策略和临时目录构造文件服务。
+// 策略 ID 来自真实迁移结果，避免测试自己编造 ID。
+func newTestFileService(t *testing.T, db *gorm.DB) *cloudfile.Service {
+	t.Helper()
+
+	var policy model.StoragePolicy
+	if err := db.Where("config_key = ?", model.LocalStorageConfigKey).First(&policy).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	registry := storage.NewRegistry()
+	if err := registry.Register(policy.ID, storage.NewLocal(t.TempDir())); err != nil {
+		t.Fatal(err)
+	}
+	return cloudfile.NewService(db, registry)
+}
+
 func resetAuthTables(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	// files.parent_id 是自引用外键，逐行按顺序删很容易出现“父节点先被删”。
@@ -433,7 +450,7 @@ func TestDirectoryFlowOverHTTP(t *testing.T) {
 		}
 	}
 
-	fileService := cloudfile.NewService(client, storage.NewLocal(t.TempDir()))
+	fileService := newTestFileService(t, client)
 	router := httpapi.NewRouter(slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		fileService, auth.NewService(client))
 
@@ -620,7 +637,7 @@ func TestMoveAndEmptyDirectoryDeleteOverHTTP(t *testing.T) {
 	if _, err := auth.CreateUser(ctx, client, testUsernameA, testPasswordA); err != nil {
 		t.Fatal(err)
 	}
-	fileService := cloudfile.NewService(client, storage.NewLocal(t.TempDir()))
+	fileService := newTestFileService(t, client)
 	router := httpapi.NewRouter(slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		fileService, auth.NewService(client))
 	token := login(t, router, testUsernameA, testPasswordA)

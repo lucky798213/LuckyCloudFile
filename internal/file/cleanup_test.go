@@ -35,7 +35,10 @@ func TestDeleteDefersCleanupUntilRetry(t *testing.T) {
 
 	// 把磁盘对象换成一个非空目录：os.Remove 会失败，用来模拟“物理清理暂时失败”。
 	// 正常上传只会产生普通文件，这里只是制造故障，不改变业务逻辑。
-	path := service.store.Path(entity.StorageKey)
+	//
+	// 这里直接用测试拿到的 root 拼路径，而不是业务接口：Store 刻意不暴露本地路径，
+	// “知道对象在磁盘上的位置”只是本地测试的实现细节。
+	path := filepath.Join(root, entity.StorageKey)
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +109,7 @@ func TestDeleteDefersCleanupUntilRetry(t *testing.T) {
 // TestCleanupTreatsMissingObjectAsDeleted 覆盖第二个崩溃点：
 // 磁盘对象已经删掉，但 Entity 记录还没来得及删。
 func TestCleanupTreatsMissingObjectAsDeleted(t *testing.T) {
-	service, db, _, ownerA, _ := newTestService(t)
+	service, db, root, ownerA, _ := newTestService(t)
 	ctx := context.Background()
 
 	record, err := service.Upload(ctx, ownerA.ID, "", "gone.txt", strings.NewReader("gone"))
@@ -121,7 +124,7 @@ func TestCleanupTreatsMissingObjectAsDeleted(t *testing.T) {
 
 	// 手工制造“磁盘已删、记录还在”的状态：对象先删掉，
 	// 再把 File 行和 Entity 改成逻辑删除已提交后的样子。
-	if err := os.Remove(service.store.Path(entity.StorageKey)); err != nil {
+	if err := os.Remove(filepath.Join(root, entity.StorageKey)); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.WithContext(ctx).
@@ -158,11 +161,11 @@ func TestCleanupKeepsEntityThatStillHasReferences(t *testing.T) {
 	// 手工制造一条“状态和引用不一致”的数据。正常流程不会这样，
 	// 但清理逻辑必须宁可保留对象，也不能删掉还在用的内容。
 	entity := model.Entity{
-		StorageKey: "pending-with-reference",
-		Size:       1,
-		Policy:     "local",
-		RefCount:   0,
-		Status:     model.EntityStatusPendingDelete,
+		StorageKey:      "pending-with-reference",
+		Size:            1,
+		StoragePolicyID: localStoragePolicy(t, db).ID,
+		RefCount:        0,
+		Status:          model.EntityStatusPendingDelete,
 	}
 	if err := db.WithContext(ctx).Create(&entity).Error; err != nil {
 		t.Fatal(err)
@@ -176,7 +179,7 @@ func TestCleanupKeepsEntityThatStillHasReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 	entity.RefCount = 0
-	path := service.store.Path(entity.StorageKey)
+	path := filepath.Join(root, entity.StorageKey)
 	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +263,7 @@ func TestDeleteSharedEntityWaitsForLastReference(t *testing.T) {
 	if active.Status != model.EntityStatusActive || active.RefCount != 1 {
 		t.Fatalf("entity should still be active with 1 reference, got %+v", active)
 	}
-	if _, err := os.Stat(service.store.Path(entity.StorageKey)); err != nil {
+	if _, err := os.Stat(filepath.Join(root, entity.StorageKey)); err != nil {
 		t.Fatalf("content was removed while still referenced: %v", err)
 	}
 
@@ -350,11 +353,11 @@ func TestCleanupLoopRunsImmediatelyAndStops(t *testing.T) {
 
 	// 对象本来就不存在：清理应该把这条 pending_delete 记录直接删掉。
 	entity := model.Entity{
-		StorageKey: "never-created",
-		Size:       0,
-		Policy:     "local",
-		RefCount:   0,
-		Status:     model.EntityStatusPendingDelete,
+		StorageKey:      "never-created",
+		Size:            0,
+		StoragePolicyID: localStoragePolicy(t, db).ID,
+		RefCount:        0,
+		Status:          model.EntityStatusPendingDelete,
 	}
 	if err := db.WithContext(ctx).Create(&entity).Error; err != nil {
 		t.Fatal(err)

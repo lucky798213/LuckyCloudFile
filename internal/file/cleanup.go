@@ -63,7 +63,7 @@ func (s *Service) CleanupPending(ctx context.Context, batchSize int) (CleanupRes
 
 		var entities []model.Entity
 		err := s.db.WithContext(ctx).
-			Select("id", "storage_key").
+			Select("id", "storage_key", "storage_policy_id").
 			Where("status = ? AND ref_count = 0 AND id > ?", model.EntityStatusPendingDelete, cursor).
 			Order("id ASC").
 			Limit(batchSize).
@@ -84,6 +84,7 @@ func (s *Service) CleanupPending(ctx context.Context, batchSize int) (CleanupRes
 				s.logger.Warn("defer content cleanup",
 					"entity_id", entity.ID,
 					"storage_key", entity.StorageKey,
+					"storage_policy_id", entity.StoragePolicyID,
 					"error", err,
 				)
 				continue
@@ -147,7 +148,7 @@ func (s *Service) runCleanupOnce(ctx context.Context, batchSize int) {
 //
 // 如果第 2 步成功、第 3 步之前崩溃，下一轮会看到对象不存在，直接视为删除成功。
 func (s *Service) cleanupEntity(ctx context.Context, entityID int64) error {
-	storageKey, err := s.prepareCleanup(ctx, entityID)
+	policyID, storageKey, err := s.prepareCleanup(ctx, entityID)
 	if err != nil {
 		return err
 	}
@@ -157,20 +158,29 @@ func (s *Service) cleanupEntity(ctx context.Context, entityID int64) error {
 		return nil
 	}
 
+	// 去内容实际写入的位置删除。策略缺失就保留记录等下一轮，
+	// 绝不能换成别的 Store 去删（可能删到同 key 的另一份内容）。
+	store, err := s.stores.Get(policyID)
+	if err != nil {
+		return fmt.Errorf("resolve storage policy %d: %w", policyID, err)
+	}
+
 	// 物理删除必须在事务之外。对象已经不存在（上次删到一半崩溃）也算成功。
-	if err := s.store.Remove(storageKey); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("remove object %q: %w", storageKey, err)
+	if err := store.Remove(ctx, storageKey); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove object %q from policy %d: %w", storageKey, policyID, err)
 	}
 
 	return s.deleteCleanedEntity(ctx, entityID)
 }
 
-// prepareCleanup 在一个短事务里确认 Entity 可以清理，并返回它的 storage_key。
+// prepareCleanup 在一个短事务里确认 Entity 可以清理，并返回它记录的位置：
+// 策略 ID + storage key。两者必须一起返回，清理才能去正确的地方删。
 //
 // 锁顺序：清理只锁 Entity，不锁 File 行，因此不会和 Delete 的
 // “File → Entity” 顺序成环。这里对 files 的 COUNT 是普通快照读：
 // pending_delete 实体不允许新增引用，所以计数只会因为 File 被删而变小。
-func (s *Service) prepareCleanup(ctx context.Context, entityID int64) (string, error) {
+func (s *Service) prepareCleanup(ctx context.Context, entityID int64) (int, string, error) {
+	var policyID int
 	var storageKey string
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -203,13 +213,14 @@ func (s *Service) prepareCleanup(ctx context.Context, entityID int64) (string, e
 			)
 		}
 
+		policyID = entity.StoragePolicyID
 		storageKey = entity.StorageKey
 		return nil
 	})
 	if err != nil {
-		return "", err
+		return 0, "", err
 	}
-	return storageKey, nil
+	return policyID, storageKey, nil
 }
 
 // deleteCleanedEntity 删除已经完成物理清理的 Entity 记录。

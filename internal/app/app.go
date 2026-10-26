@@ -17,11 +17,14 @@ import (
 	"os"
 	"time"
 
+	"gorm.io/gorm"
+
 	"luckyCloudFile/internal/auth"
 	"luckyCloudFile/internal/config"
 	"luckyCloudFile/internal/database"
 	"luckyCloudFile/internal/file"
 	"luckyCloudFile/internal/httpapi"
+	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/storage"
 )
 
@@ -48,8 +51,14 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	// 第三步：创建“存储 → 文件业务 → 认证 → 路由”这条调用链。
 	// 这里是整个程序唯一一处把它们组装起来的地方，
 	// 以后换成 S3，只要改这一行的存储实现。
-	store := storage.NewLocal(cfg.Storage.LocalRoot)
-	fileService := file.NewService(db, store).WithLogger(logger)
+	//
+	// 数据库里的策略必须在配置里找到对应目录，否则启动直接失败：
+	// 不能让旧内容落到猜测的位置。
+	stores, err := newStorageRegistry(db, cfg.Storage)
+	if err != nil {
+		return fmt.Errorf("initialize storage: %w", err)
+	}
+	fileService := file.NewService(db, stores).WithLogger(logger)
 	authService := auth.NewService(db)
 
 	// 第四步：创建 HTTP Server。它只是一个“配置好的对象”，还没开始监听。
@@ -147,6 +156,49 @@ func serve(ctx context.Context, server *http.Server, listener net.Listener, shut
 	<-serveErr
 	logger.Info("http stopped")
 	return nil
+}
+
+// newStorageRegistry 把数据库里的每条存储策略绑定到配置中的本地目录。
+//
+// 策略只记录 Type 和 ConfigKey；实际目录由配置提供。
+// 任何一条策略找不到目录、类型不认识或 ID 重复，都让启动失败，
+// 而不是让它悄悄回退到 LocalRoot。
+func newStorageRegistry(db *gorm.DB, cfg config.Storage) (*storage.Registry, error) {
+	var policies []model.StoragePolicy
+	if err := db.Order("id ASC").Find(&policies).Error; err != nil {
+		return nil, fmt.Errorf("query storage policies: %w", err)
+	}
+	if len(policies) == 0 {
+		return nil, errors.New("no storage policies configured")
+	}
+
+	registry := storage.NewRegistry()
+	for _, policy := range policies {
+		if policy.Type != model.StorageTypeLocal {
+			return nil, fmt.Errorf(
+				"storage policy %d (%q) has unsupported type %q",
+				policy.ID, policy.Name, policy.Type,
+			)
+		}
+
+		root, ok := cfg.RootFor(policy.ConfigKey)
+		if !ok {
+			return nil, fmt.Errorf(
+				"storage policy %d (%q) has no local directory for config key %q",
+				policy.ID, policy.Name, policy.ConfigKey,
+			)
+		}
+		if err := checkStorage(root); err != nil {
+			return nil, fmt.Errorf(
+				"storage policy %d (%q): %w",
+				policy.ID, policy.Name, err,
+			)
+		}
+		if err := registry.Register(policy.ID, storage.NewLocal(root)); err != nil {
+			return nil, err
+		}
+	}
+	return registry, nil
 }
 
 // checkStorage 确认存储目录存在，并且当前用户真的能往里面写文件。

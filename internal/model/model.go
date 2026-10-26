@@ -15,6 +15,34 @@ const (
 	KindDirectory = "directory"
 )
 
+// 存储策略的驱动类型。本阶段只实现本地目录。
+const (
+	StorageTypeLocal = "local"
+
+	// LocalStorageConfigKey 是初始本地策略对应的配置键：
+	// 它映射到 [Storage] LocalRoot，也是新账号的默认策略。
+	LocalStorageConfigKey = "local"
+)
+
+// StoragePolicy 是一个具体的存储位置。
+//
+// 它只描述“用哪种驱动、去哪一组配置里找目录”，不保存目录本身；
+// 目录由配置按 ConfigKey 提供。这样数据库里的策略 ID 在重启后仍然稳定。
+type StoragePolicy struct {
+	ID int `gorm:"primaryKey;autoIncrement"`
+
+	// 展示名称，便于运维识别，不参与定位。
+	Name string `gorm:"type:varchar(255);not null"`
+
+	// 驱动类型：本阶段只有 local，以后接 S3 时再扩展。
+	Type string `gorm:"type:varchar(32);not null"`
+
+	// 对应哪一组存储配置。配置读取层用它在本地目录表里查找实际路径。
+	ConfigKey string `gorm:"type:varchar(64);not null;uniqueIndex:storage_policies_config_key"`
+}
+
+func (StoragePolicy) TableName() string { return "storage_policies" }
+
 // User 是登录用户。本阶段不做注册，账号由开发初始化命令显式创建。
 type User struct {
 	ID int `gorm:"primaryKey;autoIncrement"`
@@ -32,6 +60,13 @@ type User struct {
 	// 用户的根目录 File ID。客户端不传 parent_id 时，业务层用它作为默认父目录。
 	// 根目录的 parent_id 是 NULL，它是整棵树的起点。
 	RootFileID *string `gorm:"type:varchar(255);uniqueIndex"`
+
+	// 服务器给这个账号分配的新上传位置。它不是用户选择，只在服务端调整。
+	// 上传时读取一次，写入新 Entity，之后不再跟随用户默认值变化。
+	DefaultStoragePolicyID int `gorm:"not null;index"`
+
+	// 只读关联。删除仍被账号引用的策略会被数据库拒绝（RESTRICT）。
+	DefaultStoragePolicy *StoragePolicy `gorm:"foreignKey:DefaultStoragePolicyID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
 }
 
 // TableName 显式指定表名，避免依赖 GORM 的复数化规则。
@@ -63,8 +98,12 @@ type Entity struct {
 	// 内容大小，单位字节。下载时用来设置 Content-Length。
 	Size int64 `gorm:"not null"`
 
-	// 存储策略。P2 只有 local，P3 接 S3 时可以写 "s3"。
-	Policy string `gorm:"type:varchar(255);not null;default:local"`
+	// 这份内容实际存放在哪个策略对应的位置。
+	// 下载和清理都以它为准，不看用户当前的默认策略。
+	StoragePolicyID int `gorm:"not null;index"`
+
+	// 只读关联。删除仍被内容引用的策略会被数据库拒绝（RESTRICT）。
+	StoragePolicy *StoragePolicy `gorm:"foreignKey:StoragePolicyID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
 
 	// 有多少个 File 引用这份内容。删除 File 时减一，减到 0 才进入
 	// pending_delete，等待物理清理。

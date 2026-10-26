@@ -16,8 +16,11 @@ import (
 	"time"
 
 	mysqlDriver "github.com/go-sql-driver/mysql"
+	"gorm.io/gorm"
 
 	"luckyCloudFile/internal/config"
+	"luckyCloudFile/internal/database"
+	"luckyCloudFile/internal/model"
 )
 
 func testLogger() *slog.Logger {
@@ -181,11 +184,88 @@ func testDatabaseConfig(t *testing.T) config.Database {
 	}
 }
 
+// testStorageConfig 给数据库里现有的每条策略都配一个临时目录。
+// 测试库可能和别的测试包共用，这样启动测试不会因为暂时存在的策略失败。
+func testStorageConfig(t *testing.T, db *gorm.DB) config.Storage {
+	t.Helper()
+
+	storageCfg := config.Storage{
+		LocalRoot: t.TempDir(),
+		// 文件测试包会创建这条策略；提前配好目录，避免多个测试包共用
+		// 数据库时启动测试恰好撞上它。
+		LocalRoots: map[string]string{"test-policy-b": t.TempDir()},
+	}
+	var policies []model.StoragePolicy
+	if err := db.Find(&policies).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, policy := range policies {
+		if policy.ConfigKey == model.LocalStorageConfigKey {
+			continue
+		}
+		storageCfg.LocalRoots[policy.ConfigKey] = t.TempDir()
+	}
+	return storageCfg
+}
+
+func TestNewStorageRegistryFailsForReferencedMissingConfig(t *testing.T) {
+	dsn := os.Getenv("CLOUDREVE_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("set CLOUDREVE_TEST_MYSQL_DSN to run the storage registry check")
+	}
+	db, err := database.OpenDSN(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 先注册关闭，后注册删除；t.Cleanup 是后进先出，
+	// 所以删除策略时连接还开着。
+	t.Cleanup(func() { _ = database.Close(db) })
+
+	policy := model.StoragePolicy{
+		Name:      "missing",
+		Type:      model.StorageTypeLocal,
+		ConfigKey: "missing-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+	}
+	if err := db.Create(&policy).Error; err != nil {
+		t.Fatal(err)
+	}
+	user := model.User{
+		Username:               "missing-policy-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+		PasswordHash:           "x",
+		DefaultStoragePolicyID: policy.ID,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = db.Delete(&user).Error
+		_ = db.Delete(&policy).Error
+	})
+
+	cfg := testStorageConfig(t, db)
+	delete(cfg.LocalRoots, policy.ConfigKey)
+
+	_, err = newStorageRegistry(db, cfg)
+	if err == nil || !strings.Contains(err.Error(), policy.ConfigKey) {
+		t.Fatalf("wanted a missing-config error for %q, got %v", policy.ConfigKey, err)
+	}
+}
+
 func TestRunRejectsOccupiedPort(t *testing.T) {
+	dsn := os.Getenv("CLOUDREVE_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("set CLOUDREVE_TEST_MYSQL_DSN to run tests that start the full app")
+	}
+	db, err := database.OpenDSN(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close(db)
+
 	listener := testListener(t)
 	cfg := config.Config{
 		HTTP:     config.HTTP{Listen: listener.Addr().String(), ShutdownTimeoutSeconds: 1},
-		Storage:  config.Storage{LocalRoot: t.TempDir()},
+		Storage:  testStorageConfig(t, db),
 		Database: testDatabaseConfig(t),
 	}
 	if err := Run(context.Background(), cfg, testLogger()); err == nil || !strings.Contains(err.Error(), "listen HTTP") {

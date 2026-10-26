@@ -5,6 +5,7 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -16,20 +17,23 @@ import (
 // 上层可以用 errors.Is 判断它，然后决定返回 413 还是别的状态码。
 var ErrTooLarge = errors.New("content too large")
 
-// Local 表示“文件存在本机某个目录”。
+// Local 表示“文件存在本机某个目录”，是 Store 的本地实现。
 //
-// 现在就这一种存储方式，所以直接写具体类型，不抽接口。
-// 等以后要接 S3 之类的对象存储时，再抽接口也不迟。
+// 业务层只依赖 Store 接口；以后接 S3 时新增一个实现就行，不用改 internal/file。
 type Local struct {
 	root string
 }
+
+// Local 必须满足 Store 接口。接口签名一旦对不上，编译时就会失败，
+// 而不是等到运行到某个上传请求才发现。
+var _ Store = (*Local)(nil)
 
 // NewLocal 创建一个本地存储，所有文件都放在 root 目录下。
 func NewLocal(root string) *Local {
 	return &Local{root: root}
 }
 
-// Save 把 r 里的内容写成 root/id 这个文件，最多接受 maxBytes 字节。
+// Save 把 r 里的内容写成 root/key 这个文件，最多接受 maxBytes 字节。
 //
 // 步骤是固定的三步：
 //
@@ -39,7 +43,14 @@ func NewLocal(root string) *Local {
 //
 // 为什么要先写临时文件？因为如果直接写正式文件，别人下载时可能读到“写了一半”的内容。
 // 重命名在同一个文件系统里是原子的，要么没有这个文件，要么内容是完整的。
-func (l *Local) Save(id string, r io.Reader, maxBytes int64) (int64, error) {
+//
+// 注意：这里只在开始前检查一次 ctx。本地 io.Copy 还不能在中途被取消，
+// 这是本地实现的限制，接口本身没有承诺这一点。
+func (l *Local) Save(ctx context.Context, key string, r io.Reader, maxBytes int64) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
 	// 临时文件必须和最终文件在同一个目录，这样 Rename 才是原子操作。
 	tmp, err := os.CreateTemp(l.root, ".upload-*")
 	if err != nil {
@@ -71,7 +82,7 @@ func (l *Local) Save(id string, r io.Reader, maxBytes int64) (int64, error) {
 	}
 
 	// 写完了才“发布”成正式文件。走到这里内容已经是完整的。
-	if err := os.Rename(tmpPath, l.Path(id)); err != nil {
+	if err := os.Rename(tmpPath, l.Path(key)); err != nil {
 		return 0, fmt.Errorf("publish file: %w", err)
 	}
 	return size, nil
@@ -79,19 +90,28 @@ func (l *Local) Save(id string, r io.Reader, maxBytes int64) (int64, error) {
 
 // Open 打开一个已经存好的文件，用来读取（下载会用到）。
 // 用完必须由调用方 Close。
-func (l *Local) Open(id string) (*os.File, error) {
-	return os.Open(l.Path(id))
+func (l *Local) Open(ctx context.Context, key string) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return os.Open(l.Path(key))
 }
 
 // Remove 删除一个文件。文件不存在时返回的错误可以用 os.IsNotExist 判断。
-func (l *Local) Remove(id string) error {
-	return os.Remove(l.Path(id))
+func (l *Local) Remove(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return os.Remove(l.Path(key))
 }
 
-// Path 返回某个 ID 对应的磁盘路径。
+// Path 返回某个 key 对应的磁盘路径。
 //
-// 只有内存索引里存在的 ID 才会走到这里，所以外部传进来的随机字符串
+// 它只属于本地实现，刻意不放进 Store 接口：S3 没有可供 os.Remove 使用的本地路径，
+// 业务层也不应该知道内容具体放在哪块磁盘上。
+//
+// 只有数据库里存在的 key 才会走到这里，所以外部传进来的随机字符串
 // 不可能用来拼出 ../ 之类的越界路径。
-func (l *Local) Path(id string) string {
-	return filepath.Join(l.root, id)
+func (l *Local) Path(key string) string {
+	return filepath.Join(l.root, key)
 }

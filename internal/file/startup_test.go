@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	mysqlDriver "github.com/go-sql-driver/mysql"
+	"gorm.io/gorm"
 
 	"luckyCloudFile/internal/app"
 	"luckyCloudFile/internal/config"
@@ -52,7 +53,7 @@ func TestNormalStartupDoesNotCreateUsers(t *testing.T) {
 			Listen:                 occupied.Addr().String(),
 			ShutdownTimeoutSeconds: 1,
 		},
-		Storage:  config.Storage{LocalRoot: t.TempDir()},
+		Storage:  storageConfigForPolicies(t, client),
 		Database: databaseConfig(t, dsn),
 	}
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
@@ -65,6 +66,30 @@ func TestNormalStartupDoesNotCreateUsers(t *testing.T) {
 		t.Fatalf("normal startup created %d default user(s), want 0", count)
 	}
 	t.Log("PASS: normal startup created no users")
+}
+
+// storageConfigForPolicies 给测试库里现有的每条策略配一个临时目录，
+// 避免和别的测试包共用数据库时，启动因为临时策略缺少配置而失败。
+func storageConfigForPolicies(t *testing.T, db *gorm.DB) config.Storage {
+	t.Helper()
+
+	storageCfg := config.Storage{
+		LocalRoot: t.TempDir(),
+		// 同包的存储策略测试会创建这条策略；提前配好目录，避免启动测试
+		// 在它清理之前运行时误报“策略缺少配置”。
+		LocalRoots: map[string]string{"test-policy-b": t.TempDir()},
+	}
+	var policies []model.StoragePolicy
+	if err := db.Find(&policies).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, policy := range policies {
+		if policy.ConfigKey == model.LocalStorageConfigKey {
+			continue
+		}
+		storageCfg.LocalRoots[policy.ConfigKey] = t.TempDir()
+	}
+	return storageCfg
 }
 
 func databaseConfig(t *testing.T, dsn string) config.Database {

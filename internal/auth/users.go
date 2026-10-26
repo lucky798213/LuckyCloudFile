@@ -61,10 +61,16 @@ func CreateUser(ctx context.Context, db *gorm.DB, username, password string) (*m
 	if err != nil {
 		return nil, err
 	}
+	policyID, err := initialStoragePolicyID(ctx, db)
+	if err != nil {
+		return nil, err
+	}
 
 	user := model.User{
 		Username:     username,
 		PasswordHash: string(hash),
+		// 新账号的上传位置由服务端指定，不存在“客户端选择”这一步。
+		DefaultStoragePolicyID: policyID,
 	}
 	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Create 会把自增 ID 回填到 user.ID。
@@ -98,4 +104,26 @@ func CreateUser(ctx context.Context, db *gorm.DB, username, password string) (*m
 		return nil, fmt.Errorf("create user: %w", err)
 	}
 	return &user, nil
+}
+
+// initialStoragePolicyID 返回服务端给新账号分配的初始策略。
+//
+// 这里按 ConfigKey 查，不写死自增 ID：重新建库或策略表重建后 ID 会变，
+// 但配置键是稳定的。找不到时明确失败，宁可建不了账号，也不能让用户
+// 带着一个指向空位置的默认策略进入系统。
+func initialStoragePolicyID(ctx context.Context, db *gorm.DB) (int, error) {
+	var policy model.StoragePolicy
+	err := db.WithContext(ctx).
+		Where("config_key = ?", model.LocalStorageConfigKey).
+		First(&policy).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return 0, fmt.Errorf(
+				"initial storage policy %q is not configured",
+				model.LocalStorageConfigKey,
+			)
+		}
+		return 0, fmt.Errorf("query initial storage policy: %w", err)
+	}
+	return policy.ID, nil
 }

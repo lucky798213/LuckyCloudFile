@@ -32,11 +32,30 @@ func testDSN(t *testing.T) string {
 	return dsn
 }
 
-// newTestService 每个测试用一个干净的库表 + 临时存储目录，
+// testPolicyBConfigKey 是测试用第二条策略的固定配置键。
+// app 启动测试也会给这个键准备临时目录，避免多个测试包共用数据库时
+// 出现一条“存在但没配置目录”的策略。
+const testPolicyBConfigKey = "test-policy-b"
+
+// testEnv 是一次集成测试的完整环境：真实 MySQL、两个本地目录，
+// 以及分别指向它们的策略 A/B。用户默认策略由服务端分配，测试也可以直接改。
+type testEnv struct {
+	service *Service
+	db      *gorm.DB
+	rootA   string
+	rootB   string
+	policyA *model.StoragePolicy
+	policyB *model.StoragePolicy
+	ownerA  *model.User
+	ownerB  *model.User
+}
+
+// newTestEnv 每个测试用一个干净的库表 + 两个临时存储目录，
 // 并创建两个不同 ID 的测试用户，用来验证文件归属。
 //
-// 用户通过 auth.CreateUser 创建，所以每个用户都带一个根目录。
-func newTestService(t *testing.T) (*Service, *gorm.DB, string, *model.User, *model.User) {
+// 用户通过 auth.CreateUser 创建，所以每个用户都带一个根目录，
+// 默认策略是数据库初始化出来的本地策略 A。
+func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
 
 	db, err := database.OpenDSN(context.Background(), testDSN(t))
@@ -46,11 +65,109 @@ func newTestService(t *testing.T) (*Service, *gorm.DB, string, *model.User, *mod
 	t.Cleanup(func() { _ = database.Close(db) })
 
 	clearTables(t, db)
+
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	policyA := localStoragePolicy(t, db)
+	policyB := ensureTestPolicy(t, db, testPolicyBConfigKey, "B")
+
+	registry := storage.NewRegistry()
+	if err := registry.Register(policyA.ID, storage.NewLocal(rootA)); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(policyB.ID, storage.NewLocal(rootB)); err != nil {
+		t.Fatal(err)
+	}
+
 	ownerA := createTestUser(t, db, "A")
 	ownerB := createTestUser(t, db, "B")
 
-	root := t.TempDir()
-	return NewService(db, storage.NewLocal(root)), db, root, ownerA, ownerB
+	// 其它测试包（例如 app 启动测试）可能同时连同一个测试库。
+	// 这里在测试结束后把临时策略 B 收掉，避免它留在库里让别的包
+	// 以为存在一条没有配置目录的策略。
+	t.Cleanup(func() {
+		if err := db.Model(&model.Entity{}).
+			Where("storage_policy_id = ?", policyB.ID).
+			UpdateColumn("storage_policy_id", policyA.ID).Error; err != nil {
+			t.Logf("cleanup policy B entities: %v", err)
+		}
+		if err := db.Model(&model.User{}).
+			Where("default_storage_policy_id = ?", policyB.ID).
+			UpdateColumn("default_storage_policy_id", policyA.ID).Error; err != nil {
+			t.Logf("cleanup policy B users: %v", err)
+		}
+		if err := db.Delete(&model.StoragePolicy{}, policyB.ID).Error; err != nil {
+			t.Logf("cleanup policy B: %v", err)
+		}
+	})
+
+	return &testEnv{
+		service: NewService(db, registry),
+		db:      db,
+		rootA:   rootA,
+		rootB:   rootB,
+		policyA: policyA,
+		policyB: policyB,
+		ownerA:  ownerA,
+		ownerB:  ownerB,
+	}
+}
+
+// newTestService 保留原有测试的返回形状：默认策略 A 的目录就是 root。
+func newTestService(t *testing.T) (*Service, *gorm.DB, string, *model.User, *model.User) {
+	t.Helper()
+	env := newTestEnv(t)
+	return env.service, env.db, env.rootA, env.ownerA, env.ownerB
+}
+
+// localStoragePolicy 取出数据库初始化时创建的本地策略。
+// 万一别的测试清掉了策略表，这里补建一条，保证测试仍然从真实策略 ID 出发。
+func localStoragePolicy(t *testing.T, db *gorm.DB) *model.StoragePolicy {
+	t.Helper()
+
+	var policy model.StoragePolicy
+	err := db.Where("config_key = ?", model.LocalStorageConfigKey).First(&policy).Error
+	if err == nil {
+		return &policy
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatal(err)
+	}
+
+	policy = model.StoragePolicy{
+		Name:      "本地存储",
+		Type:      model.StorageTypeLocal,
+		ConfigKey: model.LocalStorageConfigKey,
+	}
+	if err := db.Create(&policy).Error; err != nil {
+		t.Fatal(err)
+	}
+	return &policy
+}
+
+// ensureTestPolicy 按 ConfigKey 取测试策略，没有才创建。
+// 这样即使上一次测试异常退出留下了这一行，下一次也能直接复用。
+func ensureTestPolicy(t *testing.T, db *gorm.DB, configKey, name string) *model.StoragePolicy {
+	t.Helper()
+
+	var policy model.StoragePolicy
+	err := db.Where("config_key = ?", configKey).First(&policy).Error
+	if err == nil {
+		return &policy
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatal(err)
+	}
+
+	policy = model.StoragePolicy{
+		Name:      name,
+		Type:      model.StorageTypeLocal,
+		ConfigKey: configKey,
+	}
+	if err := db.Create(&policy).Error; err != nil {
+		t.Fatal(err)
+	}
+	return &policy
 }
 
 func createTestUser(t *testing.T, db *gorm.DB, username string) *model.User {
@@ -111,6 +228,12 @@ func TestUploadAndOpen(t *testing.T) {
 	service, db, _, ownerA, ownerB := newTestService(t)
 	ctx := context.Background()
 
+	// 新账号的默认上传位置由服务端写入，并且是按 ConfigKey 找的策略。
+	policy := localStoragePolicy(t, db)
+	if ownerA.DefaultStoragePolicyID != policy.ID {
+		t.Fatalf("new user default policy = %d, want %d", ownerA.DefaultStoragePolicyID, policy.ID)
+	}
+
 	record, err := service.Upload(ctx, ownerA.ID, "", "a.txt", strings.NewReader("hello"))
 	if err != nil {
 		t.Fatal(err)
@@ -149,8 +272,11 @@ func TestUploadAndOpen(t *testing.T) {
 	if err := db.WithContext(ctx).First(&entity).Error; err != nil {
 		t.Fatal(err)
 	}
-	if entity.Policy != "local" || entity.RefCount != 1 || entity.Size != 5 {
+	if entity.RefCount != 1 || entity.Size != 5 {
 		t.Fatalf("unexpected entity: %+v", entity)
+	}
+	if entity.StoragePolicyID != localStoragePolicy(t, db).ID {
+		t.Fatalf("entity storage policy = %d, want the server default", entity.StoragePolicyID)
 	}
 	if entity.Status != model.EntityStatusActive {
 		t.Fatalf("new entity status = %q, want %q", entity.Status, model.EntityStatusActive)
@@ -200,8 +326,9 @@ func TestUploadPersistsAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	clearTables(t, first)
+	policy := localStoragePolicy(t, first)
 	owner := createTestUser(t, first, "A")
-	service1 := NewService(first, storage.NewLocal(root))
+	service1 := NewService(first, testRegistry(t, policy, root))
 	record, err := service1.Upload(ctx, owner.ID, "", "persist.bin", bytes.NewReader(payload))
 	if err != nil {
 		t.Fatal(err)
@@ -211,12 +338,13 @@ func TestUploadPersistsAcrossRestart(t *testing.T) {
 	}
 
 	// 重新建立连接和 Service，相当于进程重启。
+	// 迁移会重复跑一次，但策略 ID 不变，所以读取仍然指向原来的目录。
 	second, err := database.OpenDSN(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer database.Close(second)
-	service2 := NewService(second, storage.NewLocal(root))
+	service2 := NewService(second, testRegistry(t, policy, root))
 
 	info, rc, err := service2.Open(ctx, owner.ID, record.ID)
 	if err != nil {
@@ -232,6 +360,16 @@ func TestUploadPersistsAcrossRestart(t *testing.T) {
 	if !bytes.Equal(data, payload) || info.ID != record.ID || info.Size != int64(len(payload)) {
 		t.Fatalf("content changed after restart: info=%+v data=%q", info, data)
 	}
+}
+
+// testRegistry 只注册一条策略，用来构造重启测试的 Service。
+func testRegistry(t *testing.T, policy *model.StoragePolicy, root string) *storage.Registry {
+	t.Helper()
+	registry := storage.NewRegistry()
+	if err := registry.Register(policy.ID, storage.NewLocal(root)); err != nil {
+		t.Fatal(err)
+	}
+	return registry
 }
 
 func TestDeleteRemovesRecordsAndContent(t *testing.T) {
@@ -329,6 +467,102 @@ func TestUploadTooLarge(t *testing.T) {
 	// 超限的上传不能留下数据库记录。
 	if got := countKind(t, db, model.KindFile); got != 0 {
 		t.Fatalf("rejected upload left %d file rows", got)
+	}
+}
+
+// cancelAfterSaveStore 在内容写入成功后立刻取消请求的 ctx，
+// 用来模拟“文件已经存好、写数据库时客户端断开”。
+type cancelAfterSaveStore struct {
+	storage.Store
+	cancel       context.CancelFunc
+	onSaved      func()
+	removed      int
+	removeCtxErr error
+}
+
+func (s *cancelAfterSaveStore) Save(ctx context.Context, key string, r io.Reader, maxBytes int64) (int64, error) {
+	size, err := s.Store.Save(ctx, key, r, maxBytes)
+	if s.onSaved != nil {
+		s.onSaved()
+	}
+	s.cancel()
+	return size, err
+}
+
+func (s *cancelAfterSaveStore) Remove(ctx context.Context, key string) error {
+	s.removed++
+	s.removeCtxErr = ctx.Err()
+	return s.Store.Remove(ctx, key)
+}
+
+// TestUploadCompensatesWithFreshContext 验证数据库写入失败后的补偿删除：
+// 请求 ctx 已经取消时，仍然要用独立、未取消的上下文去 Remove，
+// 否则删除会立刻被取消，内容永远留在存储里。
+//
+// 这个测试还在写盘成功后把用户默认策略改成 B：本次上传已经选了 A，
+// 补偿删除必须继续操作 A，不能回头按新默认值去 B 删。
+func TestUploadCompensatesWithFreshContext(t *testing.T) {
+	env := newTestEnv(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := &cancelAfterSaveStore{
+		Store:  storage.NewLocal(env.rootA),
+		cancel: cancel,
+		onSaved: func() {
+			if err := env.db.Model(&model.User{}).
+				Where("id = ?", env.ownerA.ID).
+				UpdateColumn("default_storage_policy_id", env.policyB.ID).Error; err != nil {
+				t.Errorf("change default policy during upload: %v", err)
+			}
+		},
+	}
+	registry := storage.NewRegistry()
+	if err := registry.Register(env.policyA.ID, store); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(env.policyB.ID, storage.NewLocal(env.rootB)); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(env.db, registry)
+
+	_, err := service.Upload(ctx, env.ownerA.ID, "", "canceled.txt", strings.NewReader("hello"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("wanted the database step to fail with context.Canceled, got %v", err)
+	}
+
+	if store.removed != 1 {
+		t.Fatalf("compensation must attempt exactly one remove, got %d", store.removed)
+	}
+	if store.removeCtxErr != nil {
+		t.Fatalf("compensation must not reuse the canceled request context: %v", store.removeCtxErr)
+	}
+
+	// 补偿删的是本次实际写入的 A，B 没有被碰过。
+	for name, root := range map[string]string{"A": env.rootA, "B": env.rootB} {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("orphan content left in %s: %v", name, entries)
+		}
+	}
+	if got := countKind(t, env.db, model.KindFile); got != 0 {
+		t.Fatalf("failed upload left %d file rows", got)
+	}
+	if got := countRows(t, env.db, &model.Entity{}); got != 0 {
+		t.Fatalf("failed upload left %d entity rows", got)
+	}
+
+	// 默认策略确实已经被改成 B；但本次补偿从未使用它。
+	var user model.User
+	if err := env.db.First(&user, env.ownerA.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if user.DefaultStoragePolicyID != env.policyB.ID {
+		t.Fatalf("user default policy = %d, want B=%d", user.DefaultStoragePolicyID, env.policyB.ID)
 	}
 }
 

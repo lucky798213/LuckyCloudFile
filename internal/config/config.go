@@ -15,6 +15,8 @@ import (
 	"strings"
 
 	"github.com/go-ini/ini"
+
+	"luckyCloudFile/internal/model"
 )
 
 // Config 是整份配置。
@@ -49,6 +51,31 @@ type HTTP struct {
 // Storage 对应 [Storage]。
 type Storage struct {
 	LocalRoot string // 文件保存目录；相对路径以配置文件所在目录为基准
+
+	// LocalRoots 是额外的本地目录，键对应 StoragePolicy.ConfigKey。
+	// 它来自可选的 [StorageLocal] 段：
+	//
+	//	[StorageLocal]
+	//	archive = ../data-archive
+	//
+	// LocalRoot 继续表示配置键 "local"，所以旧配置不需要改。
+	LocalRoots map[string]string `ini:"-"`
+}
+
+// RootFor 按 StoragePolicy.ConfigKey 找到实际的本地目录。
+//
+// "local" 始终优先使用 LocalRoot，保持对旧配置的兼容；
+// 其它键只在 [StorageLocal] 里查。找不到时返回 false，
+// 调用方必须明确报错，不能拿别的目录顶上。
+func (s Storage) RootFor(configKey string) (string, bool) {
+	if configKey == model.LocalStorageConfigKey && s.LocalRoot != "" {
+		return s.LocalRoot, true
+	}
+	root, ok := s.LocalRoots[configKey]
+	if !ok || root == "" {
+		return "", false
+	}
+	return root, true
 }
 
 // Database 对应 [Database]。
@@ -104,6 +131,7 @@ func defaultConfig() Config {
 	return Config{
 		System:   System{LogLevel: "info"},
 		HTTP:     HTTP{ShutdownTimeoutSeconds: 5},
+		Storage:  Storage{LocalRoots: make(map[string]string)},
 		Database: Database{Port: 3306},
 	}
 }
@@ -128,6 +156,37 @@ func mapSections(file *ini.File, cfg *Config) error {
 	}
 	if err := file.Section("Database").StrictMapTo(&cfg.Database); err != nil {
 		return fmt.Errorf("parse [Database]: %w", err)
+	}
+	if err := mapStorageRoots(file, cfg); err != nil {
+		return err
+	}
+	return nil
+}
+
+// mapStorageRoots 读取可选的 [StorageLocal] 段。
+//
+// 这一段的每个键都是一个 ConfigKey，值是对应目录：
+//
+//	[StorageLocal]
+//	archive = ../data-archive
+//
+// 该段不存在时是正常的（当前只用一个目录），不会报错。
+func mapStorageRoots(file *ini.File, cfg *Config) error {
+	section, err := file.GetSection("StorageLocal")
+	if err != nil {
+		// 可选段：没有就说明只用 LocalRoot。
+		return nil
+	}
+	for _, key := range section.Keys() {
+		configKey := strings.TrimSpace(key.Name())
+		root := strings.TrimSpace(key.String())
+		if configKey == "" || root == "" {
+			return fmt.Errorf("parse [StorageLocal]: %s must not be empty", key.Name())
+		}
+		if configKey == model.LocalStorageConfigKey {
+			return fmt.Errorf("parse [StorageLocal]: %q is reserved for Storage.LocalRoot", configKey)
+		}
+		cfg.Storage.LocalRoots[configKey] = root
 	}
 	return nil
 }
@@ -182,6 +241,11 @@ func (c Config) validate() error {
 	if strings.TrimSpace(c.Storage.LocalRoot) == "" {
 		return fmt.Errorf("Storage.LocalRoot is required")
 	}
+	for key, root := range c.Storage.LocalRoots {
+		if strings.TrimSpace(root) == "" {
+			return fmt.Errorf("StorageLocal.%s is required", key)
+		}
+	}
 
 	// 数据库：P2 开始会真的连接 MySQL，所以这几项必须有值。
 	if strings.TrimSpace(c.Database.Host) == "" {
@@ -208,15 +272,26 @@ func (c Config) validate() error {
 // 而不是以你执行 go run 时所在的目录为基准。
 // 否则从不同目录启动程序，文件会被写到不同位置，很容易搞混。
 func (c *Config) resolveStoragePath(configPath string) error {
-	root := c.Storage.LocalRoot
-	if !filepath.IsAbs(root) {
-		root = filepath.Join(filepath.Dir(configPath), root)
-	}
-
-	abs, err := filepath.Abs(root)
+	root, err := resolvePath(configPath, c.Storage.LocalRoot)
 	if err != nil {
 		return fmt.Errorf("resolve Storage.LocalRoot: %w", err)
 	}
-	c.Storage.LocalRoot = abs
+	c.Storage.LocalRoot = root
+
+	for key, value := range c.Storage.LocalRoots {
+		resolved, err := resolvePath(configPath, value)
+		if err != nil {
+			return fmt.Errorf("resolve StorageLocal.%s: %w", key, err)
+		}
+		c.Storage.LocalRoots[key] = resolved
+	}
 	return nil
+}
+
+// resolvePath 把相对路径按“配置文件所在目录”转成绝对路径。
+func resolvePath(configPath, path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(filepath.Dir(configPath), path)
+	}
+	return filepath.Abs(path)
 }

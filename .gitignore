@@ -1,5 +1,6 @@
 /bin/
 /data/
 /configs/conf.ini
+/.gocache/
 *.out
 .DS_Store

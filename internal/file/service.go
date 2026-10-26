@@ -1,4 +1,4 @@
-// Package file 是文件的业务层：生成 ID、操作数据库记录、协调磁盘存储。
+// Package file 是文件的业务层：生成 ID、操作数据库记录、协调物理存储。
 //
 // 它不碰 HTTP（那是 internal/httpapi），也不碰 os.Open/os.Rename（那是 internal/storage）。
 // 它只决定“这件事该按什么顺序做、失败了怎么收拾”。
@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"gorm.io/gorm"
@@ -33,6 +34,11 @@ const (
 
 	// maxNameRunes 和 files.name 的 varchar(255) 对齐。
 	maxNameRunes = 255
+
+	// orphanCleanupTimeout 是上传成功后数据库写入失败时，补偿删除内容的超时时间。
+	// 它不长：删除只是一个本地文件操作或一次对象存储请求；
+	// 但没有上限的话，存储端卡住会把请求一直拖住。
+	orphanCleanupTimeout = 10 * time.Second
 )
 
 var (
@@ -85,18 +91,24 @@ type ListResult struct {
 	PageSize int    `json:"page_size"`
 }
 
-// Service 负责文件业务：落盘 + 写数据库。
+// Service 负责文件业务：把内容交给 Store 保存 + 写数据库。
+//
+// 它依赖的是 storage.Store 接口，而不是具体实现：
+// 现在注入 Local，以后换成 S3 时这里不需要改。
+//
+// 多个存储位置由 storage.Registry 按策略 ID 管理；
+// Service 不自己选目录，也不回退到“默认位置”。
 type Service struct {
 	db     *gorm.DB
-	store  *storage.Local
+	stores *storage.Registry
 	logger *slog.Logger
 }
 
 // NewService 创建文件服务。
-func NewService(db *gorm.DB, store *storage.Local) *Service {
+func NewService(db *gorm.DB, stores *storage.Registry) *Service {
 	return &Service{
-		db:    db,
-		store: store,
+		db:     db,
+		stores: stores,
 		// 默认丢弃日志：构造 Service 的人不一定关心后台清理，
 		// 生产代码可以用 WithLogger 换成真正的 logger。
 		logger: slog.New(slog.DiscardHandler),
@@ -118,11 +130,11 @@ func (s *Service) WithLogger(logger *slog.Logger) *Service {
 //
 // 顺序是：
 //  1. 先确认父目录存在、属于当前用户、而且真的是目录
-//  2. 生成两个随机 ID：File 的公开 ID、Entity 的磁盘 key
-//  3. 把内容写进磁盘（临时文件 → Rename）
+//  2. 生成两个随机 ID：File 的公开 ID、Entity 的存储 key
+//  3. 通过 Store 保存内容（具体怎么写由存储实现决定）
 //  4. 再开一个短事务：重新核对父目录 → 写 Entity 和 File
 //
-// 为什么不整个上传都包在事务里？因为 32 MiB 可能要传几十秒，
+// 为什么不把整个上传包在事务里？因为 32 MiB 可能要传几十秒，
 // 一直占着数据库事务会拖住其他请求。
 func (s *Service) Upload(ctx context.Context, ownerID int, parentID, name string, r io.Reader) (File, error) {
 	if err := validateName(name); err != nil {
@@ -130,6 +142,13 @@ func (s *Service) Upload(ctx context.Context, ownerID int, parentID, name string
 	}
 
 	parent, err := s.requireDirectory(ctx, ownerID, parentID)
+	if err != nil {
+		return File{}, err
+	}
+
+	// 整个上传只在这里选一次策略：后面即使服务端改了用户默认策略，
+	// 本次内容仍然写到已经选定的位置，Entity 也记录同一个策略 ID。
+	policyID, store, err := s.uploadStore(ctx, ownerID)
 	if err != nil {
 		return File{}, err
 	}
@@ -143,8 +162,8 @@ func (s *Service) Upload(ctx context.Context, ownerID int, parentID, name string
 		return File{}, err
 	}
 
-	// 先落盘。磁盘写失败时数据库还没动过，直接返回即可。
-	size, err := s.store.Save(storageKey, r, MaxUploadBytes)
+	// 先落盘。写入失败时数据库还没动过，直接返回即可。
+	size, err := store.Save(ctx, storageKey, r, MaxUploadBytes)
 	if err != nil {
 		if errors.Is(err, storage.ErrTooLarge) {
 			return File{}, ErrTooLarge
@@ -152,9 +171,22 @@ func (s *Service) Upload(ctx context.Context, ownerID int, parentID, name string
 		return File{}, err
 	}
 
-	// 再写数据库。失败就回滚磁盘，保证两边一致。
-	if err := s.saveRecords(ctx, ownerID, parent.ID, fileID, storageKey, name, size); err != nil {
-		_ = s.store.Remove(storageKey)
+	// 再写数据库。失败就删除已写入的内容，保证两边一致。
+	if err := s.saveRecords(ctx, ownerID, parent.ID, fileID, storageKey, policyID, name, size); err != nil {
+		// 补偿删除不能复用请求的 ctx：客户端断开或超时后 ctx 已经被取消，
+		// Remove 会立刻返回取消错误，内容就永远留在存储里了。
+		// 用 WithoutCancel 保留值但去掉取消/超时，再套一个独立的有限超时。
+		// 这里必须用本次实际写入的 store，而不是重新按默认策略查一次。
+		removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), orphanCleanupTimeout)
+		removeErr := store.Remove(removeCtx, storageKey)
+		cancel()
+		if removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+			s.logger.Warn("remove orphan content",
+				"storage_key", storageKey,
+				"storage_policy_id", policyID,
+				"error", removeErr,
+			)
+		}
 		return File{}, err
 	}
 
@@ -167,6 +199,35 @@ func (s *Service) Upload(ctx context.Context, ownerID int, parentID, name string
 	}, nil
 }
 
+// uploadStore 读取服务端分配给用户的上传策略，并取出对应的 Store。
+//
+// 这是上传过程中唯一一次选择位置：返回的策略 ID 会原样写入 Entity，
+// 后续下载和清理都以 Entity 上的 ID 为准，不再看用户当前默认策略。
+func (s *Service) uploadStore(ctx context.Context, ownerID int) (int, storage.Store, error) {
+	var user model.User
+	err := s.db.WithContext(ctx).
+		Select("id", "default_storage_policy_id").
+		First(&user, ownerID).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return 0, nil, fmt.Errorf("user %d not found", ownerID)
+		}
+		return 0, nil, fmt.Errorf("query user storage policy: %w", err)
+	}
+	if user.DefaultStoragePolicyID <= 0 {
+		return 0, nil, fmt.Errorf("user %d has no default storage policy", ownerID)
+	}
+
+	store, err := s.stores.Get(user.DefaultStoragePolicyID)
+	if err != nil {
+		return 0, nil, fmt.Errorf(
+			"resolve upload storage policy %d: %w",
+			user.DefaultStoragePolicyID, err,
+		)
+	}
+	return user.DefaultStoragePolicyID, store, nil
+}
+
 // saveRecords 在一个短事务里写入 Entity 和 File。
 //
 // 两个表必须一起成功：只有 File 没有 Entity，就不知道内容在哪；
@@ -174,17 +235,17 @@ func (s *Service) Upload(ctx context.Context, ownerID int, parentID, name string
 //
 // 事务里会重新核对一次父目录：接收文件的过程中，目录可能已经被删掉，
 // 或者被换到了别人名下。
-func (s *Service) saveRecords(ctx context.Context, ownerID int, parentID, fileID, storageKey, name string, size int64) error {
+func (s *Service) saveRecords(ctx context.Context, ownerID int, parentID, fileID, storageKey string, policyID int, name string, size int64) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if _, err := queryDirectory(ctx, tx, ownerID, parentID); err != nil {
 			return err
 		}
 
 		entity := model.Entity{
-			StorageKey: storageKey,
-			Size:       size,
-			Policy:     "local",
-			RefCount:   1,
+			StorageKey:      storageKey,
+			Size:            size,
+			StoragePolicyID: policyID,
+			RefCount:        1,
 			// 新内容一定可以被引用。以后做去重、复用现有 Entity 时，
 			// 必须先锁住 Entity 并确认它仍是 active，pending_delete 不允许再加引用。
 			Status: model.EntityStatusActive,
@@ -608,7 +669,17 @@ func (s *Service) Open(ctx context.Context, ownerID int, id string) (File, io.Re
 		return File{}, nil, fmt.Errorf("file %s has no entity", id)
 	}
 
-	f, err := s.store.Open(entity.StorageKey)
+	// 按内容自己的 StoragePolicyID 找位置，不看用户当前默认策略：
+	// 服务端把默认位置从 A 调到 B 之后，A 里的旧内容仍然必须从 A 读。
+	store, err := s.stores.Get(entity.StoragePolicyID)
+	if err != nil {
+		return File{}, nil, fmt.Errorf(
+			"resolve storage policy %d of entity %d: %w",
+			entity.StoragePolicyID, entity.ID, err,
+		)
+	}
+
+	f, err := store.Open(ctx, entity.StorageKey)
 	if err != nil {
 		// 数据库有记录但磁盘文件没了：对外也当作“不存在”。
 		if errors.Is(err, fs.ErrNotExist) {
