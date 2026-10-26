@@ -80,7 +80,27 @@ func (s *Service) UploadSessionContent(
 		)
 	}
 
-	claimed, err := s.claimUploadSession(ctx, ownerID, sessionID)
+	// 必须先登记活跃写入，再做 pending → receiving 的数据库抢占。
+	// 否则会出现“数据库已经是 receiving，但取消方看不到正在写的请求”，
+	// 从而在传输还没退出时提前删掉内容。
+	uploadCtx, endUpload, err := s.uploads.begin(ctx, sessionID)
+	if err != nil {
+		return UploadSessionInfo{}, err
+	}
+	defer func() {
+		// 先注销，让取消/过期方确认写入已经退出；若会话已经结束
+		// （canceled 或 expired），再移交清理。handoff 内部有独立超时，
+		// 且会话不是终态时什么都不做。
+		endUpload()
+		if handoffErr := s.handoffTerminatedSession(ctx, ownerID, sessionID); handoffErr != nil {
+			s.logger.Warn("terminated upload session cleanup deferred",
+				"session_id", sessionID,
+				"error", handoffErr,
+			)
+		}
+	}()
+
+	claimed, err := s.claimUploadSession(uploadCtx, ownerID, sessionID)
 	if err != nil {
 		return UploadSessionInfo{}, err
 	}
@@ -94,7 +114,8 @@ func (s *Service) UploadSessionContent(
 	}
 
 	// 按声明大小读取，最多多读 1 个字节来发现“多传”。
-	actualSize, err := store.Save(ctx, entity.StorageKey, r, session.ExpectedSize)
+	// 使用登记时创建的子 context：取消接口会让它停止读取。
+	actualSize, err := store.Save(uploadCtx, entity.StorageKey, r, session.ExpectedSize)
 	if err != nil {
 		if errors.Is(err, storage.ErrTooLarge) {
 			err = ErrUploadSizeMismatch

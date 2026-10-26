@@ -7,7 +7,9 @@
 //	标记已提交，磁盘还没删 → 下次扫描到标记，继续删
 //	磁盘已删，Entity 还没删 → 再删发现对象不存在，视为成功，再清记录
 //
-// 清理逻辑不产生新的 pending_delete：它只处理已经处于该状态的 Entity。
+// 清理逻辑本身不直接把 active 内容标成 pending_delete：它只处理已经处于
+// 该状态的 Entity。上传会话过期时，CleanupPending 会先走一遍到期扫描，
+// 由 handoffTerminatedSession 在确认写入退出后产生新的 pending_delete。
 package file
 
 import (
@@ -41,6 +43,16 @@ type CleanupResult struct {
 
 // CleanupPending 扫描并清理所有 pending_delete、ref_count=0 的 Entity。
 //
+// 每一轮按固定顺序做三件事：
+//  1. 扫描到期仍未完成的会话，标记 expired，并尝试移交占位内容；
+//  2. 恢复已经 canceled / expired、但占位 Entity 还是 uploading 的会话，
+//     补上上次崩溃前没来得及完成的移交；
+//  3. 清理所有 pending_delete 实体。
+//
+// 第 1、2 步都可能产生新的 pending_delete，所以必须放在清理之前。
+// 它们不会删除已发布的内容：只有仍处于 uploading/0、没有 File 引用的
+// 占位实体才会被移交。
+//
 // 每处理一个实体都会：
 //  1. 在一个短事务里锁住 Entity，再次确认没有 File 引用；
 //  2. 提交事务后才删物理对象（磁盘/S3 操作不能长期占着数据库事务）；
@@ -54,8 +66,22 @@ func (s *Service) CleanupPending(ctx context.Context, batchSize int) (CleanupRes
 	}
 
 	var result CleanupResult
-	var cursor int64
 
+	// 第 1 步：先把已经到期的未完成会话标成 expired。
+	// 到期扫描内部按条处理，单条失败不会中断整轮；这里的错误通常来自
+	// 候选查询本身，记日志后仍然继续清理已经存在的 pending_delete。
+	if err := s.ExpireUploadSessions(ctx, time.Now(), batchSize); err != nil {
+		if ctx.Err() != nil {
+			return result, ctx.Err()
+		}
+		s.logger.Warn("scan expired upload sessions", "error", err)
+	}
+
+	// 第 2 步：补做已经 canceled / expired 但还没移交的占位内容。
+	// 服务可能在“会话已经是终态、Entity 仍是 uploading/0”时崩溃。
+	s.resumeTerminatedSessions(ctx, batchSize)
+
+	var cursor int64
 	for {
 		if err := ctx.Err(); err != nil {
 			return result, err

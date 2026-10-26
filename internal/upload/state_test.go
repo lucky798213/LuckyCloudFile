@@ -52,9 +52,11 @@ func TestCanTransition(t *testing.T) {
 		{model.UploadStatusCanceled, model.UploadStatusPending, false},
 		{model.UploadStatusCanceled, model.UploadStatusReceiving, false},
 		{model.UploadStatusCanceled, model.UploadStatusCompleted, false},
+		{model.UploadStatusCanceled, model.UploadStatusExpired, false},
 		{model.UploadStatusExpired, model.UploadStatusPending, false},
 		{model.UploadStatusExpired, model.UploadStatusReceiving, false},
 		{model.UploadStatusExpired, model.UploadStatusCompleted, false},
+		{model.UploadStatusExpired, model.UploadStatusCanceled, false},
 
 		// 未知状态不放行。
 		{"", model.UploadStatusPending, false},

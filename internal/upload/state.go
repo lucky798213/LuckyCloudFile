@@ -34,6 +34,8 @@ var (
 //
 // receiving → pending 表示这次写入失败且已经停止，客户端可以重新上传。
 // completed 不能再取消或过期，所以它只能停留在 completed。
+// canceled / expired 也都是终态：取消不能把 expired 改写成 canceled，
+// 过期扫描也不能把 canceled 改写成 expired；两者只继续推进物理清理。
 func CanTransition(from, to string) bool {
 	switch from {
 	case model.UploadStatusPending:

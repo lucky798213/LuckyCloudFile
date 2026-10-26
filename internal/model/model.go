@@ -184,7 +184,8 @@ func (AuthSession) TableName() string { return "auth_sessions" }
 //	          pending（写入失败且已停止，可以重新上传）
 //
 // pending/receiving/ready 都可以变成 canceled 或 expired；
-// 一旦 completed 就不能再取消或过期。
+// 一旦 completed 就不能再取消或过期。canceled / expired 都是终态，
+// 保留各自的原因，只继续推进残留内容的物理清理。
 const (
 	UploadStatusPending   = "pending"
 	UploadStatusReceiving = "receiving"

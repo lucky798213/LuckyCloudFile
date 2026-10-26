@@ -39,6 +39,8 @@ type fileService interface {
 	CreateUploadSession(ctx context.Context, ownerID int, parentID, name string, size int64) (file.UploadSessionInfo, error)
 	GetUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error)
 	UploadSessionContent(ctx context.Context, ownerID int, sessionID string, r io.Reader) (file.UploadSessionInfo, error)
+	CompleteUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error)
+	CancelUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error)
 }
 
 // NewRouter 创建并配置好路由。
@@ -90,6 +92,11 @@ func NewRouter(logger *slog.Logger, fileService fileService, authService authSer
 	protected.GET("/upload-sessions/:id", getUploadSession(logger, fileService))
 	// 内容上传：请求体是原始字节，写入会话创建时选定的占位位置。
 	protected.PUT("/upload-sessions/:id/content", uploadSessionContent(logger, fileService))
+	// 确认完成：把已经 ready 的内容正式发布成用户目录里的文件。
+	protected.POST("/upload-sessions/:id/complete", completeUploadSession(logger, fileService))
+	// 取消上传：未完成会话标记 canceled；已过期会话保持 expired，
+	// 两种情况都会在写入停止后清理占位内容。
+	protected.DELETE("/upload-sessions/:id", cancelUploadSession(logger, fileService))
 
 	// 兜底：没匹配到任何路由时，返回统一的 JSON 错误，而不是 Gin 默认的纯文本 404。
 	r.NoRoute(notFound)

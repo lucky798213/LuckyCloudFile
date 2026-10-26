@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -28,6 +29,49 @@ func TestSaveWritesCompleteFile(t *testing.T) {
 	}
 	if string(data) != "hello" {
 		t.Fatalf("saved content = %q, want %q", data, "hello")
+	}
+}
+
+// TestSaveCreatesOwnerOnlyContent 验证上传内容不会被同组/其他用户读取。
+//
+// 临时文件会用 0600 创建，重命名后正式文件沿用同一权限。
+// 这里直接检查最终文件，避免依赖进程 umask 的具体取值。
+func TestSaveCreatesOwnerOnlyContent(t *testing.T) {
+	ctx := context.Background()
+	local := NewLocal(t.TempDir())
+
+	if _, err := local.Save(ctx, "private", strings.NewReader("secret"), 1<<20); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(local.Path("private"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("saved content permission = %04o, want 0600", got)
+	}
+}
+
+// TestSaveTightensLeftoverTempPermission 覆盖旧版本留下的 0644 临时文件：
+// O_CREATE 不会改已存在文件的权限，Save 必须显式收紧后再发布。
+func TestSaveTightensLeftoverTempPermission(t *testing.T) {
+	ctx := context.Background()
+	local := NewLocal(t.TempDir())
+
+	if err := os.WriteFile(local.tempPath("leftover"), []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := local.Save(ctx, "leftover", strings.NewReader("new"), 1<<20); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(local.Path("leftover"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("published content permission = %04o, want 0600", got)
 	}
 }
 
@@ -204,5 +248,42 @@ func TestOpenAndRemove(t *testing.T) {
 	}
 	if _, err := local.Open(ctx, "id1"); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("wanted not-exist error after remove, got %v", err)
+	}
+}
+
+// TestRemoveDeletesTempContent 覆盖“进程在 Save 中途被强杀”留下的临时文件：
+// Remove(key) 必须同时删除正式对象和 .upload-<key>。
+func TestRemoveDeletesTempContent(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	local := NewLocal(root)
+
+	tmpPath := filepath.Join(root, ".upload-crashed-key")
+	if err := os.WriteFile(tmpPath, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := local.Remove(ctx, "crashed-key"); err != nil {
+		t.Fatalf("remove should treat the leftover temp file as cleanable: %v", err)
+	}
+	if _, err := os.Stat(tmpPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("temp content was not removed: %v", err)
+	}
+}
+
+// TestRemoveReportsRealErrors 确认清理不会把真实删除错误吞掉。
+func TestRemoveReportsRealErrors(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	local := NewLocal(root)
+
+	// 在目标位置放一个非空目录，os.Remove 会返回 ENOTEMPTY 之类的真实错误。
+	finalPath := filepath.Join(root, "not-a-file")
+	if err := os.MkdirAll(filepath.Join(finalPath, "child"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := local.Remove(ctx, "not-a-file"); err == nil {
+		t.Fatal("wanted a real remove error")
 	}
 }

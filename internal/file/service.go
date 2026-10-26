@@ -99,9 +99,10 @@ type ListResult struct {
 // 多个存储位置由 storage.Registry 按策略 ID 管理；
 // Service 不自己选目录，也不回退到“默认位置”。
 type Service struct {
-	db     *gorm.DB
-	stores *storage.Registry
-	logger *slog.Logger
+	db      *gorm.DB
+	stores  *storage.Registry
+	logger  *slog.Logger
+	uploads *uploadController
 }
 
 // NewService 创建文件服务。
@@ -112,6 +113,8 @@ func NewService(db *gorm.DB, stores *storage.Registry) *Service {
 		// 默认丢弃日志：构造 Service 的人不一定关心后台清理，
 		// 生产代码可以用 WithLogger 换成真正的 logger。
 		logger: slog.New(slog.DiscardHandler),
+		// 同一个 Service 实例的上传和取消请求共用这个控制器。
+		uploads: newUploadController(),
 	}
 }
 

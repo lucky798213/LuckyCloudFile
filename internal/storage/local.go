@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -53,15 +54,31 @@ func (l *Local) Save(ctx context.Context, key string, r io.Reader, maxBytes int6
 	}
 
 	// 临时文件必须和最终文件在同一个目录，这样 Rename 才是原子操作。
-	tmp, err := os.CreateTemp(l.root, ".upload-*")
+	// 名字带上 StorageKey，清理时即使进程被强杀，也能通过 Remove(key)
+	// 找到这份“还没发布”的临时内容。
+	//
+	// 显式用 0600 创建：内容在重命名后沿用临时文件的权限，
+	// 不能依赖进程 umask（常见的 022 会让 os.Create 得到 0644）。
+	tmp, err := os.OpenFile(
+		l.tempPath(key),
+		os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
+		0o600,
+	)
 	if err != nil {
 		return 0, fmt.Errorf("create temp file: %w", err)
 	}
 	tmpPath := tmp.Name()
 
-	// 不管成功还是失败，最后都尝试删除临时文件。
-	// 成功重命名后它已经不存在了，删除会失败，但无所谓，所以忽略错误。
+	// 正常退出时再兜底删一次；进程被强杀时不会执行，
+	// 所以清理路径还必须自己处理临时文件（见 Remove）。
 	defer os.Remove(tmpPath)
+
+	// O_CREATE 不会修改已存在文件的权限：如果目录里残留了旧版本
+	// 创建的 0644 临时文件，这里再收紧一次，避免发布后变成可被同组读取。
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return 0, fmt.Errorf("set temp file permissions: %w", err)
+	}
 
 	// 多读 1 个字节，是为了区分“刚好等于上限”和“超过上限”：
 	//   - 读到 maxBytes 就结束 → 正好等于上限，放行
@@ -126,12 +143,36 @@ func (l *Local) Open(ctx context.Context, key string) (io.ReadCloser, error) {
 	return os.Open(l.Path(key))
 }
 
-// Remove 删除一个文件。文件不存在时返回的错误可以用 os.IsNotExist 判断。
+// Remove 删除一个 key 对应的正式内容和可能的临时内容。
+//
+// 只删正式对象不够：进程在 Save 中途被强杀时，会留下 .upload-<key>。
+// 这里同时删两者，任何一个删除失败都会返回错误，让清理逻辑保留记录并重试。
+// 两个都不存在时返回 fs.ErrNotExist，和原来“删除不存在的对象”的约定一致。
 func (l *Local) Remove(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return os.Remove(l.Path(key))
+
+	finalErr := os.Remove(l.Path(key))
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tempErr := os.Remove(l.tempPath(key))
+
+	finalMissing := errors.Is(finalErr, fs.ErrNotExist)
+	tempMissing := errors.Is(tempErr, fs.ErrNotExist)
+
+	// 真实删除错误优先返回：此时不能假装清理已经完成。
+	if finalErr != nil && !finalMissing {
+		return fmt.Errorf("remove content %q: %w", key, finalErr)
+	}
+	if tempErr != nil && !tempMissing {
+		return fmt.Errorf("remove temp content %q: %w", key, tempErr)
+	}
+	if finalMissing && tempMissing {
+		return fs.ErrNotExist
+	}
+	return nil
 }
 
 // Path 返回某个 key 对应的磁盘路径。
@@ -143,4 +184,10 @@ func (l *Local) Remove(ctx context.Context, key string) error {
 // 不可能用来拼出 ../ 之类的越界路径。
 func (l *Local) Path(key string) string {
 	return filepath.Join(l.root, key)
+}
+
+// tempPath 是 Save 过程中使用的临时文件名。
+// 它必须和 Path(key) 在同一个目录，Rename 才是原子的。
+func (l *Local) tempPath(key string) string {
+	return l.Path(".upload-" + key)
 }

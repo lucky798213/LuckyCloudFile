@@ -436,6 +436,78 @@ func (f *fakeFileService) UploadSessionContent(ctx context.Context, ownerID int,
 	return session.info, nil
 }
 
+// CompleteUploadSession 模拟真实服务：把 ready 会话的内容发布成一条正式 File。
+// 已完成时先于过期检查返回原文件 ID；其他状态拒绝，同名冲突返回 409。
+func (f *fakeFileService) CompleteUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	session, ok := f.sessions[sessionID]
+	if !ok || session.ownerID != ownerID {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionNotFound
+	}
+
+	if session.info.Status == model.UploadStatusCompleted {
+		if session.info.ResultFileID == nil || *session.info.ResultFileID == "" {
+			return file.UploadSessionInfo{}, file.ErrUploadSessionInconsistent
+		}
+		return session.info, nil
+	}
+	if session.info.Status != model.UploadStatusReady {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionNotCompletable
+	}
+	if !session.info.ExpiresAt.After(time.Now()) {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionExpired
+	}
+	if err := f.checkParent(ownerID, session.info.ParentID); err != nil {
+		return file.UploadSessionInfo{}, err
+	}
+	if f.nameTaken(ownerID, session.info.ParentID, session.info.Name) {
+		return file.UploadSessionInfo{}, file.ErrAlreadyExists
+	}
+
+	f.nextID++
+	id := fmt.Sprintf("fake-%d", f.nextID)
+	record := file.File{
+		ID:   id,
+		Name: session.info.Name,
+		Size: session.info.ActualSize,
+		Kind: model.KindFile,
+	}
+	if session.info.ParentID != "" {
+		parentID := session.info.ParentID
+		record.ParentID = &parentID
+	}
+	f.records[id] = record
+	f.contents[id] = session.content
+	f.owners[id] = ownerID
+
+	session.info.Status = model.UploadStatusCompleted
+	session.info.ResultFileID = &id
+	f.sessions[sessionID] = session
+	return session.info, nil
+}
+
+// CancelUploadSession 模拟真实服务：completed 返回冲突，其余状态改成 canceled。
+// 幂等取消不报错；假实现同时丢掉尚未发布的会话内容。
+func (f *fakeFileService) CancelUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	session, ok := f.sessions[sessionID]
+	if !ok || session.ownerID != ownerID {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionNotFound
+	}
+	if session.info.Status == model.UploadStatusCompleted {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionCompleted
+	}
+
+	session.info.Status = model.UploadStatusCanceled
+	session.content = nil
+	f.sessions[sessionID] = session
+	return session.info, nil
+}
+
 func (f *fakeFileService) stored(id string) ([]byte, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
