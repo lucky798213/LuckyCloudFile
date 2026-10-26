@@ -13,6 +13,7 @@ import (
 	"luckyCloudFile/internal/idgen"
 	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/quota"
+	"luckyCloudFile/internal/storage"
 	"luckyCloudFile/internal/upload"
 )
 
@@ -26,17 +27,24 @@ var (
 	ErrUploadSessionInconsistent = upload.ErrMissingResultFile
 )
 
-// CompleteUploadSession 把已经 ready 的上传内容正式发布到用户目录。
+// CompleteUploadSession 把已经收齐的上传内容正式发布到用户目录。
 //
 // 它不接收也不搬运文件：内容已经在内容上传阶段写进了会话占位 Entity，
 // 这里只创建正式 File、激活 Entity、把会话标成 completed。
 //
+// 分片会话在进入发布事务之前多一个准备阶段（见 prepareChunkedCompletion）：
+// 先取得会话级收尾门禁、等在途写入退出，再按内存账本核对每个分片，
+// 然后 FinalizeChunks 并把 Session/Entity 推进到 ready。
+// 因此 /complete 每次都会重新核对和推进，而不是只在“最后一片到达”时
+// 尝试一次；缺任何一片都不会因为文件长度已经等于总大小而发布。
+//
 // 顺序：
-//  1. 在事务里先锁用户行，再按 sessionID + ownerID 锁会话；
-//  2. completed 直接返回原 ResultFileID（先于过期检查，支持幂等重放）；
-//  3. ready 且未过期才继续，其余状态拒绝；
-//  4. 重新校验目标目录和占位 Entity（uploading / 0，三处大小一致）；
-//  5. 把会话预留量转成已用量（reserved → used），
+//  1. 分片会话先做收尾准备：门禁 → 核对账本 → FinalizeChunks → ready；
+//  2. 在事务里先锁用户行，再按 sessionID + ownerID 锁会话；
+//  3. completed 直接返回原 ResultFileID（先于过期检查，支持幂等重放）；
+//  4. ready 且未过期才继续，其余状态拒绝；
+//  5. 重新校验目标目录和占位 Entity（uploading / 0，三处大小一致）；
+//  6. 把会话预留量转成已用量（reserved → used），
 //     创建 File → 激活 Entity（active / 1）→ 会话标记 completed、预留清零。
 //
 // 容量结算是这个事务的一部分，但不在事务提交后的回调里做：
@@ -51,12 +59,43 @@ func (s *Service) CompleteUploadSession(
 	ownerID int,
 	sessionID string,
 ) (UploadSessionInfo, error) {
+	// 分片会话：先确认内容真的收齐，再进入发布事务。
+	//
+	// 已经 completed 的会话不再拿门禁，直接交给下面的发布事务返回原结果，
+	// 这样 completed 仍然先于过期判断。
+	current, err := s.findOwnedUploadSession(ctx, ownerID, sessionID)
+	if err != nil {
+		return UploadSessionInfo{}, err
+	}
+	if current.Mode == model.UploadModeChunked &&
+		current.Status != model.UploadStatusCompleted {
+		release, gateErr := s.uploads.beginFinalize(ctx, sessionID)
+		if gateErr != nil {
+			return UploadSessionInfo{}, gateErr
+		}
+		defer func() {
+			release()
+			// 收尾期间会话可能被并发取消/过期。handoff 之前因为门禁
+			// 把会话当成“仍活跃”而跳过，现在补一次；成功完成时它是空操作。
+			if handoffErr := s.handoffTerminatedSession(ctx, ownerID, sessionID); handoffErr != nil {
+				s.logger.Warn("terminated upload session cleanup deferred",
+					"session_id", sessionID,
+					"error", handoffErr,
+				)
+			}
+		}()
+
+		if err := s.prepareChunkedCompletion(ctx, ownerID, sessionID); err != nil {
+			return UploadSessionInfo{}, err
+		}
+	}
+
 	var (
 		completed UploadSessionInfo
 		fileID    string
 	)
 
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// 先锁用户、再锁会话：和取消、过期、重启恢复保持同一个加锁顺序。
 		if _, err := quota.LockUser(tx, ownerID); err != nil {
 			return err
@@ -245,6 +284,230 @@ func (s *Service) CompleteUploadSession(
 		)
 	}
 	return UploadSessionInfo{}, err
+}
+
+// prepareChunkedCompletion 是分片会话的收尾准备阶段。
+//
+// 调用方必须已经取得会话级收尾门禁，因此这里不会再有新的分片写入。
+// 它依次做三件事：
+//  1. 按内存账本核对每个合法编号都有成功记录，累计字节数等于 ExpectedSize；
+//  2. 调用 FinalizeChunks 把临时对象发布成完整内容（空文件没有临时对象，跳过）；
+//  3. 把 Session 推进到 ready、ActualSize/Entity.Size 对齐 ExpectedSize。
+//
+// 这里只确认“内容已经完整”并完成物理收尾，不创建 File、不结算容量：
+// 那些仍然由后面的发布事务完成，避免另开一套发布逻辑。
+//
+// 任何一步失败都不删除已确认的分片、物理内容或预留容量；用户再次调用
+// /complete 会重新核对并继续，即使上一次已经走到了 Finalize 之后。
+func (s *Service) prepareChunkedCompletion(
+	ctx context.Context,
+	ownerID int,
+	sessionID string,
+) error {
+	session, err := s.findOwnedUploadSession(ctx, ownerID, sessionID)
+	if err != nil {
+		return err
+	}
+	if session.Mode != model.UploadModeChunked {
+		return nil
+	}
+	switch session.Status {
+	case model.UploadStatusCompleted:
+		return nil
+	case model.UploadStatusCanceled, model.UploadStatusExpired:
+		return ErrUploadSessionNotCompletable
+	}
+	// 到期和重启失效都不能再推进成 ready。
+	if !session.ExpiresAt.After(time.Now()) {
+		return ErrUploadSessionExpired
+	}
+
+	// 账本缺失时不能凭 ActualSize 或文件长度就发布：分片进度只认账本。
+	// 空文件没有分片，账本即使不存在也没有任何需要核对的编号。
+	uploaded, received, ok := s.chunks.snapshot(session.ID)
+	if !ok {
+		if session.ExpectedSize != 0 {
+			return fmt.Errorf(
+				"%w: chunk ledger missing for session %s",
+				ErrUploadSessionNotCompletable, session.ID,
+			)
+		}
+		uploaded, received = map[int]ChunkReceipt{}, 0
+	}
+	if err := verifyChunkProgress(session, uploaded, received); err != nil {
+		return err
+	}
+
+	var entity model.Entity
+	err = s.db.WithContext(ctx).First(&entity, session.EntityID).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrUploadSessionConflict
+		}
+		return fmt.Errorf("query upload placeholder entity: %w", err)
+	}
+	if entity.Status != model.EntityStatusUploading || entity.RefCount != 0 {
+		return ErrUploadSessionConflict
+	}
+
+	store, err := s.stores.Get(entity.StoragePolicyID)
+	if err != nil {
+		return fmt.Errorf(
+			"resolve storage policy %d of upload session %s: %w",
+			entity.StoragePolicyID, session.ID, err,
+		)
+	}
+	chunkStore, ok := store.(storage.ChunkStore)
+	if !ok {
+		return fmt.Errorf(
+			"storage policy %d does not support chunked uploads",
+			entity.StoragePolicyID,
+		)
+	}
+
+	// 空文件没有 PrepareChunks 产生的临时对象，发布事务会补一个 0 字节对象。
+	if session.ExpectedSize > 0 {
+		if err := chunkStore.FinalizeChunks(
+			ctx, entity.StorageKey, session.ExpectedSize,
+		); err != nil {
+			return fmt.Errorf("finalize upload chunks: %w", err)
+		}
+	}
+
+	return s.markChunkedUploadReady(ctx, ownerID, session, entity.ID)
+}
+
+// verifyChunkProgress 用账本确认内容完整：编号必须恰好覆盖 [0, chunkCount)，
+// 每片长度必须等于几何计算值，累计字节数必须等于声明大小。
+//
+// 这里刻意不看文件长度：预分配的文件可能已经是总大小，但中间仍可能是空洞。
+// 缺一片时返回 ErrUploadSessionNotCompletable（HTTP 409），不发布文件。
+func verifyChunkProgress(
+	session *model.UploadSession,
+	uploaded map[int]ChunkReceipt,
+	received int64,
+) error {
+	count, err := upload.ChunkCount(session.ExpectedSize, session.ChunkSize)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrUploadSessionConflict, err)
+	}
+	if len(uploaded) != count {
+		return fmt.Errorf(
+			"%w: session %s has %d chunk receipts, want %d",
+			ErrUploadSessionNotCompletable, session.ID, len(uploaded), count,
+		)
+	}
+
+	var total int64
+	for index := 0; index < count; index++ {
+		receipt, ok := uploaded[index]
+		if !ok {
+			return fmt.Errorf(
+				"%w: session %s is missing chunk %d/%d",
+				ErrUploadSessionNotCompletable, session.ID, index, count,
+			)
+		}
+		_, want, err := upload.ChunkAt(
+			session.ExpectedSize, session.ChunkSize, index,
+		)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrUploadSessionConflict, err)
+		}
+		if receipt.Size != want {
+			return fmt.Errorf(
+				"%w: session %s chunk %d has %d bytes, want %d",
+				ErrUploadSessionNotCompletable, session.ID, index, receipt.Size, want,
+			)
+		}
+		total += receipt.Size
+	}
+	if total != received || total != session.ExpectedSize {
+		return fmt.Errorf(
+			"%w: session %s has %d chunk bytes (ledger %d), want %d",
+			ErrUploadSessionNotCompletable, session.ID, total, received, session.ExpectedSize,
+		)
+	}
+	return nil
+}
+
+// markChunkedUploadReady 在短事务里把分片会话推进到发布事务要求的 ready：
+// status=ready、ActualSize=ExpectedSize、Entity.Size=ExpectedSize。
+//
+// 它同时作为“上次收尾只完成了一半”的恢复入口：分片已经全部登记、临时对象
+// 也已经 Finalize，但数据库更新失败时，Session 可能还是 pending/receiving，
+// Entity.Size 也可能落后。这里按 ExpectedSize 重新对齐，重复执行是幂等的。
+func (s *Service) markChunkedUploadReady(
+	ctx context.Context,
+	ownerID int,
+	session *model.UploadSession,
+	entityID int64,
+) error {
+	now := time.Now()
+
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 加锁顺序仍然和完成/取消/过期一致：User → Session → Entity。
+		current, err := lockUserAndUploadSession(ctx, tx, ownerID, session.ID)
+		if err != nil {
+			return err
+		}
+		switch current.Status {
+		case model.UploadStatusCompleted:
+			return nil
+		case model.UploadStatusCanceled, model.UploadStatusExpired:
+			return ErrUploadSessionNotCompletable
+		}
+		if !current.ExpiresAt.After(now) {
+			return ErrUploadSessionExpired
+		}
+		if current.Mode != model.UploadModeChunked ||
+			current.ExpectedSize != session.ExpectedSize ||
+			current.EntityID != entityID {
+			return ErrUploadSessionConflict
+		}
+
+		var entity model.Entity
+		err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND status = ? AND ref_count = 0",
+				entityID, model.EntityStatusUploading).
+			First(&entity).Error
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrUploadSessionConflict
+			}
+			return fmt.Errorf("lock upload placeholder entity: %w", err)
+		}
+		if entity.Size != current.ExpectedSize {
+			if err := tx.Model(&model.Entity{}).
+				Where("id = ?", entity.ID).
+				UpdateColumn("size", current.ExpectedSize).Error; err != nil {
+				return fmt.Errorf("update upload placeholder entity: %w", err)
+			}
+		}
+
+		// 已经是 ready 且大小对齐时不需要 UPDATE：MySQL 会把“值没有变化”
+		// 报告成 0 行受影响，不能拿 RowsAffected 判断这次操作是否成功。
+		if current.Status == model.UploadStatusReady &&
+			current.ActualSize == current.ExpectedSize {
+			return nil
+		}
+
+		// 分片已经全部核对通过，pending/receiving/ready 都允许推进到 ready。
+		// 这是恢复路径：正常情况下最后一片到达时已经走过 receiving → ready。
+		updated := tx.Model(&model.UploadSession{}).
+			Where("id = ? AND owner_id = ? AND status IN ?",
+				current.ID, ownerID, unfinishedUploadStatuses).
+			UpdateColumns(map[string]any{
+				"status":      model.UploadStatusReady,
+				"actual_size": current.ExpectedSize,
+			})
+		if updated.Error != nil {
+			return fmt.Errorf("mark upload session ready: %w", updated.Error)
+		}
+		if updated.RowsAffected != 1 {
+			return ErrUploadSessionConflict
+		}
+		return nil
+	})
 }
 
 // verifyCompletedUploadSession 用独立、有超时的 context 加锁核对完成结果。

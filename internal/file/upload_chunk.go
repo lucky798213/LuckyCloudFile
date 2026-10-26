@@ -62,6 +62,32 @@ func (s *Service) UploadSessionChunk(
 		return s.replayReadyUploadChunk(ctx, session, index, r)
 	case model.UploadStatusPending:
 		// 正常的分片写入路径。
+	case model.UploadStatusReceiving:
+		// 正常写入期间状态就是 receiving。但如果上一次失败回退 pending 时
+		// 数据库出错，会话会卡在 receiving：此时没有活跃写入，却一直 409。
+		// 先尝试核对恢复，拿不到空闲门禁说明确实还有请求在写。
+		recovered, err := s.recoverReceivingUploadSession(ctx, ownerID, sessionID)
+		if err != nil {
+			return UploadSessionInfo{}, err
+		}
+		if !recovered {
+			return UploadSessionInfo{}, ErrUploadSessionConflict
+		}
+		// 恢复后重新读取：通常是 pending；也可能刚被并发完成推进到 ready。
+		session, err = s.findOwnedUploadSession(ctx, ownerID, sessionID)
+		if err != nil {
+			return UploadSessionInfo{}, err
+		}
+		if isUploadSessionInvalid(*session) {
+			return UploadSessionInfo{}, ErrUploadSessionExpired
+		}
+		switch session.Status {
+		case model.UploadStatusPending:
+		case model.UploadStatusReady:
+			return s.replayReadyUploadChunk(ctx, session, index, r)
+		default:
+			return UploadSessionInfo{}, ErrUploadSessionConflict
+		}
 	default:
 		return UploadSessionInfo{}, ErrUploadSessionConflict
 	}
@@ -166,20 +192,20 @@ func (s *Service) UploadSessionChunk(
 			fmt.Errorf("read upload chunk: %w", err),
 		)
 	}
-	if int64(len(data)) != chunkBytes {
-		return UploadSessionInfo{}, s.failUploadChunk(
-			ctx, ownerID, sessionID, ErrUploadSizeMismatch,
-		)
-	}
 
-	receipt := ChunkReceipt{
-		Size:   int64(len(data)),
-		SHA256: sha256.Sum256(data),
-	}
-
-	// 账本里已经有这个编号：内容一致就幂等返回，不一致就拒绝。
-	// 这里不再 WriteAt，避免重复写入或覆盖已经确认过的分片。
+	// 账本里已经有这个编号：长度或摘要不一致都属于“已确认内容被改写”，
+	// 必须返回冲突（409），不能落到下面未确认编号的“长度不匹配”（400）。
+	// 这里在判断长度之前先查账本，而且两种情况都不写盘。
 	if existing, exists := s.chunks.lookup(sessionID, index); exists {
+		if int64(len(data)) != existing.Size {
+			return UploadSessionInfo{}, s.failUploadChunk(
+				ctx, ownerID, sessionID, ErrUploadSessionConflict,
+			)
+		}
+		receipt := ChunkReceipt{
+			Size:   int64(len(data)),
+			SHA256: sha256.Sum256(data),
+		}
 		if existing != receipt {
 			return UploadSessionInfo{}, s.failUploadChunk(
 				ctx, ownerID, sessionID, ErrUploadSessionConflict,
@@ -189,6 +215,18 @@ func (s *Service) UploadSessionChunk(
 			ctx, uploadCtx, ownerID, session, chunkStore,
 			entity.StorageKey, received,
 		)
+	}
+
+	// 未确认编号：长度必须正好等于这一片应该收到的字节数，否则 400。
+	if int64(len(data)) != chunkBytes {
+		return UploadSessionInfo{}, s.failUploadChunk(
+			ctx, ownerID, sessionID, ErrUploadSizeMismatch,
+		)
+	}
+
+	receipt := ChunkReceipt{
+		Size:   int64(len(data)),
+		SHA256: sha256.Sum256(data),
 	}
 
 	// 第一次写入前才准备临时文件。PrepareChunks 是幂等的，
@@ -226,6 +264,64 @@ func (s *Service) UploadSessionChunk(
 		ctx, uploadCtx, ownerID, session, chunkStore,
 		entity.StorageKey, received,
 	)
+}
+
+// recoverReceivingUploadSession 处理“数据库仍是 receiving，但没有任何活跃写入”。
+//
+// 正常失败回退会把 receiving 改回 pending；如果那次数据库更新失败，会话就会
+// 卡在 receiving，之后所有分片都返回 409。这里在空闲门禁下核对并恢复：
+// 只有确认内存里没有活跃写入/收尾时，才按条件把 receiving 改回 pending。
+//
+// 拿不到门禁说明还有请求在写，或者有收尾正在进行，返回 (false, nil)，
+// 调用方按冲突处理。恢复条件带 expires_at，过期会话不会被重新放行。
+func (s *Service) recoverReceivingUploadSession(
+	ctx context.Context,
+	ownerID int,
+	sessionID string,
+) (bool, error) {
+	release, ok := s.uploads.beginIdleGate(sessionID)
+	if !ok {
+		return false, nil
+	}
+	defer func() {
+		release()
+		// 恢复期间会话可能被并发取消/过期。终态会话的 handoff 会因为
+		// 门禁把这里当成“仍活跃”而跳过，释放后再补一次；正常 pending 是空操作。
+		if handoffErr := s.handoffTerminatedSession(ctx, ownerID, sessionID); handoffErr != nil {
+			s.logger.Warn("terminated upload session cleanup deferred",
+				"session_id", sessionID,
+				"error", handoffErr,
+			)
+		}
+	}()
+
+	// 恢复本身不应该因为客户端断开而半途而废：否则会话会一直卡在 receiving。
+	recoverCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx), orphanCleanupTimeout,
+	)
+	defer cancel()
+
+	result := s.db.WithContext(recoverCtx).
+		Model(&model.UploadSession{}).
+		Where("id = ? AND owner_id = ? AND status = ? AND expires_at > ?",
+			sessionID, ownerID, model.UploadStatusReceiving, time.Now()).
+		UpdateColumn("status", model.UploadStatusPending)
+	if result.Error != nil {
+		return false, fmt.Errorf("recover receiving upload session: %w", result.Error)
+	}
+	if result.RowsAffected == 1 {
+		return true, nil
+	}
+
+	// 条件更新没命中：可能已经被别人改回 pending，也可能刚好过期。
+	current, err := s.findOwnedUploadSession(recoverCtx, ownerID, sessionID)
+	if err != nil {
+		return false, err
+	}
+	if isUploadSessionInvalid(*current) {
+		return false, ErrUploadSessionExpired
+	}
+	return current.Status == model.UploadStatusPending, nil
 }
 
 // replayReadyUploadChunk 处理“所有分片已经收齐、但还没有正式完成”时的重复分片。
@@ -293,6 +389,9 @@ func (s *Service) replayReadyUploadChunk(
 // 只有账本累计字节数等于声明大小时才 Finalize 临时文件，并让会话变成 ready。
 // 所有分片乱序到达也没关系：每片都写在自己的准确区间，收齐后临时文件就是
 // 完整内容。Finalize 是幂等的，重复编号的幂等重试可以安全地再调用一次。
+//
+// 这里只是尽早收尾；确认完成接口还会在发布前重新核对账本并再次 Finalize，
+// 所以最后一片收尾失败时，客户端再次调用 /complete 仍然可以继续。
 func (s *Service) finishUploadChunk(
 	ctx context.Context,
 	uploadCtx context.Context,

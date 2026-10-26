@@ -79,6 +79,25 @@ func (l *chunkLedger) lookup(sessionID string, index int) (ChunkReceipt, bool) {
 	return receipt, ok
 }
 
+// snapshot 返回账本的一份只读副本、累计字节数，以及账本是否存在。
+//
+// 完成接口用它核对“每个合法编号都有成功记录”。返回副本是为了让核对
+// 过程不持有账本锁：核对期间的写入已经被会话级收尾门禁挡住了。
+func (l *chunkLedger) snapshot(sessionID string) (map[int]ChunkReceipt, int64, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	progress, ok := l.sessions[sessionID]
+	if !ok {
+		return nil, 0, false
+	}
+	uploaded := make(map[int]ChunkReceipt, len(progress.Uploaded))
+	for index, receipt := range progress.Uploaded {
+		uploaded[index] = receipt
+	}
+	return uploaded, progress.ReceivedBytes, true
+}
+
 // record 在写入成功后登记一片。
 //
 // 返回累计有效字节数和是否真的登记成功。编号已经存在时返回 false，
