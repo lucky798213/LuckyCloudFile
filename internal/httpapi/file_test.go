@@ -204,12 +204,20 @@ func (f *fakeFileService) Delete(ctx context.Context, ownerID int, id string) er
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if owner, isRoot := f.roots[id]; isRoot && owner == ownerID {
+		return file.ErrRootDirectory
+	}
 	record, ok := f.records[id]
 	if !ok || f.owners[id] != ownerID {
 		return file.ErrNotFound
 	}
-	if record.Kind != model.KindFile {
-		return file.ErrIsDirectory
+	// 目录只能删空的；非空返回 409 的底层错误。
+	if record.Kind == model.KindDirectory {
+		for childID, child := range f.records {
+			if f.owners[childID] == ownerID && sameParent(child.ParentID, id) {
+				return file.ErrDirectoryNotEmpty
+			}
+		}
 	}
 	delete(f.records, id)
 	delete(f.contents, id)
@@ -285,6 +293,51 @@ func (f *fakeFileService) Rename(ctx context.Context, ownerID int, id, name stri
 	record.Name = name
 	f.records[id] = record
 	return record, nil
+}
+
+// Move 模拟只改 parent_id：大小、内容和名字都不变。
+func (f *fakeFileService) Move(ctx context.Context, ownerID int, id, parentID string) (file.File, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if owner, isRoot := f.roots[id]; isRoot && owner == ownerID {
+		return file.File{}, file.ErrRootDirectory
+	}
+	source, ok := f.records[id]
+	if !ok || f.owners[id] != ownerID {
+		return file.File{}, file.ErrNotFound
+	}
+	if err := f.checkParent(ownerID, parentID); err != nil {
+		return file.File{}, err
+	}
+	// 目录不能移到自己或自己的后代里。
+	if source.Kind == model.KindDirectory {
+		for current, depth := parentID, 0; current != "" && depth < 1000; depth++ {
+			if current == id {
+				return file.File{}, file.ErrInvalidMove
+			}
+			record, ok := f.records[current]
+			if !ok || record.ParentID == nil {
+				break
+			}
+			current = *record.ParentID
+		}
+	}
+	if sameParent(source.ParentID, parentID) {
+		return source, nil
+	}
+	if f.nameTaken(ownerID, parentID, source.Name) {
+		return file.File{}, file.ErrAlreadyExists
+	}
+
+	if parentID == "" {
+		source.ParentID = nil
+	} else {
+		target := parentID
+		source.ParentID = &target
+	}
+	f.records[id] = source
+	return source, nil
 }
 
 // validFakeName 复刻业务层最基本的名字校验，
@@ -688,6 +741,7 @@ func TestFileEndpointsRequireLogin(t *testing.T) {
 		httptest.NewRequest(http.MethodPost, "/api/directories", strings.NewReader(`{"name":"docs"}`)),
 		newCopyRequest(t, testTokenA, "whatever", "", "copy.txt"),
 		newRenameRequest(t, testTokenA, "whatever", "renamed.txt"),
+		newMoveRequest(t, testTokenA, "whatever", ""),
 	}
 	for _, req := range requests {
 		// uploadRequest 默认带 A 的 Token；这里统一去掉，验证未登录行为。
@@ -809,7 +863,7 @@ func TestCreateDirectoryDuplicateName(t *testing.T) {
 	}
 }
 
-func TestDirectoryDownloadAndDeleteRejected(t *testing.T) {
+func TestDirectoryDownloadRejected(t *testing.T) {
 	router, _ := newTestRouter(t)
 	dir := createDir(t, router, "", "docs")
 
@@ -821,11 +875,53 @@ func TestDirectoryDownloadAndDeleteRejected(t *testing.T) {
 	if code := errorCode(t, download); code != "is_directory" {
 		t.Fatalf("code = %q, want is_directory", code)
 	}
+}
 
+func TestDirectoryDelete(t *testing.T) {
+	router, fake := newTestRouter(t)
+	dir := createDir(t, router, "", "docs")
+	uploadInto(t, router, dir.ID, "a.txt", []byte("x"))
+
+	// 非空目录：409 directory_not_empty。
+	nonEmpty := httptest.NewRecorder()
+	router.ServeHTTP(nonEmpty, authorize(httptest.NewRequest(http.MethodDelete, "/api/files/"+dir.ID, nil), testTokenA))
+	if nonEmpty.Code != http.StatusConflict {
+		t.Fatalf("delete non-empty directory: wanted 409, got %d: %s", nonEmpty.Code, nonEmpty.Body.String())
+	}
+	if code := errorCode(t, nonEmpty); code != "directory_not_empty" {
+		t.Fatalf("code = %q, want directory_not_empty", code)
+	}
+
+	// 清掉子文件后，空目录可以删除。
+	list := listChildren(t, router, dir.ID, "1", "20")
+	for _, item := range list.Items {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, authorize(httptest.NewRequest(http.MethodDelete, "/api/files/"+item.ID, nil), testTokenA))
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("delete child %s: wanted 204, got %d", item.ID, recorder.Code)
+		}
+	}
 	remove := httptest.NewRecorder()
 	router.ServeHTTP(remove, authorize(httptest.NewRequest(http.MethodDelete, "/api/files/"+dir.ID, nil), testTokenA))
-	if remove.Code != http.StatusBadRequest {
-		t.Fatalf("delete directory: wanted 400, got %d: %s", remove.Code, remove.Body.String())
+	if remove.Code != http.StatusNoContent {
+		t.Fatalf("delete empty directory: wanted 204, got %d: %s", remove.Code, remove.Body.String())
+	}
+	if _, ok := fake.records[dir.ID]; ok {
+		t.Fatal("directory is still stored after delete")
+	}
+}
+
+func TestDeleteRootDirectoryRejected(t *testing.T) {
+	router, fake := newTestRouter(t)
+	fake.roots["root-a"] = testUserAID
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, authorize(httptest.NewRequest(http.MethodDelete, "/api/files/root-a", nil), testTokenA))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("delete root: wanted 400, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if code := errorCode(t, recorder); code != "root_directory" {
+		t.Fatalf("code = %q, want root_directory", code)
 	}
 }
 
@@ -1308,6 +1404,237 @@ func TestRenameErrors(t *testing.T) {
 
 	// 请求体不是 JSON：400 invalid_json。
 	badJSON := httptest.NewRequest(http.MethodPatch, "/api/files/"+record.ID, strings.NewReader("not json"))
+	badJSON.Header.Set("Content-Type", "application/json")
+	authorize(badJSON, testTokenA)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, badJSON)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid json: wanted 400, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if code := errorCode(t, recorder); code != "invalid_json" {
+		t.Fatalf("code = %q, want invalid_json", code)
+	}
+}
+
+// newMoveRequest 构造 POST /api/files/:id/move 请求。
+func newMoveRequest(t *testing.T, token, id, parentID string) *http.Request {
+	t.Helper()
+
+	payload, err := json.Marshal(moveFileRequest{ParentID: parentID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/files/"+id+"/move", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	return authorize(req, token)
+}
+
+// TestMoveFile 覆盖文件移动的闭环：旧目录不可见、新目录可见、下载内容不变。
+func TestMoveFile(t *testing.T) {
+	router, _ := newTestRouter(t)
+	content := []byte("move must not touch content\n")
+	record := upload(t, router, content)
+	target := createDir(t, router, "", "目标目录")
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, newMoveRequest(t, testTokenA, record.ID, target.ID))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("wanted 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var moved file.File
+	if err := json.Unmarshal(recorder.Body.Bytes(), &moved); err != nil {
+		t.Fatal(err)
+	}
+	if moved.ID != record.ID || moved.Name != record.Name || moved.Size != record.Size {
+		t.Fatalf("unexpected moved record: %+v", moved)
+	}
+	if moved.ParentID == nil || *moved.ParentID != target.ID {
+		t.Fatalf("moved parent = %v, want %q", moved.ParentID, target.ID)
+	}
+
+	// 旧目录（根）里只剩目标目录，新目录里是移动后的文件。
+	rootList := listChildren(t, router, "", "1", "20")
+	if rootList.Total != 1 || rootList.Items[0].ID != target.ID {
+		t.Fatalf("old directory still lists the moved file: %+v", rootList)
+	}
+	targetList := listChildren(t, router, target.ID, "1", "20")
+	if targetList.Total != 1 || targetList.Items[0].ID != record.ID {
+		t.Fatalf("new directory does not list the moved file: %+v", targetList)
+	}
+
+	download := httptest.NewRecorder()
+	router.ServeHTTP(download, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+record.ID, nil), testTokenA))
+	if download.Code != http.StatusOK || !bytes.Equal(download.Body.Bytes(), content) {
+		t.Fatalf("download after move: status=%d body=%q", download.Code, download.Body.Bytes())
+	}
+
+	// 移回根目录：parent_id 为空表示当前用户的根目录。
+	toRoot := httptest.NewRecorder()
+	router.ServeHTTP(toRoot, newMoveRequest(t, testTokenA, record.ID, ""))
+	if toRoot.Code != http.StatusOK {
+		t.Fatalf("move to root: wanted 200, got %d: %s", toRoot.Code, toRoot.Body.String())
+	}
+	if got := listChildren(t, router, target.ID, "1", "20"); got.Total != 0 {
+		t.Fatalf("target should be empty after moving to root: %+v", got)
+	}
+}
+
+// TestMoveDirectory 目录移动带着子树走；移到自身或后代被拒绝。
+func TestMoveDirectory(t *testing.T) {
+	router, _ := newTestRouter(t)
+	outer := createDir(t, router, "", "outer")
+	inner := createDir(t, router, outer.ID, "inner")
+	note := uploadInto(t, router, inner.ID, "a.txt", []byte("hello"))
+	target := createDir(t, router, "", "target")
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, newMoveRequest(t, testTokenA, outer.ID, target.ID))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("move directory: wanted 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var moved file.File
+	if err := json.Unmarshal(recorder.Body.Bytes(), &moved); err != nil {
+		t.Fatal(err)
+	}
+	if moved.ID != outer.ID || moved.Kind != model.KindDirectory || moved.ParentID == nil || *moved.ParentID != target.ID {
+		t.Fatalf("unexpected moved directory: %+v", moved)
+	}
+
+	// 子树仍然可达，内容可下载。
+	if got := listChildren(t, router, target.ID, "1", "20"); got.Total != 1 || got.Items[0].ID != outer.ID {
+		t.Fatalf("unexpected target listing: %+v", got)
+	}
+	if got := listChildren(t, router, inner.ID, "1", "20"); got.Total != 1 || got.Items[0].ID != note.ID {
+		t.Fatalf("unexpected inner listing: %+v", got)
+	}
+	download := httptest.NewRecorder()
+	router.ServeHTTP(download, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+note.ID, nil), testTokenA))
+	if download.Code != http.StatusOK || download.Body.String() != "hello" {
+		t.Fatalf("download after directory move: status=%d body=%q", download.Code, download.Body.String())
+	}
+
+	// 移到自己或自己的后代：400 invalid_move。
+	for _, parentID := range []string{outer.ID, inner.ID} {
+		cycle := httptest.NewRecorder()
+		router.ServeHTTP(cycle, newMoveRequest(t, testTokenA, outer.ID, parentID))
+		if cycle.Code != http.StatusBadRequest {
+			t.Fatalf("move %s into %s: wanted 400, got %d: %s", outer.ID, parentID, cycle.Code, cycle.Body.String())
+		}
+		if code := errorCode(t, cycle); code != "invalid_move" {
+			t.Fatalf("code = %q, want invalid_move", code)
+		}
+	}
+}
+
+func TestMoveDuplicateName(t *testing.T) {
+	router, _ := newTestRouter(t)
+	left := createDir(t, router, "", "left")
+	right := createDir(t, router, "", "right")
+	uploadInto(t, router, left.ID, "same.txt", []byte("one"))
+	existing := uploadInto(t, router, right.ID, "same.txt", []byte("two"))
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, newMoveRequest(t, testTokenA, existing.ID, left.ID))
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("wanted 409, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if code := errorCode(t, recorder); code != "already_exists" {
+		t.Fatalf("code = %q, want already_exists", code)
+	}
+
+	// 冲突后目标目录里仍只有原来的同名文件。
+	if got := listChildren(t, router, right.ID, "1", "20"); got.Total != 1 || got.Items[0].ID != existing.ID {
+		t.Fatalf("target changed after failed move: %+v", got)
+	}
+}
+
+func TestMoveOwnershipIsolation(t *testing.T) {
+	router, fake := newTestRouter(t)
+	record := upload(t, router, []byte("secret"))
+	aDir := createDir(t, router, "", "a-dir")
+
+	// B 移动 A 的文件：404。
+	byB := httptest.NewRecorder()
+	router.ServeHTTP(byB, newMoveRequest(t, testTokenB, record.ID, aDir.ID))
+	if byB.Code != http.StatusNotFound {
+		t.Fatalf("B move A's file: wanted 404, got %d: %s", byB.Code, byB.Body.String())
+	}
+
+	// B 把自己的文件移进 A 的目录：目标表现为不存在。
+	bRequest := uploadRequest(t, "file", "b.txt", []byte("b"))
+	bRequest.Header.Set("Authorization", "Bearer "+testTokenB)
+	bUploaded := httptest.NewRecorder()
+	router.ServeHTTP(bUploaded, bRequest)
+	if bUploaded.Code != http.StatusCreated {
+		t.Fatalf("B upload: wanted 201, got %d", bUploaded.Code)
+	}
+	var bFile file.File
+	if err := json.Unmarshal(bUploaded.Body.Bytes(), &bFile); err != nil {
+		t.Fatal(err)
+	}
+	intoA := httptest.NewRecorder()
+	router.ServeHTTP(intoA, newMoveRequest(t, testTokenB, bFile.ID, aDir.ID))
+	if intoA.Code != http.StatusNotFound {
+		t.Fatalf("B move into A's directory: wanted 404, got %d: %s", intoA.Code, intoA.Body.String())
+	}
+
+	// A 的文件没有被移动，内容完好。
+	if got := listChildren(t, router, "", "1", "20"); got.Total != 2 {
+		t.Fatalf("A's root was modified by B: %+v", got)
+	}
+	download := httptest.NewRecorder()
+	router.ServeHTTP(download, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+record.ID, nil), testTokenA))
+	if download.Code != http.StatusOK || download.Body.String() != "secret" {
+		t.Fatalf("A's file was damaged by B: status=%d body=%q", download.Code, download.Body.String())
+	}
+
+	// 移动根目录：400 root_directory。
+	fake.roots["root-a"] = testUserAID
+	rootMove := httptest.NewRecorder()
+	router.ServeHTTP(rootMove, newMoveRequest(t, testTokenA, "root-a", aDir.ID))
+	if rootMove.Code != http.StatusBadRequest {
+		t.Fatalf("move root: wanted 400, got %d: %s", rootMove.Code, rootMove.Body.String())
+	}
+	if code := errorCode(t, rootMove); code != "root_directory" {
+		t.Fatalf("code = %q, want root_directory", code)
+	}
+}
+
+func TestMoveErrors(t *testing.T) {
+	router, _ := newTestRouter(t)
+	record := upload(t, router, []byte("x"))
+
+	// 源不存在：404。
+	missing := httptest.NewRecorder()
+	router.ServeHTTP(missing, newMoveRequest(t, testTokenA, "does-not-exist", ""))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing source: wanted 404, got %d: %s", missing.Code, missing.Body.String())
+	}
+	if code := errorCode(t, missing); code != "file_or_parent_not_found" {
+		t.Fatalf("code = %q, want file_or_parent_not_found", code)
+	}
+
+	// 目标不存在：404。
+	missingTarget := httptest.NewRecorder()
+	router.ServeHTTP(missingTarget, newMoveRequest(t, testTokenA, record.ID, "does-not-exist"))
+	if missingTarget.Code != http.StatusNotFound {
+		t.Fatalf("missing target: wanted 404, got %d", missingTarget.Code)
+	}
+
+	// 目标是普通文件：400 not_a_directory。
+	intoFile := httptest.NewRecorder()
+	router.ServeHTTP(intoFile, newMoveRequest(t, testTokenA, record.ID, record.ID))
+	if intoFile.Code != http.StatusBadRequest {
+		t.Fatalf("move into a file: wanted 400, got %d: %s", intoFile.Code, intoFile.Body.String())
+	}
+	if code := errorCode(t, intoFile); code != "not_a_directory" {
+		t.Fatalf("code = %q, want not_a_directory", code)
+	}
+
+	// 请求体不是 JSON：400 invalid_json。
+	badJSON := httptest.NewRequest(http.MethodPost, "/api/files/"+record.ID+"/move", strings.NewReader("not json"))
 	badJSON.Header.Set("Content-Type", "application/json")
 	authorize(badJSON, testTokenA)
 	recorder := httptest.NewRecorder()

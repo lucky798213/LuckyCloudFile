@@ -231,6 +231,57 @@ func copyFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	}
 }
 
+// moveFileRequest 是 POST /api/files/:id/move 的请求体。
+// parent_id 是目标目录，不传表示当前用户的根目录。
+type moveFileRequest struct {
+	ParentID string `json:"parent_id"`
+}
+
+// moveFile 处理 POST /api/files/:id/move。
+//
+//	curl -X POST "$BASE/api/files/$ID/move" \
+//	  -H "Authorization: Bearer $TOKEN" \
+//	  -H 'Content-Type: application/json' \
+//	  -d '{"parent_id":"<目标目录ID>"}'
+//
+// 文件和目录都能移动，只改 parent_id，不搬磁盘内容、不改 Entity。
+// 成功返回 200 和移动后的节点；源节点或目标目录不存在、不属于当前用户返回 404；
+// 目标目录已有同名节点返回 409；目录移到自己或后代返回 400 invalid_move；
+// 移动用户根目录返回 400 root_directory。
+func moveFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ownerID, ok := currentUserID(c)
+		if !ok {
+			respondInternalError(c, logger, "move file: missing authenticated user")
+			return
+		}
+
+		var request moveFileRequest
+		if err := c.ShouldBindJSON(&request); err != nil {
+			c.JSON(http.StatusBadRequest, ErrorResponse{
+				Code:    "invalid_json",
+				Message: `request body must be JSON like {"parent_id":"..."}`,
+			})
+			return
+		}
+
+		record, err := svc.Move(c.Request.Context(), ownerID, c.Param("id"), request.ParentID)
+		if err != nil {
+			if handleFileError(c, err, "file_or_parent_not_found", "source file or target directory not found") {
+				return
+			}
+			logger.Error("move file", "error", err)
+			c.JSON(http.StatusInternalServerError, ErrorResponse{
+				Code:    "move_failed",
+				Message: "failed to move file",
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, record)
+	}
+}
+
 // renameFileRequest 是 PATCH /api/files/:id 的请求体。
 type renameFileRequest struct {
 	Name string `json:"name"`
@@ -379,11 +430,12 @@ func downloadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 // deleteFile 处理 DELETE /api/files/:id。
 //
 // 成功返回 204（No Content，没有响应正文）。
-// 204 只表示逻辑文件已经删除，不承诺磁盘空间已经立即释放：
+// 普通文件：204 只表示逻辑文件已经删除，不承诺磁盘空间已经立即释放：
 // Service 在事务提交后尝试物理清理，失败会保留 pending_delete 标记，
 // 由启动扫描和后台定时扫描继续重试。
+// 目录：只能删除空目录（返回 204）；非空目录返回 409 directory_not_empty，
+// 用户根目录返回 400 root_directory。
 // 文件不存在或不属于当前用户，统一返回 404。
-// 目录暂时不允许删除，返回 400 is_directory。
 func deleteFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ownerID, ok := currentUserID(c)
@@ -441,7 +493,17 @@ func handleFileError(c *gin.Context, err error, notFoundCode, notFoundMessage st
 	case errors.Is(err, file.ErrRootDirectory):
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Code:    "root_directory",
-			Message: "the user root directory cannot be renamed",
+			Message: "the user root directory cannot be modified",
+		})
+	case errors.Is(err, file.ErrDirectoryNotEmpty):
+		c.JSON(http.StatusConflict, ErrorResponse{
+			Code:    "directory_not_empty",
+			Message: "directory must be empty before it can be deleted",
+		})
+	case errors.Is(err, file.ErrInvalidMove):
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Code:    "invalid_move",
+			Message: "a directory cannot be moved into itself or its descendants",
 		})
 	default:
 		return false

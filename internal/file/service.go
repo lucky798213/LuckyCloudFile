@@ -45,7 +45,7 @@ var (
 	// ErrNotDirectory 表示 parent_id 指向的不是目录。
 	ErrNotDirectory = errors.New("parent is not a directory")
 
-	// ErrIsDirectory 表示对一个目录调用了只适用于文件的操作（下载、删除）。
+	// ErrIsDirectory 表示对一个目录调用了只适用于文件的操作（下载、作为复制源）。
 	ErrIsDirectory = errors.New("file is a directory")
 
 	// ErrInvalidName 表示名字为空、是 "." / ".."、含路径分隔符或太长。
@@ -54,8 +54,14 @@ var (
 	// ErrAlreadyExists 表示同一目录下已经有同名节点。
 	ErrAlreadyExists = errors.New("an entry with the same name already exists")
 
-	// ErrRootDirectory 表示试图修改用户根目录（名字固定为 "/"）。
+	// ErrRootDirectory 表示试图修改用户根目录（改名、移动或删除）。
 	ErrRootDirectory = errors.New("the user root directory cannot be modified")
+
+	// ErrDirectoryNotEmpty 表示试图删除还有子节点的目录。
+	ErrDirectoryNotEmpty = errors.New("directory is not empty")
+
+	// ErrInvalidMove 表示把目录移动到自身或自己的后代，会让目录树成环。
+	ErrInvalidMove = errors.New("cannot move a directory into itself or its descendants")
 )
 
 // File 是返回给 HTTP 层的节点信息（不包含数据库内部字段）。
@@ -353,13 +359,8 @@ func (s *Service) Rename(ctx context.Context, ownerID int, id, name string) (Fil
 		}
 
 		// 在事务里读 Entity：此时 File 行锁还在，别的删除事务无法把它清理掉。
-		// 返回体里的 size 来自 Entity；目录没有 Entity，保持 0。
-		if record.EntityID != nil {
-			var entity model.Entity
-			if err := tx.WithContext(ctx).First(&entity, *record.EntityID).Error; err != nil {
-				return fmt.Errorf("query entity: %w", err)
-			}
-			record.Entity = &entity
+		if err := attachEntity(ctx, tx, record); err != nil {
+			return err
 		}
 
 		renamed = *record
@@ -370,6 +371,135 @@ func (s *Service) Rename(ctx context.Context, ownerID int, id, name string) (Fil
 	}
 
 	return toFile(renamed), nil
+}
+
+// Move 把 ownerID 用户名下的节点（文件或目录）移动到 parentID 目录下。
+//
+// parentID 为空表示当前用户的根目录。
+//
+// 只更新 files.parent_id：磁盘内容、Entity 和引用计数都不动，
+// 所以移动后下载到的内容不变。旧的父目录列表里不再出现这个节点，
+// 新的父目录列表里能看到它。
+//
+// 目标目录必须属于当前用户、而且真的是目录。
+// 目录不能移动到自身或自己的后代，否则目录树会成环，返回 ErrInvalidMove。
+// 目标目录已有同名节点时由唯一索引拒绝，返回 ErrAlreadyExists。
+// 用户根目录是整棵树的起点，不能移动，返回 ErrRootDirectory。
+func (s *Service) Move(ctx context.Context, ownerID int, id, parentID string) (File, error) {
+	var moved model.File
+
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		record, err := lockOwnedFile(ctx, tx, ownerID, id)
+		if err != nil {
+			return err
+		}
+		// 根目录没有父目录，移动它等于换掉整棵树的起点，直接拒绝。
+		if record.ParentID == nil {
+			return ErrRootDirectory
+		}
+
+		// 目标目录必须在事务内再核对一次，防止校验之后被删除或换到别人名下。
+		target, err := queryDirectory(ctx, tx, ownerID, parentID)
+		if err != nil {
+			return err
+		}
+
+		// 只有目录可能把“自己”装进子树；文件没有子节点，不需要检查。
+		if record.Kind == model.KindDirectory {
+			cyclic, err := isDescendant(ctx, tx, record.ID, target.ID)
+			if err != nil {
+				return err
+			}
+			if cyclic {
+				return ErrInvalidMove
+			}
+		}
+
+		// 已经在目标目录里：幂等成功。这样也不用担心 MySQL 的 RowsAffected = 0。
+		if record.ParentID != nil && *record.ParentID == target.ID {
+			if err := attachEntity(ctx, tx, record); err != nil {
+				return err
+			}
+			moved = *record
+			return nil
+		}
+
+		updated := tx.WithContext(ctx).
+			Model(&model.File{}).
+			Where("id = ? AND owner_id = ?", record.ID, ownerID).
+			UpdateColumn("parent_id", target.ID)
+		if updated.Error != nil {
+			if errors.Is(updated.Error, gorm.ErrDuplicatedKey) {
+				return ErrAlreadyExists
+			}
+			return fmt.Errorf("move file: %w", updated.Error)
+		}
+		if updated.RowsAffected != 1 {
+			return fmt.Errorf(
+				"move file %s: expected 1 row affected, got %d",
+				id, updated.RowsAffected,
+			)
+		}
+
+		parentID := target.ID
+		record.ParentID = &parentID
+		if err := attachEntity(ctx, tx, record); err != nil {
+			return err
+		}
+		moved = *record
+		return nil
+	})
+	if err != nil {
+		return File{}, err
+	}
+
+	return toFile(moved), nil
+}
+
+// attachEntity 在事务里补上节点的 Entity，让返回体能带 size。
+// 目录没有 Entity，保持 nil（size 为 0）。
+func attachEntity(ctx context.Context, tx *gorm.DB, record *model.File) error {
+	if record.EntityID == nil {
+		return nil
+	}
+	var entity model.Entity
+	if err := tx.WithContext(ctx).First(&entity, *record.EntityID).Error; err != nil {
+		return fmt.Errorf("query entity: %w", err)
+	}
+	record.Entity = &entity
+	return nil
+}
+
+// isDescendant 判断 nodeID 是不是 ancestorID 本身或它的后代。
+//
+// 从 nodeID 沿着 parent_id 往上走：走到 ancestorID 说明成环。
+// 加深度上限是为了让异常数据（已经存在环）报错退出，而不是死循环。
+func isDescendant(ctx context.Context, db *gorm.DB, ancestorID, nodeID string) (bool, error) {
+	const maxDepth = 1000
+
+	current := nodeID
+	for depth := 0; depth < maxDepth; depth++ {
+		if current == ancestorID {
+			return true, nil
+		}
+
+		var node model.File
+		err := db.WithContext(ctx).
+			Select("id", "parent_id").
+			First(&node, "id = ?", current).Error
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return false, nil
+			}
+			return false, fmt.Errorf("walk directory tree: %w", err)
+		}
+		if node.ParentID == nil {
+			return false, nil
+		}
+		current = *node.ParentID
+	}
+
+	return false, fmt.Errorf("directory tree is too deep or contains a cycle at %s", nodeID)
 }
 
 // CreateDirectory 在 parentID（为空表示根目录）下创建一个空目录。
@@ -490,9 +620,15 @@ func (s *Service) Open(ctx context.Context, ownerID int, id string) (File, io.Re
 	return toFile(record), f, nil
 }
 
-// Delete 删除 ownerID 用户自己的普通文件。
+// Delete 删除 ownerID 用户自己的节点。
 //
-// 删除分两段：先在事务里只改逻辑关系，提交成功后再尝试清理磁盘。
+// 普通文件：在事务里删 File、扣 Entity 引用，提交后再尝试清理磁盘。
+// 空目录：只删 files 这一行，不碰 Entity 和磁盘。
+// 非空目录：返回 ErrDirectoryNotEmpty，要求客户端先清空；
+// 这一阶段不做递归删除，避免留下半棵树。
+// 用户根目录不能删除：它是整棵树的起点，返回 ErrRootDirectory。
+//
+// 文件删除分两段：先在事务里只改逻辑关系，提交成功后再尝试清理磁盘。
 //
 //	BEGIN
 //	  SELECT files   ... FOR UPDATE   (id + owner_id)
@@ -510,8 +646,8 @@ func (s *Service) Open(ctx context.Context, ownerID int, id string) (File, io.Re
 // 为什么不在事务里删磁盘：磁盘操作可能很慢，未来换成 S3 更慢。
 // 事务只保护“引用计数 + 逻辑记录”这一小段，物理清理交给 cleanup.go。
 //
-// 目录暂时不允许删除：递归删除整棵子树涉及“先删文件还是先删记录”，
-// 这一阶段明确返回 ErrIsDirectory，而不是留下半棵树。
+// 空目录检查也在同一个事务里：父目录行已经被 FOR UPDATE 锁住，
+// 并发的上传会等这个事务结束，不会出现“检查时是空的、删完又多出孩子”的情况。
 func (s *Service) Delete(ctx context.Context, ownerID int, id string) error {
 	var pendingEntityID int64
 
@@ -520,9 +656,26 @@ func (s *Service) Delete(ctx context.Context, ownerID int, id string) error {
 		if err != nil {
 			return err
 		}
-		if record.Kind != model.KindFile {
-			return ErrIsDirectory
+		// 根目录同样 parent_id 为 NULL，必须在按目录处理之前拦住。
+		if record.ParentID == nil {
+			return ErrRootDirectory
 		}
+
+		// 目录只允许删除空的：先数直接子节点，非空就拒绝。
+		if record.Kind == model.KindDirectory {
+			var children int64
+			if err := tx.WithContext(ctx).
+				Model(&model.File{}).
+				Where("owner_id = ? AND parent_id = ?", ownerID, record.ID).
+				Count(&children).Error; err != nil {
+				return fmt.Errorf("count directory children: %w", err)
+			}
+			if children > 0 {
+				return ErrDirectoryNotEmpty
+			}
+			return deleteFileRow(ctx, tx, ownerID, record.ID)
+		}
+
 		if record.EntityID == nil {
 			return fmt.Errorf("file %s has no entity", id)
 		}
@@ -542,17 +695,8 @@ func (s *Service) Delete(ctx context.Context, ownerID int, id string) error {
 
 		// 先删 File 行。RowsAffected 必须正好是 1，否则说明这一行已经被别的事务删掉了，
 		// 继续扣引用就会重复计数，所以直接回滚。
-		deleted := tx.WithContext(ctx).
-			Where("id = ? AND owner_id = ?", record.ID, ownerID).
-			Delete(&model.File{})
-		if deleted.Error != nil {
-			return fmt.Errorf("delete file: %w", deleted.Error)
-		}
-		if deleted.RowsAffected != 1 {
-			return fmt.Errorf(
-				"delete file %s: expected 1 row affected, got %d",
-				id, deleted.RowsAffected,
-			)
+		if err := deleteFileRow(ctx, tx, ownerID, record.ID); err != nil {
+			return err
 		}
 
 		// 用带 ref_count > 0 条件的原子自减，防止重复扣引用。
@@ -606,6 +750,25 @@ func (s *Service) Delete(ctx context.Context, ownerID int, id string) error {
 				"error", cleanupErr,
 			)
 		}
+	}
+	return nil
+}
+
+// deleteFileRow 删除一行 files，并确认真的删掉了一行。
+//
+// 文件和空目录共用这段逻辑：两者在 files 表里都只是一行。
+func deleteFileRow(ctx context.Context, tx *gorm.DB, ownerID int, id string) error {
+	deleted := tx.WithContext(ctx).
+		Where("id = ? AND owner_id = ?", id, ownerID).
+		Delete(&model.File{})
+	if deleted.Error != nil {
+		return fmt.Errorf("delete file: %w", deleted.Error)
+	}
+	if deleted.RowsAffected != 1 {
+		return fmt.Errorf(
+			"delete file %s: expected 1 row affected, got %d",
+			id, deleted.RowsAffected,
+		)
 	}
 	return nil
 }

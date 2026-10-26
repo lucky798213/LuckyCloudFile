@@ -502,14 +502,23 @@ func TestDirectoryFlowOverHTTP(t *testing.T) {
 		t.Fatalf("unexpected root listing: %+v", rootListing)
 	}
 
-	// 5. 目录不能下载、不能删除。
+	// 5. 目录不能下载；目录里还有文件时不能删除。
 	download := serve(t, router, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+dir.ID, nil), tokenA))
 	if download.Code != http.StatusBadRequest {
 		t.Fatalf("download directory: wanted 400, got %d", download.Code)
 	}
 	remove := serve(t, router, authorize(httptest.NewRequest(http.MethodDelete, "/api/files/"+dir.ID, nil), tokenA))
-	if remove.Code != http.StatusBadRequest {
-		t.Fatalf("delete directory: wanted 400, got %d", remove.Code)
+	if remove.Code != http.StatusConflict {
+		t.Fatalf("delete non-empty directory: wanted 409, got %d", remove.Code)
+	}
+	var removeErr struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(remove.Body.Bytes(), &removeErr); err != nil {
+		t.Fatal(err)
+	}
+	if removeErr.Code != "directory_not_empty" {
+		t.Fatalf("delete non-empty directory: code = %q, want directory_not_empty", removeErr.Code)
 	}
 
 	// 6. 复制：新 File 复用源内容的 Entity，源文件仍然存在。
@@ -588,5 +597,146 @@ func TestDirectoryFlowOverHTTP(t *testing.T) {
 	peek := serve(t, router, authorize(httptest.NewRequest(http.MethodGet, "/api/files?parent_id="+dir.ID, nil), tokenB))
 	if peek.Code != http.StatusNotFound {
 		t.Fatalf("B list A's directory: wanted 404, got %d", peek.Code)
+	}
+}
+
+// TestMoveAndEmptyDirectoryDeleteOverHTTP 是移动和空目录删除的真实链路验收：
+// 移动文件 → 旧目录不可见、新目录可见、下载不变 → 目录成环被拒绝
+// → 非空目录被拒绝 → 删空子目录和文件后目录可以删除。
+func TestMoveAndEmptyDirectoryDeleteOverHTTP(t *testing.T) {
+	dsn := os.Getenv("CLOUDREVE_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("set CLOUDREVE_TEST_MYSQL_DSN to run the move/directory flow")
+	}
+
+	ctx := context.Background()
+	client, err := database.OpenDSN(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close(client) })
+	resetAuthTables(t, client)
+
+	if _, err := auth.CreateUser(ctx, client, testUsernameA, testPasswordA); err != nil {
+		t.Fatal(err)
+	}
+	fileService := cloudfile.NewService(client, storage.NewLocal(t.TempDir()))
+	router := httpapi.NewRouter(slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		fileService, auth.NewService(client))
+	token := login(t, router, testUsernameA, testPasswordA)
+
+	createDir := func(parentID, name string) cloudfile.File {
+		payload, err := json.Marshal(map[string]string{"parent_id": parentID, "name": name})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/directories", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		recorder := serve(t, router, authorize(req, token))
+		if recorder.Code != http.StatusCreated {
+			t.Fatalf("create directory %q: wanted 201, got %d: %s", name, recorder.Code, recorder.Body.String())
+		}
+		var record cloudfile.File
+		if err := json.Unmarshal(recorder.Body.Bytes(), &record); err != nil {
+			t.Fatal(err)
+		}
+		return record
+	}
+	uploadInto := func(parentID string, content []byte) cloudfile.File {
+		req := newUploadRequest(t, token, content)
+		query := req.URL.Query()
+		query.Set("parent_id", parentID)
+		req.URL.RawQuery = query.Encode()
+		recorder := serve(t, router, req)
+		if recorder.Code != http.StatusCreated {
+			t.Fatalf("upload into %s: wanted 201, got %d: %s", parentID, recorder.Code, recorder.Body.String())
+		}
+		var record cloudfile.File
+		if err := json.Unmarshal(recorder.Body.Bytes(), &record); err != nil {
+			t.Fatal(err)
+		}
+		return record
+	}
+	move := func(id, parentID string) *httptest.ResponseRecorder {
+		payload, err := json.Marshal(map[string]string{"parent_id": parentID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/files/"+id+"/move", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		return serve(t, router, authorize(req, token))
+	}
+	list := func(parentID string) cloudfile.ListResult {
+		req := httptest.NewRequest(http.MethodGet, "/api/files?parent_id="+parentID, nil)
+		recorder := serve(t, router, authorize(req, token))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("list %q: wanted 200, got %d", parentID, recorder.Code)
+		}
+		var result cloudfile.ListResult
+		if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+
+	dir := createDir("", "学习资料")
+	child := createDir(dir.ID, "子目录")
+	note := uploadInto(dir.ID, []byte("hello"))
+
+	// 1. 移动文件到子目录：旧列表不再出现，新列表可见，内容不变。
+	moved := move(note.ID, child.ID)
+	if moved.Code != http.StatusOK {
+		t.Fatalf("move file: wanted 200, got %d: %s", moved.Code, moved.Body.String())
+	}
+	var movedFile cloudfile.File
+	if err := json.Unmarshal(moved.Body.Bytes(), &movedFile); err != nil {
+		t.Fatal(err)
+	}
+	if movedFile.ParentID == nil || *movedFile.ParentID != child.ID || movedFile.Size != note.Size {
+		t.Fatalf("unexpected moved file: %+v", movedFile)
+	}
+	if got := list(dir.ID); got.Total != 1 || got.Items[0].ID != child.ID {
+		t.Fatalf("old directory still lists the moved file: %+v", got)
+	}
+	if got := list(child.ID); got.Total != 1 || got.Items[0].ID != note.ID {
+		t.Fatalf("new directory does not list the moved file: %+v", got)
+	}
+	download := serve(t, router, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+note.ID, nil), token))
+	if download.Code != http.StatusOK || download.Body.String() != "hello" {
+		t.Fatalf("download after move: status=%d body=%q", download.Code, download.Body.String())
+	}
+
+	// 2. 目录不能移到自己或自己的后代。
+	if got := move(dir.ID, dir.ID); got.Code != http.StatusBadRequest {
+		t.Fatalf("move directory into itself: wanted 400, got %d", got.Code)
+	}
+	cycle := move(dir.ID, child.ID)
+	if cycle.Code != http.StatusBadRequest {
+		t.Fatalf("move directory into descendant: wanted 400, got %d", cycle.Code)
+	}
+	var cycleErr struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(cycle.Body.Bytes(), &cycleErr); err != nil {
+		t.Fatal(err)
+	}
+	if cycleErr.Code != "invalid_move" {
+		t.Fatalf("cycle error code = %q, want invalid_move", cycleErr.Code)
+	}
+
+	// 3. 非空目录不能删；删掉文件、再删空子目录和父目录。
+	if got := serve(t, router, authorize(httptest.NewRequest(http.MethodDelete, "/api/files/"+dir.ID, nil), token)); got.Code != http.StatusConflict {
+		t.Fatalf("delete non-empty directory: wanted 409, got %d", got.Code)
+	}
+	for _, id := range []string{note.ID, child.ID} {
+		if got := serve(t, router, authorize(httptest.NewRequest(http.MethodDelete, "/api/files/"+id, nil), token)); got.Code != http.StatusNoContent {
+			t.Fatalf("delete %s: wanted 204, got %d: %s", id, got.Code, got.Body.String())
+		}
+	}
+	if got := serve(t, router, authorize(httptest.NewRequest(http.MethodDelete, "/api/files/"+dir.ID, nil), token)); got.Code != http.StatusNoContent {
+		t.Fatalf("delete empty directory: wanted 204, got %d: %s", got.Code, got.Body.String())
+	}
+	if got := list(""); got.Total != 0 {
+		t.Fatalf("deleted directory still in root listing: %+v", got)
 	}
 }

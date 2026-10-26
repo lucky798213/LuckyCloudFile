@@ -502,7 +502,7 @@ func TestDirectoryAccessIsolation(t *testing.T) {
 	}
 }
 
-func TestDirectoryDownloadAndDeleteRejected(t *testing.T) {
+func TestDirectoryDownloadRejected(t *testing.T) {
 	service, db, _, ownerA, _ := newTestService(t)
 	ctx := context.Background()
 
@@ -514,13 +514,114 @@ func TestDirectoryDownloadAndDeleteRejected(t *testing.T) {
 	if _, _, err := service.Open(ctx, ownerA.ID, dir.ID); !errors.Is(err, ErrIsDirectory) {
 		t.Fatalf("open directory: wanted ErrIsDirectory, got %v", err)
 	}
-	if err := service.Delete(ctx, ownerA.ID, dir.ID); !errors.Is(err, ErrIsDirectory) {
-		t.Fatalf("delete directory: wanted ErrIsDirectory, got %v", err)
+	if got := countKind(t, db, model.KindDirectory); got != 3 {
+		t.Fatalf("download attempt changed directory rows: %d", got)
+	}
+}
+
+func TestDeleteEmptyDirectory(t *testing.T) {
+	service, db, diskRoot, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	dir, err := service.CreateDirectory(ctx, ownerA.ID, "", "docs")
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	// 拒绝之后目录还在。
+	if err := service.Delete(ctx, ownerA.ID, dir.ID); err != nil {
+		t.Fatalf("delete empty directory: %v", err)
+	}
+
+	// 目录行没了，父目录列表也看不到它；Entity 和磁盘完全没被碰过。
+	if got := countKind(t, db, model.KindDirectory); got != 2 {
+		t.Fatalf("wanted only the two root directories left, got %d", got)
+	}
+	rootList, err := service.ListChildren(ctx, ownerA.ID, "", 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootList.Total != 0 {
+		t.Fatalf("deleted directory still listed: %+v", rootList)
+	}
+	if got := countRows(t, db, &model.Entity{}); got != 0 {
+		t.Fatalf("deleting a directory created entities: %d", got)
+	}
+	entries, err := os.ReadDir(diskRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("deleting a directory touched disk: %v", entries)
+	}
+
+	// 再删一次：记录已经不存在。
+	if err := service.Delete(ctx, ownerA.ID, dir.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleting twice should return ErrNotFound, got %v", err)
+	}
+}
+
+func TestDeleteNonEmptyDirectoryRejected(t *testing.T) {
+	service, db, _, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	dir, err := service.CreateDirectory(ctx, ownerA.ID, "", "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := service.Upload(ctx, ownerA.ID, dir.ID, "a.txt", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := service.Delete(ctx, ownerA.ID, dir.ID); !errors.Is(err, ErrDirectoryNotEmpty) {
+		t.Fatalf("delete non-empty directory: wanted ErrDirectoryNotEmpty, got %v", err)
+	}
+
+	// 拒绝是干净的：目录、子文件、Entity 和内容都还在。
 	if got := countKind(t, db, model.KindDirectory); got != 3 {
-		t.Fatalf("directory disappeared after rejected operations: %d", got)
+		t.Fatalf("non-empty directory was removed: %d left", got)
+	}
+	if got := countKind(t, db, model.KindFile); got != 1 {
+		t.Fatalf("child file was removed: %d left", got)
+	}
+	list, err := service.ListChildren(ctx, ownerA.ID, dir.ID, 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list.Total != 1 || list.Items[0].ID != child.ID {
+		t.Fatalf("unexpected directory listing after rejected delete: %+v", list)
+	}
+	_, rc, err := service.Open(ctx, ownerA.ID, child.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rc.Close()
+	if string(data) != "hello" {
+		t.Fatalf("child content changed after rejected delete: %q", data)
+	}
+}
+
+func TestDeleteRootRejected(t *testing.T) {
+	service, db, _, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	if err := service.Delete(ctx, ownerA.ID, *ownerA.RootFileID); !errors.Is(err, ErrRootDirectory) {
+		t.Fatalf("delete root: wanted ErrRootDirectory, got %v", err)
+	}
+
+	var root model.File
+	if err := db.WithContext(ctx).First(&root, "id = ?", *ownerA.RootFileID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if root.Name != "/" || root.ParentID != nil {
+		t.Fatalf("root directory changed: %+v", root)
+	}
+	if got := countKind(t, db, model.KindDirectory); got != 2 {
+		t.Fatalf("root directories were removed: %d left", got)
 	}
 }
 
@@ -1212,4 +1313,364 @@ func sameParentID(a, b *string) bool {
 		return a == nil && b == nil
 	}
 	return *a == *b
+}
+
+// TestMoveFile 是文件移动的核心验收：
+// 只改 parent_id，旧目录不再列出、新目录可见，Entity 和内容都不变。
+func TestMoveFile(t *testing.T) {
+	service, db, diskRoot, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	source, err := service.CreateDirectory(ctx, ownerA.ID, "", "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := service.CreateDirectory(ctx, ownerA.ID, "", "target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := service.Upload(ctx, ownerA.ID, source.ID, "a.txt", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var before model.Entity
+	if err := db.WithContext(ctx).First(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	moved, err := service.Move(ctx, ownerA.ID, record.ID, target.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved.ID != record.ID || moved.Name != "a.txt" || moved.Size != 5 || moved.Kind != model.KindFile {
+		t.Fatalf("unexpected moved record: %+v", moved)
+	}
+	if moved.ParentID == nil || *moved.ParentID != target.ID {
+		t.Fatalf("moved parent = %v, want %q", moved.ParentID, target.ID)
+	}
+
+	// 旧目录看不到它，新目录能看到。
+	oldList, err := service.ListChildren(ctx, ownerA.ID, source.ID, 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldList.Total != 0 {
+		t.Fatalf("old directory still lists the moved file: %+v", oldList)
+	}
+	newList, err := service.ListChildren(ctx, ownerA.ID, target.ID, 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newList.Total != 1 || newList.Items[0].ID != record.ID || newList.Items[0].Name != "a.txt" {
+		t.Fatalf("new directory does not list the moved file: %+v", newList)
+	}
+
+	// 数据库只改了 parent_id；Entity 和磁盘对象都不变。
+	var stored model.File
+	if err := db.WithContext(ctx).First(&stored, "id = ?", record.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.ParentID == nil || *stored.ParentID != target.ID ||
+		stored.Name != "a.txt" || stored.OwnerID != ownerA.ID {
+		t.Fatalf("unexpected stored file: %+v", stored)
+	}
+	var after model.Entity
+	if err := db.WithContext(ctx).First(&after, before.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.StorageKey != before.StorageKey || after.RefCount != before.RefCount ||
+		after.Status != before.Status || after.Size != before.Size {
+		t.Fatalf("move touched the entity: before=%+v after=%+v", before, after)
+	}
+	entries, err := os.ReadDir(diskRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != before.StorageKey {
+		t.Fatalf("move touched disk: %v", entries)
+	}
+
+	// 移动后内容照常下载。
+	info, rc, err := service.Open(ctx, ownerA.ID, record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rc.Close()
+	if string(data) != "hello" || info.Size != 5 {
+		t.Fatalf("download after move: info=%+v data=%q", info, data)
+	}
+
+	// 移回根目录，再移回 target，都只改 parent_id。
+	toRoot, err := service.Move(ctx, ownerA.ID, record.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if toRoot.ParentID == nil || *toRoot.ParentID != *ownerA.RootFileID {
+		t.Fatalf("move to root: parent = %v, want %q", toRoot.ParentID, *ownerA.RootFileID)
+	}
+	if list, err := service.ListChildren(ctx, ownerA.ID, target.ID, 1, 20); err != nil || list.Total != 0 {
+		t.Fatalf("target should be empty after moving to root: %+v err=%v", list, err)
+	}
+	// 已经在目标目录里：幂等成功，不存在冲突。
+	if _, err := service.Move(ctx, ownerA.ID, record.ID, ""); err != nil {
+		t.Fatalf("move to the current parent must succeed: %v", err)
+	}
+	if _, err := service.Move(ctx, ownerA.ID, record.ID, target.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := countRows(t, db, &model.Entity{}); got != 1 {
+		t.Fatalf("moves created or removed entities: %d", got)
+	}
+	entries, err = os.ReadDir(diskRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("moves duplicated or removed disk content: %v", entries)
+	}
+}
+
+// TestMoveDirectory 移动目录带着整棵子树走，子节点和内容都不受影响。
+func TestMoveDirectory(t *testing.T) {
+	service, db, diskRoot, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	outer, err := service.CreateDirectory(ctx, ownerA.ID, "", "outer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := service.CreateDirectory(ctx, ownerA.ID, outer.ID, "inner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	note, err := service.Upload(ctx, ownerA.ID, inner.ID, "a.txt", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := service.CreateDirectory(ctx, ownerA.ID, "", "target")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	moved, err := service.Move(ctx, ownerA.ID, outer.ID, target.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved.ID != outer.ID || moved.Kind != model.KindDirectory ||
+		moved.ParentID == nil || *moved.ParentID != target.ID {
+		t.Fatalf("unexpected moved directory: %+v", moved)
+	}
+
+	// 根目录只剩 target；target 里是 outer。
+	rootList, err := service.ListChildren(ctx, ownerA.ID, "", 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootList.Total != 1 || rootList.Items[0].ID != target.ID {
+		t.Fatalf("unexpected root listing: %+v", rootList)
+	}
+	targetList, err := service.ListChildren(ctx, ownerA.ID, target.ID, 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if targetList.Total != 1 || targetList.Items[0].ID != outer.ID {
+		t.Fatalf("unexpected target listing: %+v", targetList)
+	}
+
+	// 子树没有变化：inner 还在 outer 下，note 还在 inner 下。
+	var storedInner model.File
+	if err := db.WithContext(ctx).First(&storedInner, "id = ?", inner.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if storedInner.ParentID == nil || *storedInner.ParentID != outer.ID {
+		t.Fatalf("inner parent changed to %v", storedInner.ParentID)
+	}
+	innerList, err := service.ListChildren(ctx, ownerA.ID, inner.ID, 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if innerList.Total != 1 || innerList.Items[0].ID != note.ID {
+		t.Fatalf("unexpected inner listing: %+v", innerList)
+	}
+
+	// 内容和磁盘都不变。
+	_, rc, err := service.Open(ctx, ownerA.ID, note.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rc.Close()
+	if string(data) != "hello" {
+		t.Fatalf("content changed after moving directory: %q", data)
+	}
+	if got := countRows(t, db, &model.Entity{}); got != 1 {
+		t.Fatalf("moving a directory created entities: %d", got)
+	}
+	entries, err := os.ReadDir(diskRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("moving a directory touched disk: %v", entries)
+	}
+}
+
+// TestMoveDirectoryRejectsCycles 目录不能移到自己或自己的后代里。
+func TestMoveDirectoryRejectsCycles(t *testing.T) {
+	service, db, _, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	a, err := service.CreateDirectory(ctx, ownerA.ID, "", "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := service.CreateDirectory(ctx, ownerA.ID, a.ID, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := service.CreateDirectory(ctx, ownerA.ID, b.ID, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sibling, err := service.CreateDirectory(ctx, ownerA.ID, "", "sibling")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, target := range []string{a.ID, b.ID, c.ID} {
+		if _, err := service.Move(ctx, ownerA.ID, a.ID, target); !errors.Is(err, ErrInvalidMove) {
+			t.Fatalf("move a into %s: wanted ErrInvalidMove, got %v", target, err)
+		}
+	}
+	// 成环检查失败后树原样保留。
+	var storedA model.File
+	if err := db.WithContext(ctx).First(&storedA, "id = ?", a.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if storedA.ParentID == nil || *storedA.ParentID != *ownerA.RootFileID {
+		t.Fatalf("failed move changed a's parent to %v", storedA.ParentID)
+	}
+
+	// 移到无关的兄弟目录是允许的，c 也跟着 b 一起走。
+	if _, err := service.Move(ctx, ownerA.ID, b.ID, sibling.ID); err != nil {
+		t.Fatalf("move to an unrelated directory: %v", err)
+	}
+	var storedC model.File
+	if err := db.WithContext(ctx).First(&storedC, "id = ?", c.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if storedC.ParentID == nil || *storedC.ParentID != b.ID {
+		t.Fatalf("descendant chain was broken: c parent = %v", storedC.ParentID)
+	}
+	if _, err := service.Move(ctx, ownerA.ID, a.ID, sibling.ID); err != nil {
+		t.Fatalf("move a next to b: %v", err)
+	}
+}
+
+// TestMoveValidation 覆盖源、目标、根目录和“同目录”的边界情况。
+func TestMoveValidation(t *testing.T) {
+	service, _, _, ownerA, ownerB := newTestService(t)
+	ctx := context.Background()
+
+	source, err := service.CreateDirectory(ctx, ownerA.ID, "", "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := service.Upload(ctx, ownerA.ID, source.ID, "a.txt", strings.NewReader("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := service.CreateDirectory(ctx, ownerB.ID, "", "other")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.Move(ctx, ownerA.ID, "does-not-exist", ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing source: wanted ErrNotFound, got %v", err)
+	}
+	if _, err := service.Move(ctx, ownerB.ID, record.ID, other.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("another user's source: wanted ErrNotFound, got %v", err)
+	}
+	if _, err := service.Move(ctx, ownerA.ID, record.ID, "does-not-exist"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing target: wanted ErrNotFound, got %v", err)
+	}
+	if _, err := service.Move(ctx, ownerA.ID, record.ID, other.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("another user's target: wanted ErrNotFound, got %v", err)
+	}
+	if _, err := service.Move(ctx, ownerA.ID, record.ID, record.ID); !errors.Is(err, ErrNotDirectory) {
+		t.Fatalf("target is a file: wanted ErrNotDirectory, got %v", err)
+	}
+	if _, err := service.Move(ctx, ownerA.ID, *ownerA.RootFileID, source.ID); !errors.Is(err, ErrRootDirectory) {
+		t.Fatalf("move root: wanted ErrRootDirectory, got %v", err)
+	}
+
+	// 移到当前目录是幂等成功。
+	if moved, err := service.Move(ctx, ownerA.ID, record.ID, source.ID); err != nil || moved.Name != "a.txt" {
+		t.Fatalf("move to current parent: record=%+v err=%v", moved, err)
+	}
+}
+
+// TestMoveDuplicateName 目标目录已有同名节点时移动失败，源和目标都不变。
+func TestMoveDuplicateName(t *testing.T) {
+	service, db, _, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	left, err := service.CreateDirectory(ctx, ownerA.ID, "", "left")
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := service.CreateDirectory(ctx, ownerA.ID, "", "right")
+	if err != nil {
+		t.Fatal(err)
+	}
+	movedFile, err := service.Upload(ctx, ownerA.ID, left.ID, "same.txt", strings.NewReader("one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing, err := service.Upload(ctx, ownerA.ID, right.ID, "same.txt", strings.NewReader("two"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.Move(ctx, ownerA.ID, movedFile.ID, right.ID); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("duplicate name: wanted ErrAlreadyExists, got %v", err)
+	}
+
+	// 失败后源还在 left，right 里的还是原来那个文件，内容都没变。
+	var stored model.File
+	if err := db.WithContext(ctx).First(&stored, "id = ?", movedFile.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.ParentID == nil || *stored.ParentID != left.ID {
+		t.Fatalf("failed move changed the parent to %v", stored.ParentID)
+	}
+	rightList, err := service.ListChildren(ctx, ownerA.ID, right.ID, 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rightList.Total != 1 || rightList.Items[0].ID != existing.ID {
+		t.Fatalf("target directory changed after failed move: %+v", rightList)
+	}
+	for id, want := range map[string]string{movedFile.ID: "one", existing.ID: "two"} {
+		_, rc, err := service.Open(ctx, ownerA.ID, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(rc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = rc.Close()
+		if string(data) != want {
+			t.Fatalf("content of %s = %q, want %q", id, data, want)
+		}
+	}
 }
