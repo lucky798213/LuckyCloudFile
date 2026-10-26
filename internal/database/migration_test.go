@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"os"
 	"testing"
+	"time"
 
 	mysqlDriver "github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	"luckyCloudFile/internal/auth"
 	"luckyCloudFile/internal/database"
 	"luckyCloudFile/internal/model"
 )
@@ -50,7 +52,7 @@ func prepareLegacySchema(t *testing.T, dsn string) {
 
 	statements := []string{
 		"SET FOREIGN_KEY_CHECKS = 0",
-		"DROP TABLE IF EXISTS auth_sessions, files, entities, users, storage_policies",
+		"DROP TABLE IF EXISTS upload_sessions, auth_sessions, files, entities, users, storage_policies",
 		"SET FOREIGN_KEY_CHECKS = 1",
 		`CREATE TABLE users (
 			id BIGINT NOT NULL AUTO_INCREMENT,
@@ -95,6 +97,9 @@ func TestStoragePolicyMigrationFromLegacySchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !db.Migrator().HasTable("upload_sessions") {
+		t.Fatal("legacy upgrade did not create upload_sessions")
+	}
 
 	var policies []model.StoragePolicy
 	if err := db.Find(&policies).Error; err != nil {
@@ -122,6 +127,12 @@ func TestStoragePolicyMigrationFromLegacySchema(t *testing.T) {
 	}
 	if entity.Size != 3 {
 		t.Fatalf("legacy entity size changed to %d", entity.Size)
+	}
+	// 去掉 RefCount 的 GORM default 只影响新插入的零值，
+	// 旧库里已有的 active / ref_count=1 必须原样保留。
+	if entity.RefCount != 1 || entity.Status != model.EntityStatusActive {
+		t.Fatalf("legacy entity lifecycle changed: ref_count=%d status=%q",
+			entity.RefCount, entity.Status)
 	}
 
 	for _, check := range []struct {
@@ -238,7 +249,7 @@ func TestStoragePolicyMigrationOnFreshDatabase(t *testing.T) {
 		t.Fatalf("fresh database policies = %+v", policies)
 	}
 
-	for _, table := range []string{"users", "entities", "files", "auth_sessions", "storage_policies"} {
+	for _, table := range []string{"users", "entities", "files", "auth_sessions", "storage_policies", "upload_sessions"} {
 		if !db.Migrator().HasTable(table) {
 			t.Fatalf("fresh migration did not create %s", table)
 		}
@@ -269,11 +280,188 @@ func resetMigrationSchema(t *testing.T, dsn string) {
 	}
 	for _, statement := range []string{
 		"SET FOREIGN_KEY_CHECKS = 0",
-		"DROP TABLE IF EXISTS auth_sessions, files, entities, users, storage_policies",
+		"DROP TABLE IF EXISTS upload_sessions, auth_sessions, files, entities, users, storage_policies",
 		"SET FOREIGN_KEY_CHECKS = 1",
 	} {
 		if _, err := conn.Exec(statement); err != nil {
 			t.Fatalf("reset migration schema: %v", err)
 		}
+	}
+}
+
+// createMigrationUser 创建一个带根目录和默认存储策略的账号。
+// 上传会话需要真实的 owner_id 和 parent_id，所以不手写自增 ID。
+func createMigrationUser(t *testing.T, db *gorm.DB) (*model.User, *model.StoragePolicy) {
+	t.Helper()
+
+	user, err := auth.CreateUser(
+		context.Background(), db, "upload-session-owner", "test-password",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var policy model.StoragePolicy
+	if err := db.Where("config_key = ?", model.LocalStorageConfigKey).
+		First(&policy).Error; err != nil {
+		t.Fatal(err)
+	}
+	return user, &policy
+}
+
+// TestUploadSessionMigrationAndPlaceholderEntity 验证本步的两个关键点：
+//  1. 新库会建出 upload_sessions 表，字段能完整保存；
+//  2. 占位实体以 uploading / ref_count=0 落库，不会被 GORM 的默认值改成 1。
+func TestUploadSessionMigrationAndPlaceholderEntity(t *testing.T) {
+	dsn := migrationDSN(t)
+	ctx := context.Background()
+	resetMigrationSchema(t, dsn)
+
+	db, err := database.OpenDSN(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close(db)
+
+	if !db.Migrator().HasTable("upload_sessions") {
+		t.Fatal("fresh migration did not create upload_sessions")
+	}
+
+	user, policy := createMigrationUser(t, db)
+	entity := model.Entity{
+		StorageKey:      "upload-placeholder-key",
+		Size:            0,
+		StoragePolicyID: policy.ID,
+		RefCount:        0,
+		Status:          model.EntityStatusUploading,
+	}
+	if err := db.WithContext(ctx).Create(&entity).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// 必须从数据库重新读，才能确认 Create 没有偷偷把 0 换成默认值 1。
+	var storedEntity model.Entity
+	if err := db.WithContext(ctx).First(&storedEntity, entity.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if storedEntity.RefCount != 0 {
+		t.Fatalf("placeholder ref_count = %d, want 0", storedEntity.RefCount)
+	}
+	if storedEntity.Status != model.EntityStatusUploading {
+		t.Fatalf("placeholder status = %q, want %q",
+			storedEntity.Status, model.EntityStatusUploading)
+	}
+
+	session := model.UploadSession{
+		ID:           "upload-session-1",
+		OwnerID:      user.ID,
+		ParentID:     *user.RootFileID,
+		Name:         "big.bin",
+		EntityID:     storedEntity.ID,
+		ExpectedSize: 8 << 20,
+		ActualSize:   0,
+		Status:       model.UploadStatusPending,
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	if err := db.WithContext(ctx).Create(&session).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	var storedSession model.UploadSession
+	if err := db.WithContext(ctx).First(&storedSession, "id = ?", session.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if storedSession.OwnerID != user.ID ||
+		storedSession.ParentID != *user.RootFileID ||
+		storedSession.Name != session.Name ||
+		storedSession.EntityID != storedEntity.ID ||
+		storedSession.ExpectedSize != session.ExpectedSize ||
+		storedSession.ActualSize != 0 ||
+		storedSession.Status != model.UploadStatusPending {
+		t.Fatalf("stored upload session = %+v", storedSession)
+	}
+	if storedSession.ResultFileID != nil {
+		t.Fatalf("new upload session already has a result file: %q", *storedSession.ResultFileID)
+	}
+	if storedSession.ExpiresAt.IsZero() || !storedSession.ExpiresAt.After(time.Now()) {
+		t.Fatalf("upload session expiry was not stored: %v", storedSession.ExpiresAt)
+	}
+}
+
+// TestUploadSessionMigrationPreservesExistingFiles 模拟“旧库还没有 upload_sessions”：
+// 先写入一个正式文件，再删掉会话表并重启迁移。已有 File/Entity 必须保持原样。
+func TestUploadSessionMigrationPreservesExistingFiles(t *testing.T) {
+	dsn := migrationDSN(t)
+	ctx := context.Background()
+	resetMigrationSchema(t, dsn)
+
+	db, err := database.OpenDSN(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user, policy := createMigrationUser(t, db)
+	entity := model.Entity{
+		StorageKey:      "existing-content-key",
+		Size:            5,
+		StoragePolicyID: policy.ID,
+		RefCount:        1,
+		Status:          model.EntityStatusActive,
+	}
+	if err := db.WithContext(ctx).Create(&entity).Error; err != nil {
+		t.Fatal(err)
+	}
+	record := model.File{
+		ID:       "existing-file-id",
+		Name:     "keep.txt",
+		Kind:     model.KindFile,
+		ParentID: user.RootFileID,
+		EntityID: &entity.ID,
+		OwnerID:  user.ID,
+	}
+	if err := db.WithContext(ctx).Create(&record).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// 旧版本数据库没有这张表。删掉它再启动，等价于一次真实升级。
+	if err := db.Exec("DROP TABLE upload_sessions").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(db); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := database.OpenDSN(ctx, dsn)
+	if err != nil {
+		t.Fatalf("reopen after adding upload_sessions: %v", err)
+	}
+	defer database.Close(reopened)
+
+	if !reopened.Migrator().HasTable("upload_sessions") {
+		t.Fatal("restart did not recreate upload_sessions")
+	}
+
+	var stored model.File
+	if err := reopened.WithContext(ctx).
+		Preload("Entity").
+		First(&stored, "id = ?", record.ID).Error; err != nil {
+		t.Fatalf("existing file disappeared after migration: %v", err)
+	}
+	if stored.Name != record.Name ||
+		stored.Kind != model.KindFile ||
+		stored.OwnerID != user.ID ||
+		stored.ParentID == nil ||
+		*stored.ParentID != *user.RootFileID {
+		t.Fatalf("existing file changed after migration: %+v", stored)
+	}
+	if stored.Entity == nil {
+		t.Fatal("existing file lost its entity after migration")
+	}
+	if stored.Entity.StorageKey != entity.StorageKey ||
+		stored.Entity.Size != entity.Size ||
+		stored.Entity.StoragePolicyID != entity.StoragePolicyID ||
+		stored.Entity.RefCount != 1 ||
+		stored.Entity.Status != model.EntityStatusActive {
+		t.Fatalf("existing entity changed after migration: %+v", stored.Entity)
 	}
 }

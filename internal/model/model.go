@@ -72,14 +72,16 @@ type User struct {
 // TableName 显式指定表名，避免依赖 GORM 的复数化规则。
 func (User) TableName() string { return "users" }
 
-// Entity 的清理状态。
+// Entity 的生命周期状态。
 //
-//	active         允许被 File 引用，内容正常可达。
+//	uploading      上传会话的占位内容：字节还没接收完，还没有 File 引用。
+//	active         正式内容：允许被 File 引用，内容正常可达。
 //	pending_delete 引用数已经归零，等待物理清理；这个状态不能再被引用。
 //
-// 本阶段只有这两个状态：删除事务提交后，磁盘对象可能还没来得及删。
-// 更复杂的重试任务队列等真正需要时再加。
+// 占位实体和待清理实体的 ref_count 都是 0，区别只在状态：
+// uploading 之后会变成 active（上传完成），pending_delete 之后会被删除。
 const (
+	EntityStatusUploading     = "uploading"
 	EntityStatusActive        = "active"
 	EntityStatusPendingDelete = "pending_delete"
 )
@@ -107,10 +109,15 @@ type Entity struct {
 
 	// 有多少个 File 引用这份内容。删除 File 时减一，减到 0 才进入
 	// pending_delete，等待物理清理。
-	RefCount int `gorm:"not null;default:1"`
+	//
+	// 这里刻意不写 default:1：GORM 会把“带 default 的零值”当成没有设置，
+	// 于是 Create 时 ref_count=0 会被数据库默认值改成 1。上传占位实体
+	// 必须真正保存 0，所以所有创建路径都显式写这个字段：
+	// 正式实体写 1，占位实体写 0。
+	RefCount int `gorm:"not null"`
 
-	// 清理状态：active 可以被引用；pending_delete 表示 ref_count 已归零、
-	// 正在等待物理清理，禁止再被引用。
+	// 生命周期状态：uploading 是上传占位；active 可以被引用；
+	// pending_delete 表示 ref_count 已归零、正在等待物理清理，禁止再被引用。
 	Status string `gorm:"type:varchar(16);not null;default:active;index"`
 }
 
@@ -169,3 +176,57 @@ type AuthSession struct {
 }
 
 func (AuthSession) TableName() string { return "auth_sessions" }
+
+// UploadSession 的状态。转换规则不在模型里，见 internal/upload。
+//
+//	pending → receiving → ready → completed
+//	             ↓
+//	          pending（写入失败且已停止，可以重新上传）
+//
+// pending/receiving/ready 都可以变成 canceled 或 expired；
+// 一旦 completed 就不能再取消或过期。
+const (
+	UploadStatusPending   = "pending"
+	UploadStatusReceiving = "receiving"
+	UploadStatusReady     = "ready"
+	UploadStatusCompleted = "completed"
+	UploadStatusCanceled  = "canceled"
+	UploadStatusExpired   = "expired"
+)
+
+// UploadSession 是一次上传的持久化状态。
+//
+// 它把“客户端说要传什么”和“服务端已经收到多少”分开记录：
+// 字节本身放在 Entity 占位内容里，会话记录只保存进度和最终结果。
+// 会话 ID 用随机字符串，和 File 一样对外可见。
+type UploadSession struct {
+	ID string `gorm:"type:varchar(255);primaryKey"`
+
+	// 上传用户。查询会话时必须同时匹配它，不能只凭 ID 取别人的会话。
+	OwnerID int `gorm:"not null;index:idx_upload_sessions_owner_status,priority:1"`
+
+	// 目标目录和最终文件名。ParentID 指向 files 表里的目录。
+	ParentID string `gorm:"type:varchar(255);not null;index"`
+	Name     string `gorm:"type:varchar(255);not null"`
+
+	// 对应的占位实体：状态 uploading、ref_count=0。
+	// 一个会话只对应一个占位实体，所以这里加唯一索引。
+	EntityID int64 `gorm:"not null;uniqueIndex"`
+
+	// 客户端声明的总大小和实际已经收到的大小，单位字节。
+	// 状态变成 ready 时，两者必须相等（由业务层检查）。
+	ExpectedSize int64 `gorm:"not null"`
+	ActualSize   int64 `gorm:"not null"`
+
+	// 会话状态，取值见上面的 UploadStatus* 常量。
+	Status string `gorm:"type:varchar(16);not null;default:pending;index:idx_upload_sessions_owner_status,priority:2"`
+
+	// 过期时间。未完成的会话超过这个时间后变成 expired。
+	ExpiresAt time.Time `gorm:"not null;index"`
+
+	// 完成后生成的文件 ID。只有 completed 状态才有值；
+	// 重复确认完成时直接返回它，不再创建新文件。
+	ResultFileID *string `gorm:"type:varchar(255);uniqueIndex"`
+}
+
+func (UploadSession) TableName() string { return "upload_sessions" }

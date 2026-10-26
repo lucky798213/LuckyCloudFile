@@ -160,6 +160,7 @@ func TestCleanupKeepsEntityThatStillHasReferences(t *testing.T) {
 
 	// 手工制造一条“状态和引用不一致”的数据。正常流程不会这样，
 	// 但清理逻辑必须宁可保留对象，也不能删掉还在用的内容。
+	// RefCount 没有 GORM default，零值会原样写入。
 	entity := model.Entity{
 		StorageKey:      "pending-with-reference",
 		Size:            1,
@@ -170,15 +171,6 @@ func TestCleanupKeepsEntityThatStillHasReferences(t *testing.T) {
 	if err := db.WithContext(ctx).Create(&entity).Error; err != nil {
 		t.Fatal(err)
 	}
-	// RefCount 有 default:1，GORM 会把零值替换成默认值；
-	// 这里用 UpdateColumn 强制写成 0，模拟“引用已经归零”的状态。
-	if err := db.WithContext(ctx).
-		Model(&model.Entity{}).
-		Where("id = ?", entity.ID).
-		UpdateColumn("ref_count", 0).Error; err != nil {
-		t.Fatal(err)
-	}
-	entity.RefCount = 0
 	path := filepath.Join(root, entity.StorageKey)
 	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
@@ -352,6 +344,7 @@ func TestCleanupLoopRunsImmediatelyAndStops(t *testing.T) {
 	defer cancel()
 
 	// 对象本来就不存在：清理应该把这条 pending_delete 记录直接删掉。
+	// RefCount 没有 GORM default，零值会原样写入。
 	entity := model.Entity{
 		StorageKey:      "never-created",
 		Size:            0,
@@ -360,13 +353,6 @@ func TestCleanupLoopRunsImmediatelyAndStops(t *testing.T) {
 		Status:          model.EntityStatusPendingDelete,
 	}
 	if err := db.WithContext(ctx).Create(&entity).Error; err != nil {
-		t.Fatal(err)
-	}
-	// 同上：RefCount 的 default 会覆盖零值，必须显式写成 0。
-	if err := db.WithContext(ctx).
-		Model(&model.Entity{}).
-		Where("id = ?", entity.ID).
-		UpdateColumn("ref_count", 0).Error; err != nil {
 		t.Fatal(err)
 	}
 
