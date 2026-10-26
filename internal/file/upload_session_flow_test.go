@@ -227,3 +227,141 @@ func TestUploadSessionFlowOverHTTP(t *testing.T) {
 		t.Fatalf("unexpected placeholder entity: %+v", entity)
 	}
 }
+
+// TestUploadSessionContentFlowOverHTTP 用真实 MySQL + 真实 Service 走完整内容上传：
+// 创建会话 → PUT 原始内容 → 会话 ready → 目录仍为空、普通下载仍 404。
+func TestUploadSessionContentFlowOverHTTP(t *testing.T) {
+	dsn := os.Getenv("CLOUDREVE_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("set CLOUDREVE_TEST_MYSQL_DSN to run the upload content flow")
+	}
+
+	ctx := context.Background()
+	client, err := database.OpenDSN(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close(client) })
+	resetAuthTables(t, client)
+
+	for _, account := range []struct{ username, password string }{
+		{testUsernameA, testPasswordA},
+		{testUsernameB, testPasswordB},
+	} {
+		if _, err := auth.CreateUser(ctx, client, account.username, account.password); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	router := httpapi.NewRouter(
+		slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		newTestFileService(t, client),
+		auth.NewService(client),
+	)
+	tokenA := login(t, router, testUsernameA, testPasswordA)
+	tokenB := login(t, router, testUsernameB, testPasswordB)
+
+	// 1. 创建声明 5 字节的会话。
+	created := serve(t, router, uploadSessionHTTPRequest(
+		t, http.MethodPost, "/api/upload-sessions",
+		`{"name":"content.bin","size":5}`, tokenA,
+	))
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create session: wanted 201, got %d: %s", created.Code, created.Body.String())
+	}
+	var info cloudfile.UploadSessionInfo
+	if err := json.Unmarshal(created.Body.Bytes(), &info); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. 别人的会话不能写内容。
+	foreign := serve(t, router, uploadSessionContentHTTPRequest(t, info.ID, "hello", tokenB))
+	if foreign.Code != http.StatusNotFound {
+		t.Fatalf("foreign content upload: wanted 404, got %d: %s", foreign.Code, foreign.Body.String())
+	}
+
+	// 3. 正确的 5 字节内容：200 + ready。
+	uploaded := serve(t, router, uploadSessionContentHTTPRequest(t, info.ID, "hello", tokenA))
+	if uploaded.Code != http.StatusOK {
+		t.Fatalf("upload content: wanted 200, got %d: %s", uploaded.Code, uploaded.Body.String())
+	}
+	var ready cloudfile.UploadSessionInfo
+	if err := json.Unmarshal(uploaded.Body.Bytes(), &ready); err != nil {
+		t.Fatal(err)
+	}
+	if ready.ID != info.ID || ready.Status != model.UploadStatusReady ||
+		ready.ActualSize != 5 || ready.ExpectedSize != 5 || ready.ResultFileID != nil {
+		t.Fatalf("unexpected ready session: %+v", ready)
+	}
+
+	// 4. 查询会话是 ready；普通下载接口仍然找不到它。
+	got := serve(t, router, uploadSessionHTTPRequest(
+		t, http.MethodGet, "/api/upload-sessions/"+info.ID, "", tokenA,
+	))
+	if got.Code != http.StatusOK {
+		t.Fatalf("get ready session: wanted 200, got %d: %s", got.Code, got.Body.String())
+	}
+	var fetched cloudfile.UploadSessionInfo
+	if err := json.Unmarshal(got.Body.Bytes(), &fetched); err != nil {
+		t.Fatal(err)
+	}
+	if fetched.Status != model.UploadStatusReady || fetched.ActualSize != 5 {
+		t.Fatalf("fetched session = %+v", fetched)
+	}
+	download := serve(t, router, authorize(
+		httptest.NewRequest(http.MethodGet, "/api/files/"+info.ID, nil), tokenA,
+	))
+	if download.Code != http.StatusNotFound {
+		t.Fatalf("content must not be downloadable yet: wanted 404, got %d", download.Code)
+	}
+
+	// 5. 目录里没有正式文件；数据库里 Entity 仍是 uploading/0，只更新了 size。
+	rootList := serve(t, router, authorize(
+		httptest.NewRequest(http.MethodGet, "/api/files", nil), tokenA,
+	))
+	if rootList.Code != http.StatusOK {
+		t.Fatalf("list root: wanted 200, got %d: %s", rootList.Code, rootList.Body.String())
+	}
+	var listing cloudfile.ListResult
+	if err := json.Unmarshal(rootList.Body.Bytes(), &listing); err != nil {
+		t.Fatal(err)
+	}
+	if listing.Total != 0 || len(listing.Items) != 0 {
+		t.Fatalf("upload content created formal files: %+v", listing)
+	}
+
+	var session model.UploadSession
+	if err := client.First(&session, "id = ?", info.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var entity model.Entity
+	if err := client.First(&entity, session.EntityID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if session.Status != model.UploadStatusReady || session.ActualSize != 5 {
+		t.Fatalf("stored session = %+v", session)
+	}
+	if entity.Status != model.EntityStatusUploading ||
+		entity.RefCount != 0 ||
+		entity.Size != 5 {
+		t.Fatalf("stored placeholder entity = %+v", entity)
+	}
+
+	// 6. ready 之后重复写入被拒绝。
+	again := serve(t, router, uploadSessionContentHTTPRequest(t, info.ID, "again", tokenA))
+	if again.Code != http.StatusConflict {
+		t.Fatalf("second content upload: wanted 409, got %d: %s", again.Code, again.Body.String())
+	}
+}
+
+func uploadSessionContentHTTPRequest(t *testing.T, sessionID, body, token string) *http.Request {
+	t.Helper()
+
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/api/upload-sessions/"+sessionID+"/content",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	return authorize(req, token)
+}

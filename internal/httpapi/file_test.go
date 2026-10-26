@@ -27,6 +27,7 @@ import (
 type fakeUploadSession struct {
 	info    file.UploadSessionInfo
 	ownerID int
+	content []byte
 }
 
 // fakeFileService 实现和 *file.Service 相同的接口，但不连数据库、不写磁盘。
@@ -401,6 +402,37 @@ func (f *fakeFileService) GetUploadSession(ctx context.Context, ownerID int, ses
 	if !ok || session.ownerID != ownerID {
 		return file.UploadSessionInfo{}, file.ErrUploadSessionNotFound
 	}
+	return session.info, nil
+}
+
+// UploadSessionContent 模拟真实服务：只接收一次完整内容，大小必须与创建时声明的一致。
+func (f *fakeFileService) UploadSessionContent(ctx context.Context, ownerID int, sessionID string, r io.Reader) (file.UploadSessionInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	session, ok := f.sessions[sessionID]
+	if !ok || session.ownerID != ownerID {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionNotFound
+	}
+	if !session.info.ExpiresAt.After(time.Now()) {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionExpired
+	}
+	if session.info.Status != model.UploadStatusPending {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionConflict
+	}
+
+	data, err := io.ReadAll(io.LimitReader(r, session.info.ExpectedSize+1))
+	if err != nil {
+		return file.UploadSessionInfo{}, err
+	}
+	if int64(len(data)) != session.info.ExpectedSize {
+		return file.UploadSessionInfo{}, file.ErrUploadSizeMismatch
+	}
+
+	session.info.ActualSize = int64(len(data))
+	session.info.Status = model.UploadStatusReady
+	session.content = data
+	f.sessions[sessionID] = session
 	return session.info, nil
 }
 

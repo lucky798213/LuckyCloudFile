@@ -44,8 +44,9 @@ func NewLocal(root string) *Local {
 // 为什么要先写临时文件？因为如果直接写正式文件，别人下载时可能读到“写了一半”的内容。
 // 重命名在同一个文件系统里是原子的，要么没有这个文件，要么内容是完整的。
 //
-// 注意：这里只在开始前检查一次 ctx。本地 io.Copy 还不能在中途被取消，
-// 这是本地实现的限制，接口本身没有承诺这一点。
+// 复制过程中会按块检查 ctx，取消后不会继续发布文件。但底层 Reader 的一次 Read
+// 仍可能阻塞在系统调用里：这里不能用 cancel 强行打断它，HTTP 层的读超时和
+// 客户端断开仍然负责让阻塞的 Read 返回。
 func (l *Local) Save(ctx context.Context, key string, r io.Reader, maxBytes int64) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -66,7 +67,8 @@ func (l *Local) Save(ctx context.Context, key string, r io.Reader, maxBytes int6
 	//   - 读到 maxBytes 就结束 → 正好等于上限，放行
 	//   - 还能读到第 maxBytes+1 个字节 → 超了，拒绝
 	// io.Copy 会边读边写，不会把整个文件装进内存。
-	size, err := io.Copy(tmp, io.LimitReader(r, maxBytes+1))
+	src := io.LimitReader(&contextReader{ctx: ctx, r: r}, maxBytes+1)
+	size, err := io.Copy(tmp, src)
 	if err != nil {
 		_ = tmp.Close()
 		return 0, fmt.Errorf("write file: %w", err)
@@ -76,9 +78,20 @@ func (l *Local) Save(ctx context.Context, key string, r io.Reader, maxBytes int6
 		return 0, fmt.Errorf("%w: limit is %d bytes", ErrTooLarge, maxBytes)
 	}
 
+	// 内容刚好读完后请求被取消：不能把“已经取消的上传”发布成正式文件。
+	if err := ctx.Err(); err != nil {
+		_ = tmp.Close()
+		return 0, err
+	}
+
 	// Close 的错误必须检查：数据可能还在缓冲区，关闭时才真正刷到磁盘。
 	if err := tmp.Close(); err != nil {
 		return 0, fmt.Errorf("close file: %w", err)
+	}
+
+	// 发布前再看一次 ctx，避免关闭文件后才收到取消。
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 
 	// 写完了才“发布”成正式文件。走到这里内容已经是完整的。
@@ -86,6 +99,22 @@ func (l *Local) Save(ctx context.Context, key string, r io.Reader, maxBytes int6
 		return 0, fmt.Errorf("publish file: %w", err)
 	}
 	return size, nil
+}
+
+// contextReader 在每次 Read 前检查 ctx。
+//
+// 它只能保证“两次 Read 之间”能及时停止；一次已经进入内核的阻塞读
+// 仍然要靠 HTTP 读超时或连接关闭来唤醒。
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
 }
 
 // Open 打开一个已经存好的文件，用来读取（下载会用到）。

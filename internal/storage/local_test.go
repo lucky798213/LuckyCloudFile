@@ -89,6 +89,85 @@ func TestSaveRemovesTempFileOnFailure(t *testing.T) {
 	}
 }
 
+// cancelOnReadReader 第一次 Read 返回内容并取消 ctx，下一次 Read 会看到取消。
+type cancelOnReadReader struct {
+	cancel context.CancelFunc
+	data   []byte
+	sent   bool
+}
+
+func (r *cancelOnReadReader) Read(p []byte) (int, error) {
+	if r.sent {
+		return 0, io.EOF
+	}
+	r.sent = true
+	r.cancel()
+	return copy(p, r.data), nil
+}
+
+// TestSaveStopsWhenContextCanceledDuringRead 确认复制过程中会检查 ctx：
+// 取消后不能再继续读，更不能把内容发布成正式文件。
+func TestSaveStopsWhenContextCanceledDuringRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	local := NewLocal(root)
+
+	_, err := local.Save(ctx, "canceled", &cancelOnReadReader{
+		cancel: cancel,
+		data:   []byte("hello"),
+	}, 1<<20)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("wanted context.Canceled, got %v", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("canceled save left files behind: %v", entries)
+	}
+}
+
+// cancelOnEOFReader 在返回最后一块内容和 io.EOF 的同时取消 ctx，
+// 覆盖“内容刚好读完、但请求已经取消”的窗口。
+type cancelOnEOFReader struct {
+	cancel context.CancelFunc
+	data   []byte
+	sent   bool
+}
+
+func (r *cancelOnEOFReader) Read(p []byte) (int, error) {
+	if r.sent {
+		return 0, io.EOF
+	}
+	r.sent = true
+	r.cancel()
+	return copy(p, r.data), io.EOF
+}
+
+func TestSaveDoesNotPublishContentAfterCanceledAtEOF(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	local := NewLocal(root)
+
+	_, err := local.Save(ctx, "canceled-at-eof", &cancelOnEOFReader{
+		cancel: cancel,
+		data:   []byte("hello"),
+	}, 1<<20)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("wanted context.Canceled, got %v", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("canceled save left files behind: %v", entries)
+	}
+}
+
 func TestSaveFailsWhenRootDoesNotExist(t *testing.T) {
 	ctx := context.Background()
 	local := NewLocal(t.TempDir() + "/missing")
