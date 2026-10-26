@@ -36,6 +36,8 @@ type fileService interface {
 	Copy(ctx context.Context, ownerID int, id, parentID, name string) (file.File, error)
 	Rename(ctx context.Context, ownerID int, id, name string) (file.File, error)
 	Move(ctx context.Context, ownerID int, id, parentID string) (file.File, error)
+	CreateUploadSession(ctx context.Context, ownerID int, parentID, name string, size int64) (file.UploadSessionInfo, error)
+	GetUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error)
 }
 
 // NewRouter 创建并配置好路由。
@@ -82,6 +84,9 @@ func NewRouter(logger *slog.Logger, fileService fileService, authService authSer
 	protected.PATCH("/files/:id", renameFile(logger, fileService))
 	// 移动：只改 files.parent_id，文件和目录都支持，不搬磁盘内容。
 	protected.POST("/files/:id/move", moveFile(logger, fileService))
+	// 上传会话：只登记要传的文件和目标目录，本阶段不接收内容。
+	protected.POST("/upload-sessions", createUploadSession(logger, fileService))
+	protected.GET("/upload-sessions/:id", getUploadSession(logger, fileService))
 
 	// 兜底：没匹配到任何路由时，返回统一的 JSON 错误，而不是 Gin 默认的纯文本 404。
 	r.NoRoute(notFound)

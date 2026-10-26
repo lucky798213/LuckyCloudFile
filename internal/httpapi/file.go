@@ -470,6 +470,11 @@ func handleFileError(c *gin.Context, err error, notFoundCode, notFoundMessage st
 		c.JSON(http.StatusNotFound, ErrorResponse{Code: notFoundCode, Message: notFoundMessage})
 	case errors.Is(err, file.ErrTooLarge):
 		respondTooLarge(c)
+	case errors.Is(err, file.ErrInvalidSize):
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Code:    "invalid_size",
+			Message: "size must be greater than or equal to 0",
+		})
 	case errors.Is(err, file.ErrInvalidName):
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Code:    "invalid_name",

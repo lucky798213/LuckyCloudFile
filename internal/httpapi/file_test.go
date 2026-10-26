@@ -17,10 +17,17 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"luckyCloudFile/internal/file"
 	"luckyCloudFile/internal/model"
 )
+
+// fakeUploadSession 是假服务里的一条上传会话，只用来验证 HTTP 层。
+type fakeUploadSession struct {
+	info    file.UploadSessionInfo
+	ownerID int
+}
 
 // fakeFileService 实现和 *file.Service 相同的接口，但不连数据库、不写磁盘。
 //
@@ -32,6 +39,8 @@ type fakeFileService struct {
 	records  map[string]file.File
 	contents map[string][]byte
 	owners   map[string]int
+	// sessions 是上传会话 ID → 会话。和 records 分开，模拟 upload_sessions 表。
+	sessions map[string]fakeUploadSession
 	// roots 是“用户根目录”的 ID → 用户 ID。假实现不把根目录放进 records，
 	// 只用来验证根目录不能被改名。
 	roots map[string]int
@@ -42,6 +51,7 @@ func newFakeFileService() *fakeFileService {
 		records:  make(map[string]file.File),
 		contents: make(map[string][]byte),
 		owners:   make(map[string]int),
+		sessions: make(map[string]fakeUploadSession),
 		roots:    make(map[string]int),
 	}
 }
@@ -347,6 +357,51 @@ func validFakeName(name string) bool {
 		return false
 	}
 	return !strings.ContainsAny(name, `/\`) && !strings.ContainsRune(name, 0)
+}
+
+// CreateUploadSession 模拟真实服务：校验参数和目录后只登记会话，
+// 不创建 File，也不占用文件内容。
+func (f *fakeFileService) CreateUploadSession(ctx context.Context, ownerID int, parentID, name string, size int64) (file.UploadSessionInfo, error) {
+	if !validFakeName(name) {
+		return file.UploadSessionInfo{}, file.ErrInvalidName
+	}
+	if size < 0 {
+		return file.UploadSessionInfo{}, file.ErrInvalidSize
+	}
+	if size > file.MaxUploadBytes {
+		return file.UploadSessionInfo{}, file.ErrTooLarge
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if err := f.checkParent(ownerID, parentID); err != nil {
+		return file.UploadSessionInfo{}, err
+	}
+
+	f.nextID++
+	info := file.UploadSessionInfo{
+		ID:           fmt.Sprintf("fake-session-%d", f.nextID),
+		ParentID:     parentID,
+		Name:         name,
+		ExpectedSize: size,
+		ActualSize:   0,
+		Status:       model.UploadStatusPending,
+		ExpiresAt:    time.Now().Add(file.UploadSessionTTL),
+	}
+	f.sessions[info.ID] = fakeUploadSession{info: info, ownerID: ownerID}
+	return info, nil
+}
+
+func (f *fakeFileService) GetUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	session, ok := f.sessions[sessionID]
+	if !ok || session.ownerID != ownerID {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionNotFound
+	}
+	return session.info, nil
 }
 
 func (f *fakeFileService) stored(id string) ([]byte, bool) {
