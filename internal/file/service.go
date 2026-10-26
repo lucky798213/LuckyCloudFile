@@ -123,6 +123,10 @@ type Service struct {
 	stores  *storage.Registry
 	logger  *slog.Logger
 	uploads *uploadController
+
+	// chunks 是跨请求保留的分片账本，和 uploads（当前是否有请求在写）
+	// 职责分开。它只保存内存状态，不落库。
+	chunks *chunkLedger
 }
 
 // NewService 创建文件服务。
@@ -135,6 +139,8 @@ func NewService(db *gorm.DB, stores *storage.Registry) *Service {
 		logger: slog.New(slog.DiscardHandler),
 		// 同一个 Service 实例的上传和取消请求共用这个控制器。
 		uploads: newUploadController(),
+		// 分片账本也由 Service 持有，跨请求保留到会话结束。
+		chunks: newChunkLedger(),
 	}
 }
 

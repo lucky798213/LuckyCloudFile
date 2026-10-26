@@ -244,7 +244,8 @@ type UploadSession struct {
 	EntityID int64 `gorm:"not null;uniqueIndex"`
 
 	// 客户端声明的总大小和实际已经收到的大小，单位字节。
-	// 状态变成 ready 时，两者必须相等（由业务层检查）。
+	// chunked 模式下 ActualSize 是账本里不重复分片的字节数之和，
+	// 分片可以乱序到达；状态变成 ready 时，两者必须相等（由业务层检查）。
 	ExpectedSize int64 `gorm:"not null"`
 	ActualSize   int64 `gorm:"not null"`
 

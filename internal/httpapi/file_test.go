@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -26,9 +27,10 @@ import (
 
 // fakeUploadSession 是假服务里的一条上传会话，只用来验证 HTTP 层。
 type fakeUploadSession struct {
-	info    file.UploadSessionInfo
-	ownerID int
-	content []byte
+	info     file.UploadSessionInfo
+	ownerID  int
+	content  []byte
+	uploaded map[int][]byte
 }
 
 // fakeFileService 实现和 *file.Service 相同的接口，但不连数据库、不写磁盘。
@@ -470,8 +472,8 @@ func (f *fakeFileService) UploadSessionContent(ctx context.Context, ownerID int,
 	return session.info, nil
 }
 
-// UploadSessionChunk 模拟真实服务：只接受 chunked 会话，分片必须按顺序、
-// 长度必须正好等于服务端算出的这一片大小。
+// UploadSessionChunk 模拟真实服务：允许乱序上传；同一编号同内容幂等成功，
+// 同编号不同内容按冲突拒绝。
 func (f *fakeFileService) UploadSessionChunk(ctx context.Context, ownerID int, sessionID string, index int, r io.Reader) (file.UploadSessionInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -486,20 +488,19 @@ func (f *fakeFileService) UploadSessionChunk(ctx context.Context, ownerID int, s
 	if session.info.Mode != model.UploadModeChunked {
 		return file.UploadSessionInfo{}, file.ErrUploadModeMismatch
 	}
-	if session.info.Status != model.UploadStatusPending {
-		return file.UploadSessionInfo{}, file.ErrUploadSessionConflict
-	}
-	if index < 0 || index >= session.info.ChunkCount {
-		return file.UploadSessionInfo{}, file.ErrInvalidChunkIndex
-	}
-	expectedIndex := int(session.info.ActualSize / session.info.ChunkSize)
-	if index != expectedIndex {
+	if session.info.Status != model.UploadStatusPending &&
+		session.info.Status != model.UploadStatusReady {
 		return file.UploadSessionInfo{}, file.ErrUploadSessionConflict
 	}
 
-	chunkBytes := session.info.ChunkSize
-	if remaining := session.info.ExpectedSize - session.info.ActualSize; remaining < chunkBytes {
-		chunkBytes = remaining
+	offset, chunkBytes, err := uploadpkg.ChunkAt(
+		session.info.ExpectedSize, session.info.ChunkSize, index,
+	)
+	if err != nil {
+		if errors.Is(err, uploadpkg.ErrChunkIndexOutOfRange) {
+			return file.UploadSessionInfo{}, file.ErrInvalidChunkIndex
+		}
+		return file.UploadSessionInfo{}, err
 	}
 	data, err := io.ReadAll(io.LimitReader(r, chunkBytes+1))
 	if err != nil {
@@ -509,7 +510,27 @@ func (f *fakeFileService) UploadSessionChunk(ctx context.Context, ownerID int, s
 		return file.UploadSessionInfo{}, file.ErrUploadSizeMismatch
 	}
 
-	session.content = append(session.content, data...)
+	if existing, ok := session.uploaded[index]; ok {
+		if !bytes.Equal(existing, data) {
+			return file.UploadSessionInfo{}, file.ErrUploadSessionConflict
+		}
+		// ready 且内容一致：只读幂等返回，不再写盘或改状态。
+		return session.info, nil
+	}
+	if session.info.Status == model.UploadStatusReady {
+		// ready 表示所有片都已收齐，不可能还有没登记过的编号。
+		return file.UploadSessionInfo{}, file.ErrUploadSessionConflict
+	}
+	if session.uploaded == nil {
+		session.uploaded = make(map[int][]byte)
+	}
+	if int64(len(session.content)) < session.info.ExpectedSize {
+		content := make([]byte, session.info.ExpectedSize)
+		copy(content, session.content)
+		session.content = content
+	}
+	copy(session.content[offset:offset+chunkBytes], data)
+	session.uploaded[index] = data
 	session.info.ActualSize += int64(len(data))
 	if session.info.ActualSize >= session.info.ExpectedSize {
 		session.info.Status = model.UploadStatusReady

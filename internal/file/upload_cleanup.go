@@ -78,6 +78,10 @@ func (s *Service) handoffTerminatedSession(
 			return nil
 		}
 
+		// 会话已经进入终态，分片账本不会再有合法请求使用。
+		// 物理清理可能失败，但账本不需要跟着重试。
+		s.chunks.remove(sessionID)
+
 		var entity model.Entity
 		err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			First(&entity, session.EntityID).Error

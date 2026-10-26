@@ -225,6 +225,8 @@ func (s *Service) CompleteUploadSession(
 		return nil
 	})
 	if err == nil {
+		// 会话已经发布，分片账本不再需要。
+		s.chunks.remove(sessionID)
 		return completed, nil
 	}
 
@@ -232,6 +234,7 @@ func (s *Service) CompleteUploadSession(
 	// 而是用独立 context 加锁重新核对；确认 completed 就返回已有结果。
 	verified, verifyErr := s.verifyCompletedUploadSession(ctx, ownerID, sessionID)
 	if verifyErr == nil && verified != nil {
+		s.chunks.remove(sessionID)
 		return *verified, nil
 	}
 	if verifyErr != nil {

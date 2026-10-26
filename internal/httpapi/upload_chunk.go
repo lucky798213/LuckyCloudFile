@@ -68,7 +68,7 @@ func uploadSessionChunk(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 			case errors.Is(err, file.ErrUploadSessionConflict):
 				c.JSON(http.StatusConflict, ErrorResponse{
 					Code:    "upload_session_conflict",
-					Message: "chunk is out of order or the session is not accepting content",
+					Message: "chunk conflicts with uploaded content or the session is not accepting content",
 				})
 			case errors.Is(err, file.ErrUploadSizeMismatch):
 				c.JSON(http.StatusBadRequest, ErrorResponse{

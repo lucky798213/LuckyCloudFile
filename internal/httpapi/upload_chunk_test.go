@@ -74,6 +74,34 @@ func TestUploadSessionHTTPChunkedFlow(t *testing.T) {
 		t.Fatalf("chunk progress = %+v", progress)
 	}
 
+	// 最后一片已经收齐、会话 ready：重传同内容必须幂等成功。
+	replayed := httptest.NewRecorder()
+	router.ServeHTTP(replayed, uploadSessionJSONRequest(
+		t, http.MethodPut, "/api/upload-sessions/"+info.ID+"/chunks/0", "abcd", testTokenA,
+	))
+	if replayed.Code != http.StatusOK {
+		t.Fatalf("replay ready chunk: wanted 200, got %d: %s",
+			replayed.Code, replayed.Body.String())
+	}
+	var replayInfo file.UploadSessionInfo
+	if err := json.Unmarshal(replayed.Body.Bytes(), &replayInfo); err != nil {
+		t.Fatal(err)
+	}
+	if replayInfo.Status != model.UploadStatusReady || replayInfo.ActualSize != 4 {
+		t.Fatalf("replay progress = %+v", replayInfo)
+	}
+
+	// ready 状态下同编号不同内容仍然冲突。
+	conflicting := httptest.NewRecorder()
+	router.ServeHTTP(conflicting, uploadSessionJSONRequest(
+		t, http.MethodPut, "/api/upload-sessions/"+info.ID+"/chunks/0", "wxyz", testTokenA,
+	))
+	if conflicting.Code != http.StatusConflict {
+		t.Fatalf("conflicting ready replay: wanted 409, got %d: %s",
+			conflicting.Code, conflicting.Body.String())
+	}
+	assertErrorCode(t, conflicting, "upload_session_conflict")
+
 	completed := httptest.NewRecorder()
 	router.ServeHTTP(completed, uploadSessionJSONRequest(
 		t, http.MethodPost, "/api/upload-sessions/"+info.ID+"/complete", "", testTokenA,

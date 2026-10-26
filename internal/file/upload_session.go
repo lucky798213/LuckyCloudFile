@@ -190,6 +190,12 @@ func (s *Service) CreateUploadSessionWithMode(
 		return UploadSessionInfo{}, err
 	}
 
+	// 分片账本从创建时开始存在，后续请求才能跨请求累计进度。
+	// 空文件也会有一个空账本，完成/取消时统一删除。
+	if mode == model.UploadModeChunked {
+		s.chunks.create(session.ID)
+	}
+
 	return toUploadSessionInfo(session), nil
 }
 
