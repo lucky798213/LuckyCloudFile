@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/upload"
@@ -28,9 +27,14 @@ const DefaultExpireBatchSize = DefaultCleanupBatchSize
 //
 // 扫描顺序：
 //  1. 按 id 游标分页查询 pending/receiving/ready 且 expires_at <= now 的会话；
-//  2. 每条会话单独开一个短事务：锁住会话，重新核对状态和到期时间，
-//     确认仍然未完成后才改成 expired；提交事务；
+//  2. 每条会话单独开一个短事务：先锁用户、再锁会话，重新核对状态和到期时间，
+//     确认仍然未完成后才改成 expired，并在同一个事务里释放预留、清零会话预留；
+//     提交事务；
 //  3. 事务提交后通知上传控制器停止，再尝试把占位 Entity 移交给清理。
+//
+// 终态和容量释放必须一起提交：不能先提交 expired 再单独释放容量，
+// 否则中途崩溃会留下永久占用的预留。会话上的 ReservedBytes 是释放依据，
+// 释放后清零，所以重复扫描 / 重复取消不会重复扣减。
 //
 // 候选查询不是最终依据：会话可能在候选查询和加锁之间被完成、取消或续期，
 // 所以事务内必须重新检查。与完成接口竞争时两者锁同一条 Session：
@@ -120,12 +124,10 @@ func (s *Service) expireUploadSession(
 	expired := false
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var session model.UploadSession
-		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ? AND owner_id = ?", sessionID, ownerID).
-			First(&session).Error
+		// 容量事务固定先锁用户、再锁会话，和完成/取消保持一致。
+		session, err := lockUserAndUploadSession(ctx, tx, ownerID, sessionID)
 		if err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
+			if errors.Is(err, ErrUploadSessionNotFound) {
 				// 候选查询之后会话被删掉了，跳过即可。
 				return nil
 			}
@@ -143,10 +145,19 @@ func (s *Service) expireUploadSession(
 			return nil
 		}
 
+		// 释放预留和写终态在同一个事务里。session.ReservedBytes 清零后才提交，
+		// 后续扫描看到的就是 0，不会重复释放。
+		if _, err := releaseUploadReservation(tx, session); err != nil {
+			return err
+		}
+
 		updated := tx.Model(&model.UploadSession{}).
 			Where("id = ? AND owner_id = ? AND status IN ? AND expires_at <= ?",
 				session.ID, ownerID, unfinishedUploadStatuses, now).
-			UpdateColumn("status", model.UploadStatusExpired)
+			UpdateColumns(map[string]any{
+				"status":         model.UploadStatusExpired,
+				"reserved_bytes": 0,
+			})
 		if updated.Error != nil {
 			return fmt.Errorf("expire upload session: %w", updated.Error)
 		}

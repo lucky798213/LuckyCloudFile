@@ -22,6 +22,7 @@ import (
 	"luckyCloudFile/internal/auth"
 	"luckyCloudFile/internal/config"
 	"luckyCloudFile/internal/database"
+	"luckyCloudFile/internal/quota"
 )
 
 const passwordEnv = "CLOUDREVE_USER_PASSWORD"
@@ -34,11 +35,16 @@ func run() int {
 	configPath := flag.String("conf", "configs/conf.ini", "配置文件路径（INI 格式）")
 	username := flag.String("username", "", "要创建的用户名（必填）")
 	ifNotExists := flag.Bool("if-not-exists", false, "用户已存在时不报错，也不修改密码")
+	quotaBytes := flag.Int64("quota-bytes", quota.DefaultBytes, "账号的初始容量配额（字节；0 表示没有可用容量）")
 	flag.Parse()
 
 	if strings.TrimSpace(*username) == "" {
 		fmt.Fprintln(os.Stderr, "错误: 必须通过 --username 指定用户名")
 		flag.Usage()
+		return 2
+	}
+	if *quotaBytes < 0 {
+		fmt.Fprintln(os.Stderr, "错误: --quota-bytes 不能是负数")
 		return 2
 	}
 
@@ -64,7 +70,7 @@ func run() int {
 	}
 	defer database.Close(client)
 
-	user, err := auth.CreateUser(ctx, client, *username, password)
+	user, err := auth.CreateUserWithQuota(ctx, client, *username, password, *quotaBytes)
 	if err != nil {
 		if errors.Is(err, auth.ErrUserExists) {
 			if *ifNotExists {
@@ -78,7 +84,7 @@ func run() int {
 		return 1
 	}
 
-	fmt.Printf("已创建用户 %q（id=%d）\n", user.Username, user.ID)
+	fmt.Printf("已创建用户 %q（id=%d，配额 %d 字节）\n", user.Username, user.ID, user.QuotaBytes)
 	return 0
 }
 

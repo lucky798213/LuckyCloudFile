@@ -243,6 +243,14 @@ func TestDeleteSharedEntityWaitsForLastReference(t *testing.T) {
 		Update("ref_count", 2).Error; err != nil {
 		t.Fatal(err)
 	}
+	// 逻辑用量按 File 计费：手工多挂一个 File 也要补上这一份用量，
+	// 否则删除时释放两份会让账目变成负数（真实路径由 Copy 负责增加）。
+	if err := db.WithContext(ctx).
+		Model(&model.User{}).
+		Where("id = ?", ownerA.ID).
+		UpdateColumn("used_bytes", entity.Size*2).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	// 删第一个：引用 2 → 1，Entity 仍 active，磁盘内容必须保留。
 	if err := service.Delete(ctx, ownerA.ID, first.ID); err != nil {

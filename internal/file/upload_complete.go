@@ -11,6 +11,7 @@ import (
 
 	"luckyCloudFile/internal/idgen"
 	"luckyCloudFile/internal/model"
+	"luckyCloudFile/internal/quota"
 	"luckyCloudFile/internal/upload"
 )
 
@@ -30,14 +31,19 @@ var (
 // 这里只创建正式 File、激活 Entity、把会话标成 completed。
 //
 // 顺序：
-//  1. 在事务里按 sessionID + ownerID 加行锁；
+//  1. 在事务里先锁用户行，再按 sessionID + ownerID 锁会话；
 //  2. completed 直接返回原 ResultFileID（先于过期检查，支持幂等重放）；
 //  3. ready 且未过期才继续，其余状态拒绝；
 //  4. 重新校验目标目录和占位 Entity（uploading / 0，三处大小一致）；
-//  5. 创建 File → 激活 Entity（active / 1）→ 会话标记 completed。
+//  5. 把会话预留量转成已用量（reserved → used），
+//     创建 File → 激活 Entity（active / 1）→ 会话标记 completed、预留清零。
 //
-// 三个写入必须一起提交。事务失败后不会删除已经传好的内容：
-// 明确回滚时会话仍是 ready，客户端可以重试；提交结果不确定时，
+// 容量结算是这个事务的一部分，但不在事务提交后的回调里做：
+// 否则会出现“文件发布了，但账没记上”的窗口。结算按会话上持久化的
+// ReservedBytes 进行，不看 ExpectedSize；重复完成直接返回原结果，不会二次计费。
+//
+// 容量结算、File、Entity 和会话状态必须一起提交。事务失败后不会删除已经传好的内容：
+// 明确回滚时会话仍是 ready、预留原样保留，客户端可以重试；提交结果不确定时，
 // 用独立且有超时的 context 加锁核对 completed + ResultFileID。
 func (s *Service) CompleteUploadSession(
 	ctx context.Context,
@@ -50,7 +56,12 @@ func (s *Service) CompleteUploadSession(
 	)
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 先锁会话。并发的完成请求会在这一行上排队：
+		// 先锁用户、再锁会话：和取消、过期、重启恢复保持同一个加锁顺序。
+		if _, err := quota.LockUser(tx, ownerID); err != nil {
+			return err
+		}
+
+		// 并发的完成请求会在会话这一行上排队：
 		// 后到的请求等到前一个提交后读到 completed，直接返回同一个结果文件。
 		var session model.UploadSession
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -112,6 +123,20 @@ func (s *Service) CompleteUploadSession(
 				session.ExpectedSize, session.ActualSize, entity.Size,
 			)
 		}
+		// 预留量必须正好覆盖这次要发布的内容。少了就说明账目和内容对不上，
+		// 不能“先发布、以后再补”：那会让 used+reserved 越过配额上界。
+		if session.ReservedBytes != entity.Size {
+			return fmt.Errorf(
+				"%w: reserved_bytes=%d entity_size=%d",
+				ErrUploadSessionConflict, session.ReservedBytes, entity.Size,
+			)
+		}
+
+		// 先把预留转成已用。它和创建 File、激活 Entity、标记 completed
+		// 在同一个事务里，失败时全部回滚，预留仍然保留，客户端可以重试完成。
+		if err := quota.Settle(tx, ownerID, session.ReservedBytes); err != nil {
+			return err
+		}
 
 		// 文件名字、目录、所有者都来自会话，完成时不允许客户端重新指定。
 		fileID, err = idgen.New()
@@ -161,6 +186,7 @@ func (s *Service) CompleteUploadSession(
 			UpdateColumns(map[string]any{
 				"status":         model.UploadStatusCompleted,
 				"result_file_id": fileID,
+				"reserved_bytes": 0,
 			})
 		if marked.Error != nil {
 			return fmt.Errorf("complete upload session: %w", marked.Error)
@@ -174,6 +200,7 @@ func (s *Service) CompleteUploadSession(
 
 		session.Status = model.UploadStatusCompleted
 		session.ResultFileID = &fileID
+		session.ReservedBytes = 0
 		completed = toUploadSessionInfo(session)
 		return nil
 	})

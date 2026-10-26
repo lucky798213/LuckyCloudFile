@@ -510,6 +510,13 @@ func handleFileError(c *gin.Context, err error, notFoundCode, notFoundMessage st
 			Code:    "invalid_move",
 			Message: "a directory cannot be moved into itself or its descendants",
 		})
+	case errors.Is(err, file.ErrQuotaExceeded):
+		// 507 Insufficient Storage：请求本身合法，但用户剩余配额不够。
+		// 上传会话创建、旧上传发布、复制都走同一份映射。
+		c.JSON(http.StatusInsufficientStorage, ErrorResponse{
+			Code:    "insufficient_storage",
+			Message: "not enough storage quota remains",
+		})
 	default:
 		return false
 	}

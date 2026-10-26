@@ -492,15 +492,23 @@ func TestInvalidateUnfinishedUploadsReturnsUpdateError(t *testing.T) {
 	})
 
 	err := env.service.InvalidateUnfinishedUploads(ctx, 2)
-	if err == nil || !strings.Contains(err.Error(), "mark unfinished upload sessions expired") {
+	if err == nil || !strings.Contains(err.Error(), "mark unfinished upload session expired") {
 		t.Fatalf("update failure = %v, want a wrapped update error", err)
 	}
 
-	// 整批事务回滚：不能出现“前几条已 expired、后面的没处理”的部分结果。
+	// 启动恢复现在是逐会话事务：失败的那一条必须整体回滚，
+	// 不能出现“会话已 expired、预留还没释放”或相反的半截状态。
 	for _, id := range ids {
-		if got := loadSessionOnly(t, env, id); got.Status != model.UploadStatusPending {
+		got := loadSessionOnly(t, env, id)
+		if got.Status != model.UploadStatusPending {
 			t.Fatalf("session %s status after failed recovery = %q, want pending", id, got.Status)
 		}
+		if got.ReservedBytes != 3 {
+			t.Fatalf("session %s reserved_bytes after failed recovery = %d, want 3", id, got.ReservedBytes)
+		}
+	}
+	if got := userAccounting(t, env.db, env.ownerA.ID); got.ReservedBytes != 6 {
+		t.Fatalf("reserved bytes after failed recovery = %d, want 6", got.ReservedBytes)
 	}
 
 	// 故障移除后重试成功，说明失败没有让游标或状态提前推进。
@@ -509,9 +517,16 @@ func TestInvalidateUnfinishedUploadsReturnsUpdateError(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range ids {
-		if got := loadSessionOnly(t, env, id); got.Status != model.UploadStatusExpired {
+		got := loadSessionOnly(t, env, id)
+		if got.Status != model.UploadStatusExpired {
 			t.Fatalf("session %s status after retry = %q, want expired", id, got.Status)
 		}
+		if got.ReservedBytes != 0 {
+			t.Fatalf("session %s reserved_bytes after retry = %d, want 0", id, got.ReservedBytes)
+		}
+	}
+	if got := userAccounting(t, env.db, env.ownerA.ID); got.ReservedBytes != 0 {
+		t.Fatalf("reserved bytes after retry = %d, want 0", got.ReservedBytes)
 	}
 }
 

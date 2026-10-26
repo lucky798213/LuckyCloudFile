@@ -128,6 +128,12 @@ func runMigrations(ctx context.Context, db *gorm.DB) error {
 	if err := migrateDirectoryTree(db); err != nil {
 		return fmt.Errorf("migrate directory tree: %w", err)
 	}
+
+	// 一次性回填容量账目。必须放在目录树迁移之后：回填按逻辑 File 统计，
+	// 需要 files.kind 和 files.entity_id 已经是最终结构。
+	if err := migrateQuotaAccounting(db); err != nil {
+		return fmt.Errorf("migrate quota accounting: %w", err)
+	}
 	return nil
 }
 

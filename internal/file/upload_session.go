@@ -10,6 +10,7 @@ import (
 
 	"luckyCloudFile/internal/idgen"
 	"luckyCloudFile/internal/model"
+	"luckyCloudFile/internal/quota"
 )
 
 // UploadSessionTTL 是上传会话的固定有效期。
@@ -51,9 +52,15 @@ type UploadSessionInfo struct {
 //  2. 校验目标目录（为空时解析成当前用户根目录）；
 //  3. 读取一次用户默认存储策略，确认驱动已注册；
 //  4. 生成会话 ID 和占位内容的 storage key；
-//  5. 在一个事务里重新检查目录，写入占位 Entity 和 UploadSession。
+//  5. 在一个事务里：锁用户 → 原子预留容量 → 重新检查目录
+//     → 写入占位 Entity 和 UploadSession。
 //
-// 两条记录必须一起成功：会话插入失败时，占位 Entity 会随事务回滚。
+// 预留、占位记录和会话必须一起成功：预留用的是一条受条件约束的
+// UPDATE（见 internal/quota.Reserve），不是“先查剩余再无条件扣减”。
+// 剩余容量不足时返回 ErrQuotaExceeded；后面任何一步失败都会让整个事务回滚，
+// 预留和占位 Entity 一起撤销。
+//
+// 空文件（size=0）不占容量，也不能因为 UPDATE 影响零行而被误判成容量不足。
 func (s *Service) CreateUploadSession(
 	ctx context.Context,
 	ownerID int,
@@ -93,17 +100,30 @@ func (s *Service) CreateUploadSession(
 	}
 
 	session := model.UploadSession{
-		ID:           sessionID,
-		OwnerID:      ownerID,
-		ParentID:     parent.ID,
-		Name:         name,
-		ExpectedSize: size,
-		ActualSize:   0,
-		Status:       model.UploadStatusPending,
-		ExpiresAt:    time.Now().Add(UploadSessionTTL),
+		ID:            sessionID,
+		OwnerID:       ownerID,
+		ParentID:      parent.ID,
+		Name:          name,
+		ExpectedSize:  size,
+		ActualSize:    0,
+		ReservedBytes: size,
+		Status:        model.UploadStatusPending,
+		ExpiresAt:     time.Now().Add(UploadSessionTTL),
 	}
 
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 容量事务固定先锁用户，再创建占位 Entity 和 Session。
+		// 这样两个并发会话会在用户行上排队，后到的那个能看到前一个的预留量。
+		if _, err := quota.LockUser(tx, ownerID); err != nil {
+			return err
+		}
+
+		// 原子预留：剩余容量不足时这里返回 ErrQuotaExceeded，
+		// 后面的占位实体和会话都不会被创建。
+		if err := quota.Reserve(tx, ownerID, size); err != nil {
+			return err
+		}
+
 		// 接收期间目录可能被删除或换到别人名下，事务内必须重新核对。
 		if _, err := queryDirectory(ctx, tx, ownerID, parent.ID); err != nil {
 			return err

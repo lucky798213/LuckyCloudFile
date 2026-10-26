@@ -6,7 +6,6 @@ import (
 	"fmt"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"luckyCloudFile/internal/model"
 )
@@ -30,10 +29,14 @@ var ErrUploadSessionCompleted = errors.New("upload session already completed")
 // 改成 canceled。过期有自己的扫描入口，见 ExpireUploadSessions。
 //
 // 顺序：
-//  1. 在短事务里锁住会话，只把未完成状态改成 canceled；
+//  1. 在短事务里先锁用户、再锁会话，把未完成状态改成 canceled；
+//     同一个事务里按 Session.ReservedBytes 释放预留并清零；
 //  2. 提交事务，先切断“再发布文件”的可能；
 //  3. 通知活跃上传停止；
 //  4. 确认没有活跃写入后，尝试把占位 Entity 移交给清理。
+//
+// 释放容量不能放到事务提交之后：否则中途崩溃会留下永久占用的预留。
+// 重复取消时 Session.ReservedBytes 已经是 0，不会再次扣减。
 //
 // 不持有数据库事务等待上传停止。active upload 如果还在运行，
 // 它退出时会再次调用 handoffTerminatedSession 完成清理。
@@ -49,18 +52,12 @@ func (s *Service) CancelUploadSession(
 
 	var info UploadSessionInfo
 	err := s.db.WithContext(opCtx).Transaction(func(tx *gorm.DB) error {
-		// 先锁会话。取消和完成争的是同一行：
+		// 取消和完成争的是同一行，也必须遵守同一个加锁顺序：User → Session。
 		// 完成先提交 → 这里看到 completed，返回冲突；
 		// 取消先提交 → 完成接口看到 canceled，不能再发布。
-		var session model.UploadSession
-		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ? AND owner_id = ?", sessionID, ownerID).
-			First(&session).Error
+		session, err := lockUserAndUploadSession(opCtx, tx, ownerID, sessionID)
 		if err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrUploadSessionNotFound
-			}
-			return fmt.Errorf("lock upload session for cancellation: %w", err)
+			return err
 		}
 
 		switch session.Status {
@@ -70,12 +67,32 @@ func (s *Service) CancelUploadSession(
 		case model.UploadStatusCanceled, model.UploadStatusExpired:
 			// 两者都是终态：取消不能把 expired 改写成 canceled，
 			// 否则就丢失了“这次结束是因为到期”的语义。
+			// 正常路径上预留早就在进入终态时释放过了；这里仍然按会话上
+			// 持久化的预留量收尾一次，重复调用不会重复扣减。
+			released, err := releaseUploadReservation(tx, session)
+			if err != nil {
+				return err
+			}
+			if released > 0 {
+				if err := tx.Model(&model.UploadSession{}).
+					Where("id = ? AND owner_id = ?", session.ID, ownerID).
+					UpdateColumn("reserved_bytes", 0).Error; err != nil {
+					return fmt.Errorf("clear upload session reservation: %w", err)
+				}
+			}
 			// 保持原状态，下面仍然尝试推进残留内容的清理。
 		default:
 			// pending / receiving / ready → canceled。
+			// 状态变更和容量释放在同一个事务里提交。
+			if _, err := releaseUploadReservation(tx, session); err != nil {
+				return err
+			}
 			updated := tx.Model(&model.UploadSession{}).
 				Where("id = ? AND owner_id = ?", session.ID, ownerID).
-				UpdateColumn("status", model.UploadStatusCanceled)
+				UpdateColumns(map[string]any{
+					"status":         model.UploadStatusCanceled,
+					"reserved_bytes": 0,
+				})
 			if updated.Error != nil {
 				return fmt.Errorf("cancel upload session: %w", updated.Error)
 			}
@@ -88,7 +105,7 @@ func (s *Service) CancelUploadSession(
 			session.Status = model.UploadStatusCanceled
 		}
 
-		info = toUploadSessionInfo(session)
+		info = toUploadSessionInfo(*session)
 		return nil
 	})
 	if err != nil {

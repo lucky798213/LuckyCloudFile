@@ -20,6 +20,7 @@ import (
 
 	"luckyCloudFile/internal/idgen"
 	"luckyCloudFile/internal/model"
+	"luckyCloudFile/internal/quota"
 	"luckyCloudFile/internal/storage"
 )
 
@@ -68,6 +69,10 @@ var (
 
 	// ErrInvalidMove 表示把目录移动到自身或自己的后代，会让目录树成环。
 	ErrInvalidMove = errors.New("cannot move a directory into itself or its descendants")
+
+	// ErrQuotaExceeded 表示用户的逻辑容量已经不足，本次发布/预留必须整体回滚。
+	// 它来自 internal/quota，HTTP 层映射成 507 insufficient_storage。
+	ErrQuotaExceeded = quota.ErrExceeded
 )
 
 // File 是返回给 HTTP 层的节点信息（不包含数据库内部字段）。
@@ -135,7 +140,10 @@ func (s *Service) WithLogger(logger *slog.Logger) *Service {
 //  1. 先确认父目录存在、属于当前用户、而且真的是目录
 //  2. 生成两个随机 ID：File 的公开 ID、Entity 的存储 key
 //  3. 通过 Store 保存内容（具体怎么写由存储实现决定）
-//  4. 再开一个短事务：重新核对父目录 → 写 Entity 和 File
+//  4. 再开一个短事务：重新核对父目录 → 检查并增加已用容量 → 写 Entity 和 File
+//
+// 容量不足时第 4 步返回 ErrQuotaExceeded，已经落盘的内容会被补偿删除：
+// 旧上传没有提前预留的体验，但最终发布不能绕过配额检查。
 //
 // 为什么不把整个上传包在事务里？因为 32 MiB 可能要传几十秒，
 // 一直占着数据库事务会拖住其他请求。
@@ -238,9 +246,22 @@ func (s *Service) uploadStore(ctx context.Context, ownerID int) (int, storage.St
 //
 // 事务里会重新核对一次父目录：接收文件的过程中，目录可能已经被删掉，
 // 或者被换到了别人名下。
+//
+// 旧上传没有提前预留容量，但发布同样不能绕过配额：这里先锁住用户行，
+// 再用一条受条件约束的 UPDATE 把实际大小加进 used_bytes。容量不足时
+// 整个事务回滚，调用方会删除已经落盘的内容（见 Upload 的补偿删除）。
+// 加锁顺序和所有容量事务一致：User → Entity → File。
 func (s *Service) saveRecords(ctx context.Context, ownerID int, parentID, fileID, storageKey string, policyID int, name string, size int64) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := quota.LockUser(tx, ownerID); err != nil {
+			return err
+		}
 		if _, err := queryDirectory(ctx, tx, ownerID, parentID); err != nil {
+			return err
+		}
+
+		// 用实际写入的大小计费，不信任客户端声明的任何值。
+		if err := quota.Consume(tx, ownerID, size); err != nil {
 			return err
 		}
 
@@ -281,7 +302,10 @@ func (s *Service) saveRecords(ctx context.Context, ownerID int, parentID, fileID
 // 复制不搬字节：新 File 直接指向源文件原来的 Entity，再把 Entity 的引用数加一。
 // 所以磁盘上只有一份内容，删除源文件或副本时只要还有另一份引用，内容就不会被清理。
 //
-// 加锁顺序和 Delete 一致：先锁源 File，再锁 Entity。这样复制和删除同一份文件时
+// 计费按逻辑文件算：副本仍然再占一份文件大小，即使和源文件共用 Entity。
+// 因此在同一个事务里先锁用户、检查剩余容量并把一份大小加进 used_bytes。
+//
+// 加锁顺序：User → 源 File → Entity。这样复制和删除同一份文件时
 // 不会互相等待成环，也不会出现“刚复制完，Entity 已被标记为待删除”的中间状态。
 func (s *Service) Copy(ctx context.Context, ownerID int, id, parentID, name string) (File, error) {
 	if err := validateName(name); err != nil {
@@ -302,6 +326,10 @@ func (s *Service) Copy(ctx context.Context, ownerID int, id, parentID, name stri
 
 	var copied model.File
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 容量事务固定先锁用户，再锁 File/Entity。
+		if _, err := quota.LockUser(tx, ownerID); err != nil {
+			return err
+		}
 		source, err := lockOwnedFile(ctx, tx, ownerID, id)
 		if err != nil {
 			return err
@@ -330,6 +358,12 @@ func (s *Service) Copy(ctx context.Context, ownerID int, id, parentID, name stri
 		// 事务内重新核对目标目录：它必须仍然属于当前用户、而且仍然是目录。
 		target, err := queryDirectory(ctx, tx, ownerID, parent.ID)
 		if err != nil {
+			return err
+		}
+
+		// 复制出的逻辑文件要再占一份容量。容量不足时整个事务回滚：
+		// 不会创建 File，也不会把源 Entity 的引用数加一。
+		if err := quota.Consume(tx, ownerID, entity.Size); err != nil {
 			return err
 		}
 
@@ -705,20 +739,27 @@ func (s *Service) Open(ctx context.Context, ownerID int, id string) (File, io.Re
 // 文件删除分两段：先在事务里只改逻辑关系，提交成功后再尝试清理磁盘。
 //
 //	BEGIN
-//	  SELECT files   ... FOR UPDATE   (id + owner_id)
+//	  SELECT users    ... FOR UPDATE   (id)
+//	  SELECT files    ... FOR UPDATE   (id + owner_id)
 //	  SELECT entities ... FOR UPDATE
 //	  DELETE files WHERE id = ...
 //	  UPDATE entities SET ref_count = ref_count - 1 WHERE id = ... AND ref_count > 0
+//	  UPDATE users SET used_bytes = used_bytes - entity.size
 //	  ref_count == 0 → status = pending_delete
 //	COMMIT
 //	  → 立即尝试一次物理清理；失败只记日志，不回滚已经提交的逻辑删除
 //
-// 为什么先锁 File 再锁 Entity：这是所有事务统一的加锁顺序
-// （Copy 也遵守：先锁源 File、再锁 Entity），
-// 否则两个事务可能一个先锁 File、另一个先锁 Entity，互相等待成环。
+// 容量按逻辑文件计费：删掉一份 File 就释放一份大小，即使 Entity 还有别的引用，
+// 也即使物理内容还没删。释放和删除记录在同一个事务里，不会出现
+// “文件没了、用量还占着”或“用量减了、文件还在”的窗口。
+//
+// 为什么先锁 User、再锁 File、最后锁 Entity：这是所有容量事务统一的加锁顺序
+// （Copy 和上传会话也遵守：User → File/Session → Entity），
+// 否则两个事务可能一个先锁 File、另一个先锁 User，互相等待成环。
 //
 // 为什么不在事务里删磁盘：磁盘操作可能很慢，未来换成 S3 更慢。
-// 事务只保护“引用计数 + 逻辑记录”这一小段，物理清理交给 cleanup.go。
+// 事务只保护“引用计数 + 逻辑记录 + 容量”这一小段，物理清理交给 cleanup.go。
+// 物理清理本身不再改动容量：预留/已用早在逻辑删除时就已经处理完了。
 //
 // 空目录检查也在同一个事务里：父目录行已经被 FOR UPDATE 锁住，
 // 并发的上传会等这个事务结束，不会出现“检查时是空的、删完又多出孩子”的情况。
@@ -726,6 +767,10 @@ func (s *Service) Delete(ctx context.Context, ownerID int, id string) error {
 	var pendingEntityID int64
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 容量事务固定先锁用户行，再锁 File/Entity。
+		if _, err := quota.LockUser(tx, ownerID); err != nil {
+			return err
+		}
 		record, err := lockOwnedFile(ctx, tx, ownerID, id)
 		if err != nil {
 			return err
@@ -786,6 +831,12 @@ func (s *Service) Delete(ctx context.Context, ownerID int, id string) error {
 				"decrement ref count of entity %d: expected 1 row affected, got %d",
 				entity.ID, decremented.RowsAffected,
 			)
+		}
+
+		// 释放这一份逻辑文件的用量。是否还有别的 File 引用同一个 Entity
+		// 与计费无关：逻辑用量按 File 计，删一份就释放一份。
+		if err := quota.ReleaseUsed(tx, ownerID, entity.Size); err != nil {
+			return err
 		}
 
 		// 还有其他 File 引用这份内容：保持 active，不碰磁盘。

@@ -11,6 +11,7 @@ import (
 
 	"luckyCloudFile/internal/idgen"
 	"luckyCloudFile/internal/model"
+	"luckyCloudFile/internal/quota"
 )
 
 var (
@@ -22,6 +23,9 @@ var (
 
 	// ErrEmptyPassword 表示没有提供密码。
 	ErrEmptyPassword = errors.New("password must not be empty")
+
+	// ErrNegativeQuota 表示初始化命令给了负数配额，无法落库。
+	ErrNegativeQuota = errors.New("quota bytes must not be negative")
 )
 
 // CreateUser 创建账号，只保存 bcrypt 哈希。
@@ -29,15 +33,32 @@ var (
 // 它不会更新已有账号：用户名重复时返回 ErrUserExists，密码保持不变。
 // 本阶段不开放 HTTP 注册，只有开发初始化命令会调用它。
 //
-// 账号和根目录必须一起成功：客户端不传 parent_id 时，业务层要靠
-// users.root_file_id 找到起点。所以两步放在同一个事务里。
+// 配额由服务端设置，取 quota.DefaultBytes；客户端没有机会指定。
+// 0 表示没有可用容量，所以这里绝不能把“没设置”落成 0。
+//
+// 账号、根目录和初始容量必须一起成功：客户端不传 parent_id 时，业务层要靠
+// users.root_file_id 找到起点。所以几步放在同一个事务里。
 func CreateUser(ctx context.Context, db *gorm.DB, username, password string) (*model.User, error) {
+	return CreateUserWithQuota(ctx, db, username, password, quota.DefaultBytes)
+}
+
+// CreateUserWithQuota 和 CreateUser 一样，但由调用方指定初始配额。
+// 只给需要显式准备测试账号/开发账号的管理命令使用，不接外部请求。
+func CreateUserWithQuota(
+	ctx context.Context,
+	db *gorm.DB,
+	username, password string,
+	quotaBytes int64,
+) (*model.User, error) {
 	username = strings.TrimSpace(username)
 	if username == "" {
 		return nil, ErrEmptyUsername
 	}
 	if password == "" {
 		return nil, ErrEmptyPassword
+	}
+	if quotaBytes < 0 {
+		return nil, ErrNegativeQuota
 	}
 
 	// 先查一次：用户名已存在是预期内的结果，不该变成一条数据库错误日志。
@@ -71,6 +92,8 @@ func CreateUser(ctx context.Context, db *gorm.DB, username, password string) (*m
 		PasswordHash: string(hash),
 		// 新账号的上传位置由服务端指定，不存在“客户端选择”这一步。
 		DefaultStoragePolicyID: policyID,
+		// 容量同样由服务端决定：0 表示没有可用容量，不能当“没设置”。
+		QuotaBytes: quotaBytes,
 	}
 	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Create 会把自增 ID 回填到 user.ID。

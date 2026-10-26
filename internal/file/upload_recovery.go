@@ -2,15 +2,18 @@ package file
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"gorm.io/gorm"
 
 	"luckyCloudFile/internal/model"
+	"luckyCloudFile/internal/upload"
 )
 
 // DefaultRecoveryBatchSize 是启动恢复一条 SELECT 最多取多少条未完成会话。
-// 和清理器用同一个默认值：批次只决定一次事务涉及多少行，不改变最终结果。
+// 和清理器用同一个默认值：批次只决定一次查询取多少条候选，
+// 每条会话仍然各自开一个事务，不改变最终结果。
 const DefaultRecoveryBatchSize = DefaultCleanupBatchSize
 
 // InvalidateUnfinishedUploads 作废上一次进程留下的所有未完成上传会话。
@@ -27,10 +30,15 @@ const DefaultRecoveryBatchSize = DefaultCleanupBatchSize
 // 这里刻意不加 “expires_at <= now”：需要作废的是重启前的全部未完成会话。
 // 重复执行是幂等的：第二轮查询不会再选中已经变成 expired 的记录。
 //
-// 本方法只改数据库状态，不删除磁盘内容、Entity 或 Session：
+// 每条会话单独开一个短事务，而不是只做一次批量 UPDATE：进入终态必须和
+// 释放预留一起提交。事务里先锁用户、再锁会话，按会话上持久化的
+// ReservedBytes 释放并清零；批量更新无法逐条知道该释放多少，会让预留永久占用。
+// 单条失败时直接返回错误（调用方会终止启动），游标不推进，避免跳过没作废的会话。
+//
+// 本方法只改数据库状态和容量账目，不删除磁盘内容、Entity 或 Session：
 // 会话变成 expired 后，现有清理链（CleanupPending → resumeTerminatedSessions）
 // 会把它当作普通终态会话回收。启动只需要等“资格切断”完成，不需要等物理删除；
-// 删除失败会保留记录，由下一轮清理重试。
+// 删除失败会保留记录，由下一轮清理重试，且不会再改动容量。
 //
 // 它必须在服务开始接受 HTTP 请求之前同步执行，而且失败必须终止启动：
 // 如果只记日志继续启动，没被作废的旧会话仍然可以上传和发布。
@@ -55,7 +63,7 @@ func (s *Service) InvalidateUnfinishedUploads(ctx context.Context, batchSize int
 		// 所以已经处理过的批次不会再次出现。
 		var candidates []model.UploadSession
 		err := s.db.WithContext(ctx).
-			Select("id").
+			Select("id", "owner_id").
 			Where("status IN ? AND id > ?", unfinishedUploadStatuses, cursor).
 			Order("id ASC").
 			Limit(batchSize).
@@ -70,32 +78,81 @@ func (s *Service) InvalidateUnfinishedUploads(ctx context.Context, batchSize int
 			return nil
 		}
 
-		ids := make([]string, len(candidates))
-		for i, candidate := range candidates {
-			ids[i] = candidate.ID
+		for _, candidate := range candidates {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+
+			// 只有事务提交成功才推进游标：失败时必须返回错误终止启动，
+			// 而不是跳过这条没作废的会话继续跑。
+			updated, err := s.invalidateUnfinishedUploadSession(
+				ctx, candidate.OwnerID, candidate.ID,
+			)
+			if err != nil {
+				return err
+			}
+			cursor = candidate.ID
+			if updated {
+				invalidated++
+			}
+		}
+	}
+}
+
+// invalidateUnfinishedUploadSession 在事务里作废一条重启前的未完成会话。
+//
+// 返回 true 表示本次真的把会话改成了 expired。已经完成或已经终态的会话
+// 保持原样并返回 false。
+func (s *Service) invalidateUnfinishedUploadSession(
+	ctx context.Context,
+	ownerID int,
+	sessionID string,
+) (bool, error) {
+	invalidated := false
+
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 加锁顺序固定为 User → Session；释放预留和写终态在同一个事务里。
+		session, err := lockUserAndUploadSession(ctx, tx, ownerID, sessionID)
+		if err != nil {
+			if errors.Is(err, ErrUploadSessionNotFound) {
+				// 候选查询之后会话被删掉了，没有需要作废的内容。
+				return nil
+			}
+			return fmt.Errorf("lock unfinished upload session: %w", err)
 		}
 
-		// 一批一个短事务，提交后才推进游标：回滚时必须保持游标不动，
-		// 让调用方看到错误并终止启动，而不是跳过没作废的会话继续跑。
-		var affected int64
-		err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			// 状态条件仍然写在 UPDATE 里：候选查询和更新之间会话可能被
-			// 并发完成，completed 绝不能被这条语句改成 expired。
-			updated := tx.Model(&model.UploadSession{}).
-				Where("id IN ? AND status IN ?", ids, unfinishedUploadStatuses).
-				UpdateColumn("status", model.UploadStatusExpired)
-			if updated.Error != nil {
-				return fmt.Errorf("mark unfinished upload sessions expired: %w", updated.Error)
-			}
-			affected = updated.RowsAffected
+		// 状态条件仍然要检查：候选查询和加锁之间会话可能被并发完成，
+		// completed 绝不能被启动恢复改成 expired。
+		if !upload.CanTransition(session.Status, model.UploadStatusExpired) {
 			return nil
-		})
-		if err != nil {
+		}
+
+		if _, err := releaseUploadReservation(tx, session); err != nil {
 			return err
 		}
 
-		// 事务已经提交：本批再也不会被重复处理，游标可以向前推进。
-		cursor = candidates[len(candidates)-1].ID
-		invalidated += affected
+		updated := tx.Model(&model.UploadSession{}).
+			Where("id = ? AND owner_id = ? AND status IN ?",
+				session.ID, ownerID, unfinishedUploadStatuses).
+			UpdateColumns(map[string]any{
+				"status":         model.UploadStatusExpired,
+				"reserved_bytes": 0,
+			})
+		if updated.Error != nil {
+			return fmt.Errorf("mark unfinished upload session expired: %w", updated.Error)
+		}
+		if updated.RowsAffected != 1 {
+			return fmt.Errorf(
+				"invalidate upload session %s: expected 1 row affected, got %d",
+				session.ID, updated.RowsAffected,
+			)
+		}
+
+		invalidated = true
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
+	return invalidated, nil
 }

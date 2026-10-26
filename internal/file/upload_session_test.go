@@ -260,6 +260,10 @@ func TestCreateUploadSessionRollsBackPlaceholderOnSessionFailure(t *testing.T) {
 	if entries := diskEntries(t, env.rootA); len(entries) != 0 {
 		t.Fatalf("failed create wrote content to disk: %v", entries)
 	}
+	// 容量预留也是同一个事务的一部分：会话插入失败时不能留下预留。
+	if got := userAccounting(t, env.db, env.ownerA.ID); got.ReservedBytes != 0 {
+		t.Fatalf("failed create left %d reserved bytes", got.ReservedBytes)
+	}
 }
 
 // TestGetUploadSessionOwnerIsolation 验证查询必须同时匹配 owner ID，

@@ -65,6 +65,19 @@ type User struct {
 	// 上传时读取一次，写入新 Entity，之后不再跟随用户默认值变化。
 	DefaultStoragePolicyID int `gorm:"not null;index"`
 
+	// 逻辑容量账目，规则见 internal/quota。
+	//
+	//	QuotaBytes    总配额。0 表示没有可用容量，不表示无限。
+	//	UsedBytes     已经发布、仍然存在的逻辑文件大小之和。
+	//	ReservedBytes 未完成上传会话预留的大小之和。
+	//
+	// 任何时刻都必须满足 UsedBytes >= 0、ReservedBytes >= 0、
+	// UsedBytes+ReservedBytes <= QuotaBytes。三个字段只能由
+	// internal/quota 在持有用户行锁的事务里修改。
+	QuotaBytes    int64 `gorm:"not null;default:0"`
+	UsedBytes     int64 `gorm:"not null;default:0"`
+	ReservedBytes int64 `gorm:"not null;default:0"`
+
 	// 只读关联。删除仍被账号引用的策略会被数据库拒绝（RESTRICT）。
 	DefaultStoragePolicy *StoragePolicy `gorm:"foreignKey:DefaultStoragePolicyID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
 }
@@ -223,6 +236,14 @@ type UploadSession struct {
 	// 状态变成 ready 时，两者必须相等（由业务层检查）。
 	ExpectedSize int64 `gorm:"not null"`
 	ActualSize   int64 `gorm:"not null"`
+
+	// 本会话还没有结算或释放的预留量。
+	//
+	// 它是释放容量的唯一依据：取消、过期、重启失效时按这个字段的值
+	// 从 users.reserved_bytes 里扣除，扣完清零。绝不能按 ExpectedSize
+	// 重新扣一遍——会话可能已经被结算或释放过，那样会重复扣减。
+	// 空文件会话的预留量是 0。
+	ReservedBytes int64 `gorm:"not null;default:0"`
 
 	// 会话状态，取值见上面的 UploadStatus* 常量。
 	Status string `gorm:"type:varchar(16);not null;default:pending;index:idx_upload_sessions_owner_status,priority:2"`
