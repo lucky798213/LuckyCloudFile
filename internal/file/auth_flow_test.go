@@ -109,6 +109,7 @@ func TestAuthenticationAndFileIsolation(t *testing.T) {
 		newUploadRequest(t, "", []byte("anonymous")),
 		httptest.NewRequest(http.MethodGet, "/api/files/any-id", nil),
 		httptest.NewRequest(http.MethodDelete, "/api/files/any-id", nil),
+		httptest.NewRequest(http.MethodPost, "/api/files/any-id/copy", strings.NewReader(`{"name":"copy.txt"}`)),
 	}
 	for _, req := range notLoggedIn {
 		recorder := serve(t, router, req)
@@ -511,7 +512,71 @@ func TestDirectoryFlowOverHTTP(t *testing.T) {
 		t.Fatalf("delete directory: wanted 400, got %d", remove.Code)
 	}
 
-	// 6. B 不能往 A 的目录里传文件，也看不到 A 的目录内容。
+	// 6. 复制：新 File 复用源内容的 Entity，源文件仍然存在。
+	copyPayload, err := json.Marshal(map[string]string{
+		"parent_id": dir.ID,
+		"name":      "笔记-副本.txt",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyReq := httptest.NewRequest(http.MethodPost, "/api/files/"+note.ID+"/copy", bytes.NewReader(copyPayload))
+	copyReq.Header.Set("Content-Type", "application/json")
+	copied := serve(t, router, authorize(copyReq, tokenA))
+	if copied.Code != http.StatusCreated {
+		t.Fatalf("copy file: wanted 201, got %d: %s", copied.Code, copied.Body.String())
+	}
+	var copyRecord cloudfile.File
+	if err := json.Unmarshal(copied.Body.Bytes(), &copyRecord); err != nil {
+		t.Fatal(err)
+	}
+	if copyRecord.ID == note.ID || copyRecord.Name != "笔记-副本.txt" ||
+		copyRecord.Size != note.Size || copyRecord.ParentID == nil || *copyRecord.ParentID != dir.ID {
+		t.Fatalf("unexpected copy response: %+v", copyRecord)
+	}
+
+	// 两条 File 记录共享同一个 Entity：ref_count = 2，磁盘上仍只有一份内容。
+	var shared model.Entity
+	if err := client.WithContext(ctx).First(&shared).Error; err != nil {
+		t.Fatal(err)
+	}
+	if shared.RefCount != 2 || shared.Status != model.EntityStatusActive {
+		t.Fatalf("shared entity = %+v, want ref_count 2 and status active", shared)
+	}
+
+	// 副本可以下载，内容和源文件一致。
+	copyDownload := serve(t, router,
+		authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+copyRecord.ID, nil), tokenA))
+	if copyDownload.Code != http.StatusOK || copyDownload.Body.String() != "hello" {
+		t.Fatalf("download copy: status=%d body=%q", copyDownload.Code, copyDownload.Body.String())
+	}
+
+	// 同一目录下再次复制成同名：409。
+	duplicateCopy := serve(t, router, authorize(
+		httptest.NewRequest(http.MethodPost, "/api/files/"+note.ID+"/copy", bytes.NewReader(copyPayload)),
+		tokenA,
+	))
+	if duplicateCopy.Code != http.StatusConflict {
+		t.Fatalf("duplicate copy: wanted 409, got %d: %s", duplicateCopy.Code, duplicateCopy.Body.String())
+	}
+
+	// B 拿着 A 的文件 ID 复制：404，不会产生新 File。
+	stealPayload, err := json.Marshal(map[string]string{"parent_id": dir.ID, "name": "stolen.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	steal := serve(t, router, authorize(
+		httptest.NewRequest(http.MethodPost, "/api/files/"+note.ID+"/copy", bytes.NewReader(stealPayload)),
+		tokenB,
+	))
+	if steal.Code != http.StatusNotFound {
+		t.Fatalf("B copy A's file: wanted 404, got %d: %s", steal.Code, steal.Body.String())
+	}
+	if count := countWhere(t, client, &model.File{}, "kind = ?", model.KindFile); count != 2 {
+		t.Fatalf("wanted exactly 2 logical files after copy tests, got %d", count)
+	}
+
+	// 7. B 不能往 A 的目录里传文件，也看不到 A 的目录内容。
 	intruder := newUploadRequest(t, tokenB, []byte("intrusion"))
 	query = intruder.URL.Query()
 	query.Set("parent_id", dir.ID)

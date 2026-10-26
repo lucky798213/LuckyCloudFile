@@ -212,6 +212,38 @@ func (f *fakeFileService) Delete(ctx context.Context, ownerID int, id string) er
 	return nil
 }
 
+// Copy 模拟复用同一份内容：新记录复制源文件的 size，内容按值拷贝一份，
+// 这样删除源文件不会影响副本。
+func (f *fakeFileService) Copy(ctx context.Context, ownerID int, id, parentID, name string) (file.File, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	source, ok := f.records[id]
+	if !ok || f.owners[id] != ownerID {
+		return file.File{}, file.ErrNotFound
+	}
+	if source.Kind != model.KindFile {
+		return file.File{}, file.ErrIsDirectory
+	}
+	if err := f.checkParent(ownerID, parentID); err != nil {
+		return file.File{}, err
+	}
+	if f.nameTaken(ownerID, parentID, name) {
+		return file.File{}, file.ErrAlreadyExists
+	}
+
+	f.nextID++
+	newID := fmt.Sprintf("fake-%d", f.nextID)
+	record := file.File{ID: newID, Name: name, Size: source.Size, Kind: model.KindFile}
+	if parentID != "" {
+		record.ParentID = &parentID
+	}
+	f.records[newID] = record
+	f.contents[newID] = append([]byte(nil), f.contents[id]...)
+	f.owners[newID] = ownerID
+	return record, nil
+}
+
 func (f *fakeFileService) stored(id string) ([]byte, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -602,6 +634,7 @@ func TestFileEndpointsRequireLogin(t *testing.T) {
 		httptest.NewRequest(http.MethodGet, "/api/files/whatever", nil),
 		httptest.NewRequest(http.MethodDelete, "/api/files/whatever", nil),
 		httptest.NewRequest(http.MethodPost, "/api/directories", strings.NewReader(`{"name":"docs"}`)),
+		newCopyRequest(t, testTokenA, "whatever", "", "copy.txt"),
 	}
 	for _, req := range requests {
 		// uploadRequest 默认带 A 的 Token；这里统一去掉，验证未登录行为。
@@ -821,5 +854,171 @@ func TestUploadDuplicateName(t *testing.T) {
 	}
 	if code := errorCode(t, recorder); code != "already_exists" {
 		t.Fatalf("code = %q, want already_exists", code)
+	}
+}
+
+// newCopyRequest 构造 POST /api/files/:id/copy 请求。
+func newCopyRequest(t *testing.T, token, id, parentID, name string) *http.Request {
+	t.Helper()
+
+	payload, err := json.Marshal(copyFileRequest{ParentID: parentID, Name: name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/files/"+id+"/copy", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	return authorize(req, token)
+}
+
+// TestCopyFile 覆盖复制接口的闭环：
+// 上传 → 复制到另一个目录 → 源文件和副本都能下载 → 删掉源文件后副本内容还在。
+func TestCopyFile(t *testing.T) {
+	router, _ := newTestRouter(t)
+	content := []byte("copy me\n")
+	source := upload(t, router, content)
+	target := createDir(t, router, "", "备份资料")
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, newCopyRequest(t, testTokenA, source.ID, target.ID, "笔记-副本.txt"))
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("wanted 201, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var copied file.File
+	if err := json.Unmarshal(recorder.Body.Bytes(), &copied); err != nil {
+		t.Fatal(err)
+	}
+	if copied.ID == source.ID || copied.ID == "" {
+		t.Fatalf("copy must get its own id, got %q (source %q)", copied.ID, source.ID)
+	}
+	if copied.Name != "笔记-副本.txt" || copied.Size != source.Size || copied.Kind != model.KindFile {
+		t.Fatalf("unexpected copy: %+v", copied)
+	}
+	if copied.ParentID == nil || *copied.ParentID != target.ID {
+		t.Fatalf("copy parent = %v, want %q", copied.ParentID, target.ID)
+	}
+
+	// 源文件和副本都能读到原内容。
+	for _, id := range []string{source.ID, copied.ID} {
+		download := httptest.NewRecorder()
+		router.ServeHTTP(download, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+id, nil), testTokenA))
+		if download.Code != http.StatusOK {
+			t.Fatalf("download %s: wanted 200, got %d", id, download.Code)
+		}
+		if !bytes.Equal(download.Body.Bytes(), content) {
+			t.Fatalf("download %s: content = %q, want %q", id, download.Body.Bytes(), content)
+		}
+	}
+
+	// 删掉源文件后，副本仍然可以下载。
+	remove := httptest.NewRecorder()
+	router.ServeHTTP(remove, authorize(httptest.NewRequest(http.MethodDelete, "/api/files/"+source.ID, nil), testTokenA))
+	if remove.Code != http.StatusNoContent {
+		t.Fatalf("delete source: wanted 204, got %d", remove.Code)
+	}
+	after := httptest.NewRecorder()
+	router.ServeHTTP(after, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+copied.ID, nil), testTokenA))
+	if after.Code != http.StatusOK || !bytes.Equal(after.Body.Bytes(), content) {
+		t.Fatalf("copy was damaged by deleting source: status=%d body=%q", after.Code, after.Body.Bytes())
+	}
+}
+
+func TestCopyFileErrors(t *testing.T) {
+	router, _ := newTestRouter(t)
+	source := upload(t, router, []byte("x"))
+	target := createDir(t, router, "", "target")
+
+	// 同名副本：409 already_exists。
+	first := httptest.NewRecorder()
+	router.ServeHTTP(first, newCopyRequest(t, testTokenA, source.ID, target.ID, "same.txt"))
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first copy: wanted 201, got %d: %s", first.Code, first.Body.String())
+	}
+	duplicate := httptest.NewRecorder()
+	router.ServeHTTP(duplicate, newCopyRequest(t, testTokenA, source.ID, target.ID, "same.txt"))
+	if duplicate.Code != http.StatusConflict {
+		t.Fatalf("duplicate copy: wanted 409, got %d: %s", duplicate.Code, duplicate.Body.String())
+	}
+	if code := errorCode(t, duplicate); code != "already_exists" {
+		t.Fatalf("code = %q, want already_exists", code)
+	}
+
+	// 源文件不存在：404。
+	missing := httptest.NewRecorder()
+	router.ServeHTTP(missing, newCopyRequest(t, testTokenA, "does-not-exist", target.ID, "copy.txt"))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing source: wanted 404, got %d", missing.Code)
+	}
+	if code := errorCode(t, missing); code != "file_or_parent_not_found" {
+		t.Fatalf("code = %q, want file_or_parent_not_found", code)
+	}
+
+	// 目标目录不存在：404。
+	missingParent := httptest.NewRecorder()
+	router.ServeHTTP(missingParent, newCopyRequest(t, testTokenA, source.ID, "does-not-exist", "copy.txt"))
+	if missingParent.Code != http.StatusNotFound {
+		t.Fatalf("missing target: wanted 404, got %d", missingParent.Code)
+	}
+
+	// 目标 parent_id 指向普通文件：400 not_a_directory。
+	intoFile := httptest.NewRecorder()
+	router.ServeHTTP(intoFile, newCopyRequest(t, testTokenA, source.ID, source.ID, "copy.txt"))
+	if intoFile.Code != http.StatusBadRequest {
+		t.Fatalf("copy into a file: wanted 400, got %d: %s", intoFile.Code, intoFile.Body.String())
+	}
+	if code := errorCode(t, intoFile); code != "not_a_directory" {
+		t.Fatalf("code = %q, want not_a_directory", code)
+	}
+
+	// 复制目录：400 is_directory。
+	dirCopy := httptest.NewRecorder()
+	router.ServeHTTP(dirCopy, newCopyRequest(t, testTokenA, target.ID, target.ID, "dir-copy"))
+	if dirCopy.Code != http.StatusBadRequest {
+		t.Fatalf("copy directory: wanted 400, got %d: %s", dirCopy.Code, dirCopy.Body.String())
+	}
+	if code := errorCode(t, dirCopy); code != "is_directory" {
+		t.Fatalf("code = %q, want is_directory", code)
+	}
+}
+
+func TestCopyFileOwnershipIsolation(t *testing.T) {
+	router, _ := newTestRouter(t)
+	source := upload(t, router, []byte("secret"))
+	target := createDir(t, router, "", "target")
+
+	// B 拿着 A 的文件 ID 复制：表现为源文件不存在。
+	byB := httptest.NewRecorder()
+	router.ServeHTTP(byB, newCopyRequest(t, testTokenB, source.ID, target.ID, "stolen.txt"))
+	if byB.Code != http.StatusNotFound {
+		t.Fatalf("B copy A's file: wanted 404, got %d: %s", byB.Code, byB.Body.String())
+	}
+
+	// B 复制自己的文件到 A 的目录：表现为目标目录不存在。
+	breq := uploadRequest(t, "file", "b.txt", []byte("b"))
+	breq.Header.Set("Authorization", "Bearer "+testTokenB)
+	bup := httptest.NewRecorder()
+	router.ServeHTTP(bup, breq)
+	if bup.Code != http.StatusCreated {
+		t.Fatalf("B upload: wanted 201, got %d: %s", bup.Code, bup.Body.String())
+	}
+	var bfile file.File
+	if err := json.Unmarshal(bup.Body.Bytes(), &bfile); err != nil {
+		t.Fatal(err)
+	}
+	bToA := httptest.NewRecorder()
+	router.ServeHTTP(bToA, newCopyRequest(t, testTokenB, bfile.ID, target.ID, "hack.txt"))
+	if bToA.Code != http.StatusNotFound {
+		t.Fatalf("B copy into A's directory: wanted 404, got %d: %s", bToA.Code, bToA.Body.String())
+	}
+
+	// A 的根目录没有被 B 改动：仍然只有源文件和 target 目录。
+	list := listChildren(t, router, "", "1", "20")
+	if list.Total != 2 {
+		t.Fatalf("A's root was modified by B: %+v", list)
+	}
+	for _, item := range list.Items {
+		if item.Name == "stolen.txt" || item.Name == "hack.txt" {
+			t.Fatalf("B created an entry in A's tree: %+v", item)
+		}
 	}
 }

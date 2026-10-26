@@ -203,6 +203,105 @@ func (s *Service) saveRecords(ctx context.Context, ownerID int, parentID, fileID
 	})
 }
 
+// Copy 在 parentID（为空表示根目录）下创建 id 文件的一份副本，副本名为 name。
+//
+// 复制不搬字节：新 File 直接指向源文件原来的 Entity，再把 Entity 的引用数加一。
+// 所以磁盘上只有一份内容，删除源文件或副本时只要还有另一份引用，内容就不会被清理。
+//
+// 加锁顺序和 Delete 一致：先锁源 File，再锁 Entity。这样复制和删除同一份文件时
+// 不会互相等待成环，也不会出现“刚复制完，Entity 已被标记为待删除”的中间状态。
+func (s *Service) Copy(ctx context.Context, ownerID int, id, parentID, name string) (File, error) {
+	if err := validateName(name); err != nil {
+		return File{}, err
+	}
+
+	// 先在事务外查一次目标目录，快速拒绝明显不合法的请求。
+	// 事务里还会再查一次，防止校验之后目录被改动。
+	parent, err := s.requireDirectory(ctx, ownerID, parentID)
+	if err != nil {
+		return File{}, err
+	}
+
+	newID, err := idgen.New()
+	if err != nil {
+		return File{}, err
+	}
+
+	var copied model.File
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		source, err := lockOwnedFile(ctx, tx, ownerID, id)
+		if err != nil {
+			return err
+		}
+		if source.Kind != model.KindFile {
+			return ErrIsDirectory
+		}
+		if source.EntityID == nil {
+			return fmt.Errorf("file %s has no entity", id)
+		}
+
+		entity, err := lockEntity(ctx, tx, *source.EntityID)
+		if err != nil {
+			return err
+		}
+		// 源 File 仍然引用这个 Entity，正常数据里 ref_count 至少是 1。
+		// 状态不是 active 或引用数已经归零，都说明数据库已经不一致；
+		// 这时继续复制只会把错误放大，宁可回滚。
+		if entity.Status != model.EntityStatusActive || entity.RefCount <= 0 {
+			return fmt.Errorf(
+				"entity %d cannot be referenced: status=%q ref_count=%d",
+				entity.ID, entity.Status, entity.RefCount,
+			)
+		}
+
+		// 事务内重新核对目标目录：它必须仍然属于当前用户、而且仍然是目录。
+		target, err := queryDirectory(ctx, tx, ownerID, parent.ID)
+		if err != nil {
+			return err
+		}
+
+		record := model.File{
+			ID:       newID,
+			Name:     name,
+			Kind:     model.KindFile,
+			ParentID: &target.ID,
+			EntityID: &entity.ID,
+			OwnerID:  ownerID,
+		}
+		// (owner_id, parent_id, name) 唯一索引负责最终的同名检查。
+		// 重名时整个事务回滚，源 Entity 的引用数不会被加一。
+		if err := tx.Create(&record).Error; err != nil {
+			if errors.Is(err, gorm.ErrDuplicatedKey) {
+				return ErrAlreadyExists
+			}
+			return fmt.Errorf("create copied file: %w", err)
+		}
+
+		incremented := tx.WithContext(ctx).
+			Model(&model.Entity{}).
+			Where("id = ? AND status = ? AND ref_count > 0", entity.ID, model.EntityStatusActive).
+			UpdateColumn("ref_count", gorm.Expr("ref_count + 1"))
+		if incremented.Error != nil {
+			return fmt.Errorf("increment ref count: %w", incremented.Error)
+		}
+		if incremented.RowsAffected != 1 {
+			return fmt.Errorf(
+				"increment ref count of entity %d: expected 1 row affected, got %d",
+				entity.ID, incremented.RowsAffected,
+			)
+		}
+
+		// 返回值里带 Size：toFile 从关联的 Entity 读取大小。
+		record.Entity = entity
+		copied = record
+		return nil
+	})
+	if err != nil {
+		return File{}, err
+	}
+	return toFile(copied), nil
+}
+
 // CreateDirectory 在 parentID（为空表示根目录）下创建一个空目录。
 //
 // 目录只是 files 表里的一行：不写磁盘、不创建 Entity。
@@ -335,7 +434,7 @@ func (s *Service) Open(ctx context.Context, ownerID int, id string) (File, io.Re
 //	  → 立即尝试一次物理清理；失败只记日志，不回滚已经提交的逻辑删除
 //
 // 为什么先锁 File 再锁 Entity：这是所有事务统一的加锁顺序
-// （以后实现 Copy 时也必须先锁源 File、再锁 Entity），
+// （Copy 也遵守：先锁源 File、再锁 Entity），
 // 否则两个事务可能一个先锁 File、另一个先锁 Entity，互相等待成环。
 //
 // 为什么不在事务里删磁盘：磁盘操作可能很慢，未来换成 S3 更慢。

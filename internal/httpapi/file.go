@@ -174,6 +174,63 @@ func uploadFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	}
 }
 
+// copyFileRequest 是 POST /api/files/:id/copy 的请求体。
+// parent_id 是目标目录，不传表示当前用户的根目录；name 是副本的新名字。
+type copyFileRequest struct {
+	ParentID string `json:"parent_id"`
+	Name     string `json:"name"`
+}
+
+// copyFile 处理 POST /api/files/:id/copy。
+//
+//	curl -X POST "$BASE/api/files/$FILE_ID/copy" \
+//	  -H "Authorization: Bearer $TOKEN" \
+//	  -H 'Content-Type: application/json' \
+//	  -d '{"parent_id":"<目标目录ID>","name":"笔记-副本.txt"}'
+//
+// 成功返回 201 和新 File。请求不携带文件内容：新 File 复用源文件的 Entity。
+// 源文件或目标目录不存在、不属于当前用户，统一返回 404；
+// 目标目录已有同名节点返回 409。
+func copyFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ownerID, ok := currentUserID(c)
+		if !ok {
+			respondInternalError(c, logger, "copy file: missing authenticated user")
+			return
+		}
+
+		var request copyFileRequest
+		if err := c.ShouldBindJSON(&request); err != nil {
+			c.JSON(http.StatusBadRequest, ErrorResponse{
+				Code:    "invalid_json",
+				Message: `request body must be JSON like {"parent_id":"...","name":"copy.txt"}`,
+			})
+			return
+		}
+
+		record, err := svc.Copy(
+			c.Request.Context(),
+			ownerID,
+			c.Param("id"),
+			request.ParentID,
+			request.Name,
+		)
+		if err != nil {
+			if handleFileError(c, err, "file_or_parent_not_found", "source file or target directory not found") {
+				return
+			}
+			logger.Error("copy file", "error", err)
+			c.JSON(http.StatusInternalServerError, ErrorResponse{
+				Code:    "copy_failed",
+				Message: "failed to copy file",
+			})
+			return
+		}
+
+		c.JSON(http.StatusCreated, record)
+	}
+}
+
 // listFiles 处理 GET /api/files。
 //
 // 只返回 parentID 这一层的直接子节点，不递归整棵树。

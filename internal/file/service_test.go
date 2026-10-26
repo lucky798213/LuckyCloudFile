@@ -608,3 +608,243 @@ func TestUploadDuplicateName(t *testing.T) {
 		t.Fatalf("another user must be able to reuse the name: %v", err)
 	}
 }
+
+// TestCopyFileReusesEntity 是复制的核心验收：
+// 新 File 指向原 Entity，引用数加一；删掉任意一边，另一边仍能下载。
+func TestCopyFileReusesEntity(t *testing.T) {
+	service, db, diskRoot, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	sourceDir, err := service.CreateDirectory(ctx, ownerA.ID, "", "学习资料")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetDir, err := service.CreateDirectory(ctx, ownerA.ID, "", "备份资料")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := service.Upload(ctx, ownerA.ID, sourceDir.ID, "笔记.txt", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	copied, err := service.Copy(ctx, ownerA.ID, source.ID, targetDir.ID, "笔记-副本.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if copied.ID == "" || copied.ID == source.ID {
+		t.Fatalf("copy must have its own id, got %q (source %q)", copied.ID, source.ID)
+	}
+	if copied.Name != "笔记-副本.txt" || copied.Size != 5 || copied.Kind != model.KindFile {
+		t.Fatalf("unexpected copy: %+v", copied)
+	}
+	if copied.ParentID == nil || *copied.ParentID != targetDir.ID {
+		t.Fatalf("copy parent = %v, want %q", copied.ParentID, targetDir.ID)
+	}
+
+	// 两条 File 记录，但只有一份 Entity，引用数为 2；磁盘也只有一份内容。
+	var entity model.Entity
+	if err := db.WithContext(ctx).First(&entity).Error; err != nil {
+		t.Fatal(err)
+	}
+	if entity.RefCount != 2 {
+		t.Fatalf("entity ref_count = %d, want 2", entity.RefCount)
+	}
+	if entity.Status != model.EntityStatusActive {
+		t.Fatalf("entity status = %q, want %q", entity.Status, model.EntityStatusActive)
+	}
+	entries, err := os.ReadDir(diskRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("copy must not duplicate content on disk, found %d files", len(entries))
+	}
+
+	// 源文件和副本都能读到同样的内容。
+	for _, record := range []File{source, copied} {
+		_, rc, err := service.Open(ctx, ownerA.ID, record.ID)
+		if err != nil {
+			t.Fatalf("open %s: %v", record.ID, err)
+		}
+		data, err := io.ReadAll(rc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = rc.Close()
+		if string(data) != "hello" {
+			t.Fatalf("content of %s = %q, want hello", record.ID, data)
+		}
+	}
+
+	// 删掉源文件：Entity 仍被副本引用，不能进入待删除状态。
+	if err := service.Delete(ctx, ownerA.ID, source.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WithContext(ctx).First(&entity, entity.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if entity.RefCount != 1 || entity.Status != model.EntityStatusActive {
+		t.Fatalf("after deleting source: ref_count=%d status=%q", entity.RefCount, entity.Status)
+	}
+	_, rc, err := service.Open(ctx, ownerA.ID, copied.ID)
+	if err != nil {
+		t.Fatalf("copy was damaged by deleting source: %v", err)
+	}
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rc.Close()
+	if string(data) != "hello" {
+		t.Fatalf("copy content after deleting source = %q", data)
+	}
+
+	// 删掉副本后，最后一个引用消失，Entity 被清理，磁盘也空出来。
+	if err := service.Delete(ctx, ownerA.ID, copied.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := countRows(t, db, &model.Entity{}); got != 0 {
+		t.Fatalf("wanted no entities left, got %d", got)
+	}
+	entries, err = os.ReadDir(diskRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("content still on disk after deleting both files: %v", entries)
+	}
+}
+
+func TestCopyFileValidation(t *testing.T) {
+	service, db, _, ownerA, ownerB := newTestService(t)
+	ctx := context.Background()
+
+	sourceDir, err := service.CreateDirectory(ctx, ownerA.ID, "", "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := service.Upload(ctx, ownerA.ID, sourceDir.ID, "a.txt", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherDir, err := service.CreateDirectory(ctx, ownerB.ID, "", "other")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 源文件不存在 / 属于别人：都表现为不存在。
+	if _, err := service.Copy(ctx, ownerA.ID, "does-not-exist", sourceDir.ID, "copy.txt"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing source: wanted ErrNotFound, got %v", err)
+	}
+	if _, err := service.Copy(ctx, ownerB.ID, source.ID, otherDir.ID, "copy.txt"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("another user's source: wanted ErrNotFound, got %v", err)
+	}
+
+	// 目标目录不存在 / 属于别人：都表现为不存在。
+	if _, err := service.Copy(ctx, ownerA.ID, source.ID, "does-not-exist", "copy.txt"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing target: wanted ErrNotFound, got %v", err)
+	}
+	if _, err := service.Copy(ctx, ownerA.ID, source.ID, otherDir.ID, "copy.txt"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("another user's target: wanted ErrNotFound, got %v", err)
+	}
+
+	// 源是目录、目标是普通文件：错误要能区分。
+	if _, err := service.Copy(ctx, ownerA.ID, sourceDir.ID, sourceDir.ID, "dir-copy"); !errors.Is(err, ErrIsDirectory) {
+		t.Fatalf("copy directory: wanted ErrIsDirectory, got %v", err)
+	}
+	if _, err := service.Copy(ctx, ownerA.ID, source.ID, source.ID, "copy.txt"); !errors.Is(err, ErrNotDirectory) {
+		t.Fatalf("copy into a file: wanted ErrNotDirectory, got %v", err)
+	}
+
+	// 名字非法：在查询数据库之前就拒绝。
+	if _, err := service.Copy(ctx, ownerA.ID, source.ID, sourceDir.ID, "a/b"); !errors.Is(err, ErrInvalidName) {
+		t.Fatalf("invalid copy name: wanted ErrInvalidName, got %v", err)
+	}
+
+	// 同名副本：409 的底层错误；失败后不能多出 File，引用数也不能变。
+	if _, err := service.Copy(ctx, ownerA.ID, source.ID, sourceDir.ID, "a.txt"); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("duplicate copy name: wanted ErrAlreadyExists, got %v", err)
+	}
+	if got := countKind(t, db, model.KindFile); got != 1 {
+		t.Fatalf("failed copies left %d file rows", got)
+	}
+	var entity model.Entity
+	if err := db.WithContext(ctx).First(&entity).Error; err != nil {
+		t.Fatal(err)
+	}
+	if entity.RefCount != 1 {
+		t.Fatalf("failed copy changed ref_count to %d", entity.RefCount)
+	}
+}
+
+// TestCopyRejectsInconsistentEntity 验证复制不会在已有异常数据上继续扩大不一致：
+// 源 File 还在引用 Entity，但 ref_count 已经是 0，或者 Entity 已经是 pending_delete。
+func TestCopyRejectsInconsistentEntity(t *testing.T) {
+	service, db, _, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	source, err := service.Upload(ctx, ownerA.ID, "", "a.txt", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var entity model.Entity
+	if err := db.WithContext(ctx).First(&entity).Error; err != nil {
+		t.Fatal(err)
+	}
+	if entity.RefCount != 1 || entity.Status != model.EntityStatusActive {
+		t.Fatalf("unexpected fresh entity: %+v", entity)
+	}
+
+	// 异常 1：源 File 仍然引用 Entity，但 ref_count 已经是 0。
+	if err := db.WithContext(ctx).
+		Model(&model.Entity{}).
+		Where("id = ?", entity.ID).
+		UpdateColumn("ref_count", 0).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Copy(ctx, ownerA.ID, source.ID, "", "copy-refcount.txt"); err == nil {
+		t.Fatal("copy with ref_count = 0 must fail")
+	}
+	if got := countKind(t, db, model.KindFile); got != 1 {
+		t.Fatalf("failed copy left %d file rows", got)
+	}
+	if err := db.WithContext(ctx).Where("id = ?", entity.ID).First(&entity).Error; err != nil {
+		t.Fatal(err)
+	}
+	if entity.RefCount != 0 {
+		t.Fatalf("failed copy changed ref_count to %d", entity.RefCount)
+	}
+
+	// 异常 2：Entity 已经是 pending_delete，却仍然被 File 引用。
+	if err := db.WithContext(ctx).
+		Model(&model.Entity{}).
+		Where("id = ?", entity.ID).
+		Updates(map[string]any{
+			"ref_count": 1,
+			"status":    model.EntityStatusPendingDelete,
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Copy(ctx, ownerA.ID, source.ID, "", "copy-pending.txt"); err == nil {
+		t.Fatal("copy from a pending_delete entity must fail")
+	}
+	if got := countKind(t, db, model.KindFile); got != 1 {
+		t.Fatalf("failed copy left %d file rows", got)
+	}
+
+	// 数据恢复正常后，复制必须仍然可用，避免检查过严。
+	if err := db.WithContext(ctx).
+		Model(&model.Entity{}).
+		Where("id = ?", entity.ID).
+		Updates(map[string]any{
+			"ref_count": 1,
+			"status":    model.EntityStatusActive,
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Copy(ctx, ownerA.ID, source.ID, "", "copy-ok.txt"); err != nil {
+		t.Fatalf("copy should succeed after data is consistent again: %v", err)
+	}
+}
