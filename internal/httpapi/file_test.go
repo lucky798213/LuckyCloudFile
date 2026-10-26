@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +32,9 @@ type fakeFileService struct {
 	records  map[string]file.File
 	contents map[string][]byte
 	owners   map[string]int
+	// roots 是“用户根目录”的 ID → 用户 ID。假实现不把根目录放进 records，
+	// 只用来验证根目录不能被改名。
+	roots map[string]int
 }
 
 func newFakeFileService() *fakeFileService {
@@ -38,6 +42,7 @@ func newFakeFileService() *fakeFileService {
 		records:  make(map[string]file.File),
 		contents: make(map[string][]byte),
 		owners:   make(map[string]int),
+		roots:    make(map[string]int),
 	}
 }
 
@@ -242,6 +247,53 @@ func (f *fakeFileService) Copy(ctx context.Context, ownerID int, id, parentID, n
 	f.contents[newID] = append([]byte(nil), f.contents[id]...)
 	f.owners[newID] = ownerID
 	return record, nil
+}
+
+// Rename 模拟只改显示名：大小、内容和父目录都不变。
+func (f *fakeFileService) Rename(ctx context.Context, ownerID int, id, name string) (file.File, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if owner, isRoot := f.roots[id]; isRoot && owner == ownerID {
+		return file.File{}, file.ErrRootDirectory
+	}
+	record, ok := f.records[id]
+	if !ok || f.owners[id] != ownerID {
+		return file.File{}, file.ErrNotFound
+	}
+	if !validFakeName(name) {
+		return file.File{}, file.ErrInvalidName
+	}
+	if record.Name == name {
+		return record, nil
+	}
+
+	parentID := ""
+	if record.ParentID != nil {
+		parentID = *record.ParentID
+	}
+	// 同名检查要排除自己，否则“改成现在的名字”会被误判为重名。
+	for otherID, other := range f.records {
+		if otherID == id || f.owners[otherID] != ownerID || other.Name != name {
+			continue
+		}
+		if sameParent(other.ParentID, parentID) {
+			return file.File{}, file.ErrAlreadyExists
+		}
+	}
+
+	record.Name = name
+	f.records[id] = record
+	return record, nil
+}
+
+// validFakeName 复刻业务层最基本的名字校验，
+// 让 HTTP 层测试也能覆盖 400 invalid_name。
+func validFakeName(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	return !strings.ContainsAny(name, `/\`) && !strings.ContainsRune(name, 0)
 }
 
 func (f *fakeFileService) stored(id string) ([]byte, bool) {
@@ -635,6 +687,7 @@ func TestFileEndpointsRequireLogin(t *testing.T) {
 		httptest.NewRequest(http.MethodDelete, "/api/files/whatever", nil),
 		httptest.NewRequest(http.MethodPost, "/api/directories", strings.NewReader(`{"name":"docs"}`)),
 		newCopyRequest(t, testTokenA, "whatever", "", "copy.txt"),
+		newRenameRequest(t, testTokenA, "whatever", "renamed.txt"),
 	}
 	for _, req := range requests {
 		// uploadRequest 默认带 A 的 Token；这里统一去掉，验证未登录行为。
@@ -1020,5 +1073,249 @@ func TestCopyFileOwnershipIsolation(t *testing.T) {
 		if item.Name == "stolen.txt" || item.Name == "hack.txt" {
 			t.Fatalf("B created an entry in A's tree: %+v", item)
 		}
+	}
+}
+
+// newRenameRequest 构造 PATCH /api/files/:id 请求。
+func newRenameRequest(t *testing.T, token, id, name string) *http.Request {
+	t.Helper()
+
+	payload, err := json.Marshal(renameFileRequest{Name: name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPatch, "/api/files/"+id, bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	return authorize(req, token)
+}
+
+// TestRenameFile 覆盖普通文件改名的闭环：
+// 上传 → 改名 → 元数据变化但 ID、大小、内容和父目录不变。
+func TestRenameFile(t *testing.T) {
+	router, _ := newTestRouter(t)
+	content := []byte("rename must not touch content\n")
+	record := upload(t, router, content)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, newRenameRequest(t, testTokenA, record.ID, "新名字.txt"))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("wanted 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var renamed file.File
+	if err := json.Unmarshal(recorder.Body.Bytes(), &renamed); err != nil {
+		t.Fatal(err)
+	}
+	if renamed.ID != record.ID || renamed.Name != "新名字.txt" {
+		t.Fatalf("unexpected renamed record: %+v", renamed)
+	}
+	if renamed.Size != record.Size || renamed.Kind != model.KindFile {
+		t.Fatalf("rename changed size or kind: %+v", renamed)
+	}
+	if !sameParent(renamed.ParentID, "") || !sameParent(record.ParentID, "") {
+		t.Fatalf("rename changed parent: %v -> %v", record.ParentID, renamed.ParentID)
+	}
+
+	// 下载内容不变，Content-Disposition 跟着新名字走。
+	download := httptest.NewRecorder()
+	router.ServeHTTP(download, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+record.ID, nil), testTokenA))
+	if download.Code != http.StatusOK || !bytes.Equal(download.Body.Bytes(), content) {
+		t.Fatalf("download after rename: status=%d body=%q", download.Code, download.Body.Bytes())
+	}
+	_, params, err := mime.ParseMediaType(download.Header().Get("Content-Disposition"))
+	if err != nil {
+		t.Fatalf("parse Content-Disposition: %v", err)
+	}
+	if params["filename"] != "新名字.txt" {
+		t.Fatalf("Content-Disposition filename = %q, want 新名字.txt", params["filename"])
+	}
+
+	// 列表里看到的也是新名字。
+	list := listChildren(t, router, "", "1", "20")
+	if list.Total != 1 || list.Items[0].Name != "新名字.txt" {
+		t.Fatalf("unexpected listing after rename: %+v", list)
+	}
+}
+
+// TestRenameDirectory 目录也能改名，里面的文件不受影响。
+func TestRenameDirectory(t *testing.T) {
+	router, _ := newTestRouter(t)
+	dir := createDir(t, router, "", "旧目录")
+	child := uploadInto(t, router, dir.ID, "笔记.txt", []byte("inside"))
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, newRenameRequest(t, testTokenA, dir.ID, "新目录"))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("wanted 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var renamed file.File
+	if err := json.Unmarshal(recorder.Body.Bytes(), &renamed); err != nil {
+		t.Fatal(err)
+	}
+	if renamed.ID != dir.ID || renamed.Name != "新目录" || renamed.Kind != model.KindDirectory {
+		t.Fatalf("unexpected renamed directory: %+v", renamed)
+	}
+
+	// 改名不影响目录里的内容。
+	list := listChildren(t, router, dir.ID, "1", "20")
+	if list.Total != 1 || list.Items[0].ID != child.ID || list.Items[0].Name != "笔记.txt" {
+		t.Fatalf("directory children changed after rename: %+v", list)
+	}
+}
+
+func TestRenameDuplicateName(t *testing.T) {
+	router, _ := newTestRouter(t)
+	first := uploadInto(t, router, "", "a.txt", []byte("one"))
+	second := uploadInto(t, router, "", "b.txt", []byte("two"))
+	dir := createDir(t, router, "", "docs")
+
+	cases := []struct {
+		id   string
+		name string
+	}{
+		{second.ID, "a.txt"}, // 文件撞文件
+		{second.ID, "docs"},  // 文件撞目录
+		{dir.ID, "a.txt"},    // 目录撞文件
+	}
+	for _, tc := range cases {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, newRenameRequest(t, testTokenA, tc.id, tc.name))
+		if recorder.Code != http.StatusConflict {
+			t.Fatalf("rename %s to %q: wanted 409, got %d: %s", tc.id, tc.name, recorder.Code, recorder.Body.String())
+		}
+		if code := errorCode(t, recorder); code != "already_exists" {
+			t.Fatalf("code = %q, want already_exists", code)
+		}
+	}
+
+	// 冲突之后两个文件都还在，名字和内容都没变。
+	for id, want := range map[string]string{first.ID: "one", second.ID: "two"} {
+		download := httptest.NewRecorder()
+		router.ServeHTTP(download, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+id, nil), testTokenA))
+		if download.Code != http.StatusOK {
+			t.Fatalf("download %s after conflict: wanted 200, got %d", id, download.Code)
+		}
+		if got := download.Body.String(); got != want {
+			t.Fatalf("content of %s changed after failed renames: got %q, want %q", id, got, want)
+		}
+	}
+	list := listChildren(t, router, "", "1", "20")
+	names := make(map[string]bool, len(list.Items))
+	for _, item := range list.Items {
+		names[item.Name] = true
+	}
+	if !names["a.txt"] || !names["b.txt"] || !names["docs"] {
+		t.Fatalf("rename conflict changed the directory: %+v", list)
+	}
+
+	// 改成现在的名字是幂等的，不算重名。
+	same := httptest.NewRecorder()
+	router.ServeHTTP(same, newRenameRequest(t, testTokenA, first.ID, "a.txt"))
+	if same.Code != http.StatusOK {
+		t.Fatalf("renaming to the current name: wanted 200, got %d: %s", same.Code, same.Body.String())
+	}
+}
+
+// TestRenameOwnershipIsolation 证明 B 知道 A 的 ID 也改不了 A 的节点。
+func TestRenameOwnershipIsolation(t *testing.T) {
+	router, _ := newTestRouter(t)
+	content := []byte("only A can rename this")
+	record := upload(t, router, content)
+
+	byB := httptest.NewRecorder()
+	router.ServeHTTP(byB, newRenameRequest(t, testTokenB, record.ID, "stolen.txt"))
+	if byB.Code != http.StatusNotFound {
+		t.Fatalf("B rename A's file: wanted 404, got %d: %s", byB.Code, byB.Body.String())
+	}
+	if code := errorCode(t, byB); code != "file_not_found" {
+		t.Fatalf("code = %q, want file_not_found", code)
+	}
+
+	// A 的文件没被改动，内容也完好。
+	download := httptest.NewRecorder()
+	router.ServeHTTP(download, authorize(httptest.NewRequest(http.MethodGet, "/api/files/"+record.ID, nil), testTokenA))
+	if download.Code != http.StatusOK || !bytes.Equal(download.Body.Bytes(), content) {
+		t.Fatalf("A's file was damaged by B: status=%d body=%q", download.Code, download.Body.Bytes())
+	}
+	list := listChildren(t, router, "", "1", "20")
+	if list.Total != 1 || list.Items[0].Name != record.Name {
+		t.Fatalf("A's file name changed by B: %+v", list)
+	}
+
+	// 真正的所有者仍然可以改名。
+	byA := httptest.NewRecorder()
+	router.ServeHTTP(byA, newRenameRequest(t, testTokenA, record.ID, "mine.txt"))
+	if byA.Code != http.StatusOK {
+		t.Fatalf("A rename own file: wanted 200, got %d: %s", byA.Code, byA.Body.String())
+	}
+}
+
+func TestRenameInvalidName(t *testing.T) {
+	router, _ := newTestRouter(t)
+	record := upload(t, router, []byte("x"))
+
+	for _, name := range []string{"", ".", "..", "a/b", `a\b`, "a\x00b"} {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, newRenameRequest(t, testTokenA, record.ID, name))
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("rename to %q: wanted 400, got %d: %s", name, recorder.Code, recorder.Body.String())
+		}
+		if code := errorCode(t, recorder); code != "invalid_name" {
+			t.Fatalf("rename to %q: code = %q, want invalid_name", name, code)
+		}
+	}
+
+	// 名字没有被改掉。
+	list := listChildren(t, router, "", "1", "20")
+	if list.Total != 1 || list.Items[0].Name != record.Name {
+		t.Fatalf("invalid names changed the entry: %+v", list)
+	}
+}
+
+func TestRenameRootDirectoryRejected(t *testing.T) {
+	router, fake := newTestRouter(t)
+	fake.roots["root-a"] = testUserAID
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, newRenameRequest(t, testTokenA, "root-a", "hacked"))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("rename root: wanted 400, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if code := errorCode(t, recorder); code != "root_directory" {
+		t.Fatalf("code = %q, want root_directory", code)
+	}
+
+	// B 连“这是根目录”都不该知道，统一按不存在处理。
+	byB := httptest.NewRecorder()
+	router.ServeHTTP(byB, newRenameRequest(t, testTokenB, "root-a", "hacked"))
+	if byB.Code != http.StatusNotFound {
+		t.Fatalf("B rename A's root: wanted 404, got %d: %s", byB.Code, byB.Body.String())
+	}
+}
+
+func TestRenameErrors(t *testing.T) {
+	router, _ := newTestRouter(t)
+
+	// ID 不存在：404。
+	missing := httptest.NewRecorder()
+	router.ServeHTTP(missing, newRenameRequest(t, testTokenA, "does-not-exist", "x.txt"))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing id: wanted 404, got %d: %s", missing.Code, missing.Body.String())
+	}
+
+	record := upload(t, router, []byte("x"))
+
+	// 请求体不是 JSON：400 invalid_json。
+	badJSON := httptest.NewRequest(http.MethodPatch, "/api/files/"+record.ID, strings.NewReader("not json"))
+	badJSON.Header.Set("Content-Type", "application/json")
+	authorize(badJSON, testTokenA)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, badJSON)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid json: wanted 400, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if code := errorCode(t, recorder); code != "invalid_json" {
+		t.Fatalf("code = %q, want invalid_json", code)
 	}
 }

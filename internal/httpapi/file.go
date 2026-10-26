@@ -231,6 +231,55 @@ func copyFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	}
 }
 
+// renameFileRequest 是 PATCH /api/files/:id 的请求体。
+type renameFileRequest struct {
+	Name string `json:"name"`
+}
+
+// renameFile 处理 PATCH /api/files/:id。
+//
+//	curl -X PATCH "$BASE/api/files/$ID" \
+//	  -H "Authorization: Bearer $TOKEN" \
+//	  -H 'Content-Type: application/json' \
+//	  -d '{"name":"新名字.txt"}'
+//
+// 文件和目录都能改名，只改显示名，不移动位置、不改变内容。
+// 成功返回 200 和改名后的节点；不存在或不属于当前用户返回 404；
+// 同一目录已有同名节点返回 409；名字非法返回 400。
+func renameFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ownerID, ok := currentUserID(c)
+		if !ok {
+			respondInternalError(c, logger, "rename file: missing authenticated user")
+			return
+		}
+
+		var request renameFileRequest
+		if err := c.ShouldBindJSON(&request); err != nil {
+			c.JSON(http.StatusBadRequest, ErrorResponse{
+				Code:    "invalid_json",
+				Message: `request body must be JSON like {"name":"new-name.txt"}`,
+			})
+			return
+		}
+
+		record, err := svc.Rename(c.Request.Context(), ownerID, c.Param("id"), request.Name)
+		if err != nil {
+			if handleFileError(c, err, "file_not_found", "file not found") {
+				return
+			}
+			logger.Error("rename file", "error", err)
+			c.JSON(http.StatusInternalServerError, ErrorResponse{
+				Code:    "rename_failed",
+				Message: "failed to rename file",
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, record)
+	}
+}
+
 // listFiles 处理 GET /api/files。
 //
 // 只返回 parentID 这一层的直接子节点，不递归整棵树。
@@ -388,6 +437,11 @@ func handleFileError(c *gin.Context, err error, notFoundCode, notFoundMessage st
 		c.JSON(http.StatusConflict, ErrorResponse{
 			Code:    "already_exists",
 			Message: "an entry with the same name already exists in this directory",
+		})
+	case errors.Is(err, file.ErrRootDirectory):
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Code:    "root_directory",
+			Message: "the user root directory cannot be renamed",
 		})
 	default:
 		return false

@@ -34,6 +34,7 @@ type fileService interface {
 	CreateDirectory(ctx context.Context, ownerID int, parentID, name string) (file.File, error)
 	ListChildren(ctx context.Context, ownerID int, parentID string, page, pageSize int) (file.ListResult, error)
 	Copy(ctx context.Context, ownerID int, id, parentID, name string) (file.File, error)
+	Rename(ctx context.Context, ownerID int, id, name string) (file.File, error)
 }
 
 // NewRouter 创建并配置好路由。
@@ -76,6 +77,8 @@ func NewRouter(logger *slog.Logger, fileService fileService, authService authSer
 	protected.DELETE("/files/:id", deleteFile(logger, fileService))
 	// 复制：只创建新的 File 并复用源 Entity，不搬运文件内容。
 	protected.POST("/files/:id/copy", copyFile(logger, fileService))
+	// 重命名：只改 files.name，文件和目录都支持，不改内容。
+	protected.PATCH("/files/:id", renameFile(logger, fileService))
 
 	// 兜底：没匹配到任何路由时，返回统一的 JSON 错误，而不是 Gin 默认的纯文本 404。
 	r.NoRoute(notFound)

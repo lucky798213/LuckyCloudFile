@@ -53,6 +53,9 @@ var (
 
 	// ErrAlreadyExists 表示同一目录下已经有同名节点。
 	ErrAlreadyExists = errors.New("an entry with the same name already exists")
+
+	// ErrRootDirectory 表示试图修改用户根目录（名字固定为 "/"）。
+	ErrRootDirectory = errors.New("the user root directory cannot be modified")
 )
 
 // File 是返回给 HTTP 层的节点信息（不包含数据库内部字段）。
@@ -300,6 +303,73 @@ func (s *Service) Copy(ctx context.Context, ownerID int, id, parentID, name stri
 		return File{}, err
 	}
 	return toFile(copied), nil
+}
+
+// Rename 修改 ownerID 用户名下节点（普通文件或目录）的显示名。
+//
+// 只更新 files.name 一列：Entity、引用计数、磁盘对象都不动，
+// 所以改名后下载到的内容不变。
+//
+// 名字合法性在查询数据库之前校验；同目录重名由
+// (owner_id, parent_id, name) 唯一索引拒绝，返回 ErrAlreadyExists。
+// 根目录是整棵树的起点（唯一 parent_id 为 NULL 的节点），
+// 名字由服务端固定为 "/"，不允许改名，返回 ErrRootDirectory。
+func (s *Service) Rename(ctx context.Context, ownerID int, id, name string) (File, error) {
+	if err := validateName(name); err != nil {
+		return File{}, err
+	}
+
+	var renamed model.File
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		record, err := lockOwnedFile(ctx, tx, ownerID, id)
+		if err != nil {
+			return err
+		}
+		// 目录和文件都能改名，唯独根目录不行。
+		if record.ParentID == nil {
+			return ErrRootDirectory
+		}
+
+		// 名字没变时 MySQL 的 RowsAffected 是 0（值没有变化），
+		// 这里直接当作成功，避免把“改成同一个名字”误判为失败。
+		if record.Name != name {
+			updated := tx.WithContext(ctx).
+				Model(&model.File{}).
+				Where("id = ? AND owner_id = ?", record.ID, ownerID).
+				UpdateColumn("name", name)
+			if updated.Error != nil {
+				if errors.Is(updated.Error, gorm.ErrDuplicatedKey) {
+					return ErrAlreadyExists
+				}
+				return fmt.Errorf("rename file: %w", updated.Error)
+			}
+			if updated.RowsAffected != 1 {
+				return fmt.Errorf(
+					"rename file %s: expected 1 row affected, got %d",
+					id, updated.RowsAffected,
+				)
+			}
+			record.Name = name
+		}
+
+		// 在事务里读 Entity：此时 File 行锁还在，别的删除事务无法把它清理掉。
+		// 返回体里的 size 来自 Entity；目录没有 Entity，保持 0。
+		if record.EntityID != nil {
+			var entity model.Entity
+			if err := tx.WithContext(ctx).First(&entity, *record.EntityID).Error; err != nil {
+				return fmt.Errorf("query entity: %w", err)
+			}
+			record.Entity = &entity
+		}
+
+		renamed = *record
+		return nil
+	})
+	if err != nil {
+		return File{}, err
+	}
+
+	return toFile(renamed), nil
 }
 
 // CreateDirectory 在 parentID（为空表示根目录）下创建一个空目录。

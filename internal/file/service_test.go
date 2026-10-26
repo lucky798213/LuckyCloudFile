@@ -848,3 +848,368 @@ func TestCopyRejectsInconsistentEntity(t *testing.T) {
 		t.Fatalf("copy should succeed after data is consistent again: %v", err)
 	}
 }
+
+// TestRenameFileKeepsContentAndEntity 是文件改名的核心验收：
+// 只改 files.name，Entity、引用计数、磁盘对象都不动，下载内容不变。
+func TestRenameFileKeepsContentAndEntity(t *testing.T) {
+	service, db, diskRoot, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	record, err := service.Upload(ctx, ownerA.ID, "", "notes.txt", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var before model.Entity
+	if err := db.WithContext(ctx).First(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	renamed, err := service.Rename(ctx, ownerA.ID, record.ID, "新笔记.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renamed.ID != record.ID || renamed.Name != "新笔记.txt" {
+		t.Fatalf("unexpected renamed record: %+v", renamed)
+	}
+	if renamed.Size != 5 || renamed.Kind != model.KindFile {
+		t.Fatalf("rename changed size or kind: %+v", renamed)
+	}
+	if !sameParentID(renamed.ParentID, record.ParentID) {
+		t.Fatalf("rename changed parent: %v -> %v", record.ParentID, renamed.ParentID)
+	}
+
+	// 数据库里只有 files.name 变了，entity_id、owner、parent 都保持原样。
+	var stored model.File
+	if err := db.WithContext(ctx).First(&stored, "id = ?", record.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Name != "新笔记.txt" || stored.OwnerID != ownerA.ID {
+		t.Fatalf("unexpected stored file: %+v", stored)
+	}
+	if stored.EntityID == nil || *stored.EntityID != before.ID {
+		t.Fatalf("rename changed entity_id: %v -> %v", before.ID, stored.EntityID)
+	}
+
+	// Entity 一个字段都不能变：引用数、状态、磁盘 key 和大小。
+	var after model.Entity
+	if err := db.WithContext(ctx).First(&after, before.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.StorageKey != before.StorageKey || after.Size != before.Size ||
+		after.RefCount != before.RefCount || after.Status != before.Status {
+		t.Fatalf("rename touched the entity: before=%+v after=%+v", before, after)
+	}
+	if got := countRows(t, db, &model.Entity{}); got != 1 {
+		t.Fatalf("rename created or removed entities: %d", got)
+	}
+
+	// 磁盘上还是同一个对象，数量和名字都没变。
+	entries, err := os.ReadDir(diskRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != before.StorageKey {
+		t.Fatalf("disk object changed: %v", entries)
+	}
+
+	// 下载内容不变，返回的名字是新的。
+	info, rc, err := service.Open(ctx, ownerA.ID, record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rc.Close()
+	if string(data) != "hello" || info.Name != "新笔记.txt" || info.Size != 5 {
+		t.Fatalf("download after rename: info=%+v data=%q", info, data)
+	}
+
+	// 列表里看到的也是新名字。
+	list, err := service.ListChildren(ctx, ownerA.ID, "", 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list.Total != 1 || list.Items[0].Name != "新笔记.txt" {
+		t.Fatalf("unexpected listing after rename: %+v", list)
+	}
+}
+
+// TestRenameDirectory 目录改名只改这一行，子树和磁盘都不受影响。
+func TestRenameDirectory(t *testing.T) {
+	service, db, diskRoot, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	dir, err := service.CreateDirectory(ctx, ownerA.ID, "", "旧目录")
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := service.Upload(ctx, ownerA.ID, dir.ID, "笔记.txt", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	renamed, err := service.Rename(ctx, ownerA.ID, dir.ID, "新目录")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renamed.ID != dir.ID || renamed.Name != "新目录" ||
+		renamed.Kind != model.KindDirectory || renamed.Size != 0 {
+		t.Fatalf("unexpected renamed directory: %+v", renamed)
+	}
+
+	// 根目录里是改名后的目录。
+	rootList, err := service.ListChildren(ctx, ownerA.ID, "", 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootList.Total != 1 || rootList.Items[0].ID != dir.ID || rootList.Items[0].Name != "新目录" {
+		t.Fatalf("unexpected root listing: %+v", rootList)
+	}
+
+	// 子节点仍然挂在原来的目录 ID 下，内容也能正常下载。
+	childList, err := service.ListChildren(ctx, ownerA.ID, dir.ID, 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if childList.Total != 1 || childList.Items[0].ID != child.ID || childList.Items[0].Name != "笔记.txt" {
+		t.Fatalf("directory children changed after rename: %+v", childList)
+	}
+	var storedChild model.File
+	if err := db.WithContext(ctx).First(&storedChild, "id = ?", child.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if storedChild.ParentID == nil || *storedChild.ParentID != dir.ID {
+		t.Fatalf("child parent changed to %v", storedChild.ParentID)
+	}
+	_, rc, err := service.Open(ctx, ownerA.ID, child.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rc.Close()
+	if string(data) != "hello" {
+		t.Fatalf("child content changed after directory rename: %q", data)
+	}
+
+	// 改名目录不写磁盘、不建 Entity。
+	if got := countRows(t, db, &model.Entity{}); got != 1 {
+		t.Fatalf("directory rename created entities: %d", got)
+	}
+	entries, err := os.ReadDir(diskRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("directory rename touched disk: %v", entries)
+	}
+}
+
+func TestRenameDuplicateName(t *testing.T) {
+	service, db, _, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	a, err := service.Upload(ctx, ownerA.ID, "", "a.txt", strings.NewReader("one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := service.Upload(ctx, ownerA.ID, "", "b.txt", strings.NewReader("two"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := service.CreateDirectory(ctx, ownerA.ID, "", "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 文件撞文件、文件撞目录、目录撞文件，都由唯一索引拒绝。
+	if _, err := service.Rename(ctx, ownerA.ID, b.ID, "a.txt"); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("file over file: wanted ErrAlreadyExists, got %v", err)
+	}
+	if _, err := service.Rename(ctx, ownerA.ID, b.ID, "docs"); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("file over directory: wanted ErrAlreadyExists, got %v", err)
+	}
+	if _, err := service.Rename(ctx, ownerA.ID, dir.ID, "a.txt"); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("directory over file: wanted ErrAlreadyExists, got %v", err)
+	}
+
+	// 冲突是事务回滚：名字、行数、引用数和内容都不变。
+	var storedB model.File
+	if err := db.WithContext(ctx).First(&storedB, "id = ?", b.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if storedB.Name != "b.txt" {
+		t.Fatalf("failed rename changed the name to %q", storedB.Name)
+	}
+	if got := countKind(t, db, model.KindFile); got != 2 {
+		t.Fatalf("failed renames changed file rows: %d", got)
+	}
+	var entity model.Entity
+	if err := db.WithContext(ctx).First(&entity).Error; err != nil {
+		t.Fatal(err)
+	}
+	if entity.RefCount != 1 {
+		t.Fatalf("failed rename changed ref_count to %d", entity.RefCount)
+	}
+
+	// 改成现在的名字是幂等的。
+	if renamed, err := service.Rename(ctx, ownerA.ID, a.ID, "a.txt"); err != nil || renamed.Name != "a.txt" {
+		t.Fatalf("rename to the same name: record=%+v err=%v", renamed, err)
+	}
+
+	// 不冲突的新名字仍然可以改，且内容不变。
+	renamed, err := service.Rename(ctx, ownerA.ID, b.ID, "c.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renamed.Name != "c.txt" || renamed.Size != 3 {
+		t.Fatalf("unexpected renamed file: %+v", renamed)
+	}
+	_, rc, err := service.Open(ctx, ownerA.ID, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rc.Close()
+	if string(data) != "two" {
+		t.Fatalf("content changed after rename: %q", data)
+	}
+}
+
+func TestRenameOnlyOwned(t *testing.T) {
+	service, _, _, ownerA, ownerB := newTestService(t)
+	ctx := context.Background()
+
+	file, err := service.Upload(ctx, ownerA.ID, "", "a.txt", strings.NewReader("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := service.CreateDirectory(ctx, ownerA.ID, "", "private")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// B 知道准确的 ID，也必须表现为“不存在”，文件和目录都一样。
+	if _, err := service.Rename(ctx, ownerB.ID, file.ID, "stolen.txt"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("B rename A's file: wanted ErrNotFound, got %v", err)
+	}
+	if _, err := service.Rename(ctx, ownerB.ID, dir.ID, "stolen-dir"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("B rename A's directory: wanted ErrNotFound, got %v", err)
+	}
+	if _, err := service.Rename(ctx, ownerA.ID, "does-not-exist", "x.txt"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown id: wanted ErrNotFound, got %v", err)
+	}
+
+	// B 的失败没有改动 A 的节点，内容也完好。
+	var storedFile model.File
+	if err := service.db.WithContext(ctx).First(&storedFile, "id = ?", file.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var storedDir model.File
+	if err := service.db.WithContext(ctx).First(&storedDir, "id = ?", dir.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if storedFile.Name != "a.txt" || storedDir.Name != "private" {
+		t.Fatalf("B changed A's names: file=%q dir=%q", storedFile.Name, storedDir.Name)
+	}
+	_, rc, err := service.Open(ctx, ownerA.ID, file.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rc.Close()
+	if string(data) != "secret" {
+		t.Fatalf("content changed after failed cross-user rename: %q", data)
+	}
+
+	// 所有者仍然可以改名。
+	if _, err := service.Rename(ctx, ownerA.ID, file.ID, "mine.txt"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRenameInvalidName(t *testing.T) {
+	service, db, _, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	record, err := service.Upload(ctx, ownerA.ID, "", "ok.txt", strings.NewReader("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := service.CreateDirectory(ctx, ownerA.ID, "", "ok-dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	badNames := []string{"", ".", "..", "a/b", `a\b`, "a\x00b", strings.Repeat("x", 256)}
+	for _, name := range badNames {
+		if _, err := service.Rename(ctx, ownerA.ID, record.ID, name); !errors.Is(err, ErrInvalidName) {
+			t.Fatalf("rename file to %q: wanted ErrInvalidName, got %v", name, err)
+		}
+		if _, err := service.Rename(ctx, ownerA.ID, dir.ID, name); !errors.Is(err, ErrInvalidName) {
+			t.Fatalf("rename directory to %q: wanted ErrInvalidName, got %v", name, err)
+		}
+	}
+
+	// 非法名字在写库之前就被拒绝，原名保持不变。
+	var stored model.File
+	if err := db.WithContext(ctx).First(&stored, "id = ?", record.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Name != "ok.txt" {
+		t.Fatalf("invalid rename changed the name to %q", stored.Name)
+	}
+
+	// 中文名和 255 个字符都是允许的。
+	if _, err := service.Rename(ctx, ownerA.ID, record.ID, "学习笔记"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Rename(ctx, ownerA.ID, record.ID, strings.Repeat("y", 255)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRenameRootRejected 用户根目录的名字由服务端固定为 "/"，不能被改。
+func TestRenameRootRejected(t *testing.T) {
+	service, db, _, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	if _, err := service.Rename(ctx, ownerA.ID, *ownerA.RootFileID, "hacked"); !errors.Is(err, ErrRootDirectory) {
+		t.Fatalf("rename root: wanted ErrRootDirectory, got %v", err)
+	}
+
+	// 根目录本身和 users.root_file_id 都没有变化。
+	var root model.File
+	if err := db.WithContext(ctx).First(&root, "id = ?", *ownerA.RootFileID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if root.Name != "/" || root.Kind != model.KindDirectory || root.ParentID != nil {
+		t.Fatalf("root directory was modified: %+v", root)
+	}
+	var user model.User
+	if err := db.WithContext(ctx).First(&user, ownerA.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if user.RootFileID == nil || *user.RootFileID != *ownerA.RootFileID {
+		t.Fatalf("users.root_file_id changed: %v", user.RootFileID)
+	}
+}
+
+// sameParentID 比较两个可空父目录 ID。
+func sameParentID(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
