@@ -50,17 +50,20 @@ type fileService interface {
 // 任务接口需要任务队列，所以由 NewRouterWithTasks 注册。
 // 保留这个构造函数是为了让只关心文件接口的测试和调用方不用准备队列。
 func NewRouter(logger *slog.Logger, fileService fileService, authService authService) *gin.Engine {
-	return newRouter(logger, fileService, authService, nil)
+	return newRouter(logger, fileService, authService, nil, nil)
 }
 
 // NewRouterWithTasks 在文件接口之外注册 ZIP 异步任务接口。
+//
+// tasks 负责持久化接收和查询；snapshots 只补充运行期进度，可以为 nil。
 func NewRouterWithTasks(
 	logger *slog.Logger,
 	fileService fileService,
 	authService authService,
-	tasks taskQueue,
+	tasks taskService,
+	snapshots taskSnapshots,
 ) *gin.Engine {
-	return newRouter(logger, fileService, authService, tasks)
+	return newRouter(logger, fileService, authService, tasks, snapshots)
 }
 
 // newRouter 是实际组装路由的地方。
@@ -71,7 +74,8 @@ func newRouter(
 	logger *slog.Logger,
 	fileService fileService,
 	authService authService,
-	tasks taskQueue,
+	tasks taskService,
+	snapshots taskSnapshots,
 ) *gin.Engine {
 	// gin.New() 创建一个空引擎。
 	// 不用 gin.Default()，是因为它自带日志和 panic 恢复中间件，
@@ -126,11 +130,11 @@ func newRouter(
 	// 两种情况都会在写入停止后清理占位内容。
 	protected.DELETE("/upload-sessions/:id", cancelUploadSession(logger, fileService))
 
-	// ZIP 异步任务：提交只入队并立即返回 task_id；查询读取内存快照。
-	// 没有注入队列时不注册这两条路由，避免 nil 处理函数。
+	// ZIP 异步任务：提交先落库再唤醒调度器，查询以数据库为准。
+	// 没有注入任务服务时不注册这两条路由，避免 nil 处理函数。
 	if tasks != nil {
-		protected.POST("/archive-tasks", createArchiveTask(logger, fileService, tasks))
-		protected.GET("/tasks/:id", getTask(logger, tasks))
+		protected.POST("/archive-tasks", createArchiveTask(logger, tasks))
+		protected.GET("/tasks/:id", getTask(logger, tasks, snapshots))
 	}
 
 	// 兜底：没匹配到任何路由时，返回统一的 JSON 错误，而不是 Gin 默认的纯文本 404。

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"luckyCloudFile/internal/queue"
+	"luckyCloudFile/internal/task"
 )
 
 const validINI = `[System]
@@ -54,23 +55,31 @@ func TestLoad(t *testing.T) {
 	if cfg.Upload.MaxParallelChunks != 2 {
 		t.Fatalf("default MaxParallelChunks = %d, want 2", cfg.Upload.MaxParallelChunks)
 	}
-	// 旧配置没有 [Task] 段：队列参数也必须有一组有界默认值。
+	// 旧配置没有 [Task] 段：队列和持久化调度参数也必须有一组有界默认值。
 	if cfg.Task.Workers != 2 || cfg.Task.QueueCapacity != 64 ||
 		cfg.Task.TimeoutSeconds != 600 || cfg.Task.RetentionSeconds != 3600 ||
-		cfg.Task.MaxTerminalRecords != 10000 {
+		cfg.Task.MaxTerminalRecords != 10000 ||
+		cfg.Task.MaxPendingTasks != 1000 ||
+		cfg.Task.ScanIntervalSeconds != 5 ||
+		cfg.Task.ScanBatchSize != 50 {
 		t.Fatalf("unexpected default task queue config: %+v", cfg.Task)
 	}
 }
 
 // TestTaskDefaultsMatchQueueDefaults 防止配置默认值和队列默认值各自漂移。
 func TestTaskDefaultsMatchQueueDefaults(t *testing.T) {
-	task := defaultConfig().Task
-	if task.Workers != queue.DefaultWorkers ||
-		task.QueueCapacity != queue.DefaultCapacity ||
-		time.Duration(task.TimeoutSeconds)*time.Second != queue.DefaultTimeout ||
-		time.Duration(task.RetentionSeconds)*time.Second != queue.DefaultRetention ||
-		task.MaxTerminalRecords != queue.DefaultMaxTerminalRecords {
-		t.Fatalf("config task defaults %+v do not match queue defaults", task)
+	cfgTask := defaultConfig().Task
+	if cfgTask.Workers != queue.DefaultWorkers ||
+		cfgTask.QueueCapacity != queue.DefaultCapacity ||
+		time.Duration(cfgTask.TimeoutSeconds)*time.Second != queue.DefaultTimeout ||
+		time.Duration(cfgTask.RetentionSeconds)*time.Second != queue.DefaultRetention ||
+		cfgTask.MaxTerminalRecords != queue.DefaultMaxTerminalRecords {
+		t.Fatalf("config task defaults %+v do not match queue defaults", cfgTask)
+	}
+	if cfgTask.MaxPendingTasks != task.DefaultMaxPending ||
+		time.Duration(cfgTask.ScanIntervalSeconds)*time.Second != task.DefaultScanInterval ||
+		cfgTask.ScanBatchSize != task.DefaultScanBatchSize {
+		t.Fatalf("config task defaults %+v do not match dispatcher defaults", cfgTask)
 	}
 }
 
@@ -83,6 +92,9 @@ QueueCapacity = 8
 TimeoutSeconds = 120
 RetentionSeconds = 60
 MaxTerminalRecords = 500
+MaxPendingTasks = 200
+ScanIntervalSeconds = 10
+ScanBatchSize = 20
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -90,6 +102,7 @@ MaxTerminalRecords = 500
 	want := Task{
 		Workers: 4, QueueCapacity: 8, TimeoutSeconds: 120,
 		RetentionSeconds: 60, MaxTerminalRecords: 500,
+		MaxPendingTasks: 200, ScanIntervalSeconds: 10, ScanBatchSize: 20,
 	}
 	if cfg.Task != want {
 		t.Fatalf("Task = %+v, want %+v", cfg.Task, want)
@@ -110,6 +123,10 @@ func TestLoadRejectsInvalidTaskQueue(t *testing.T) {
 		{"zero timeout", "TimeoutSeconds", "0", "Task.TimeoutSeconds"},
 		{"zero retention", "RetentionSeconds", "0", "Task.RetentionSeconds"},
 		{"zero max records", "MaxTerminalRecords", "0", "Task.MaxTerminalRecords"},
+		{"zero max pending", "MaxPendingTasks", "0", "Task.MaxPendingTasks"},
+		{"zero scan interval", "ScanIntervalSeconds", "0", "Task.ScanIntervalSeconds"},
+		{"zero scan batch", "ScanBatchSize", "0", "Task.ScanBatchSize"},
+		{"too large scan batch", "ScanBatchSize", "1001", "Task.ScanBatchSize"},
 		{"not integer", "Workers", "nope", "parse [Task]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

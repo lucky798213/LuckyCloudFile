@@ -52,13 +52,13 @@ type Upload struct {
 	MaxParallelChunks int
 }
 
-// Task 对应 [Task]，是 ZIP 异步任务队列的参数。
+// Task 对应 [Task]，是 ZIP 异步任务队列和持久化调度的参数。
 //
-// 队列的内存边界由两层组成：
+// 内存和数据库各有自己的边界，两层都必须有界：
 //   - Workers + QueueCapacity 限制同时存在的排队/执行任务；
-//   - RetentionSeconds + MaxTerminalRecords 限制完成后的快照记录。
-//
-// 只限制前者不够：任务可以很快结束，但终态快照会一直占着内存。
+//   - RetentionSeconds + MaxTerminalRecords 限制完成后的内存快照；
+//   - MaxPendingTasks 限制数据库里未终态任务的积压；
+//   - ScanIntervalSeconds + ScanBatchSize 决定通知丢失后多久能找回任务。
 type Task struct {
 	// Workers 是同时执行 ZIP 任务的 worker 数。
 	Workers int
@@ -71,6 +71,18 @@ type Task struct {
 	// MaxTerminalRecords 是 completed + failed 记录的数量上限。
 	// 超过时优先回收最早结束的记录。
 	MaxTerminalRecords int
+
+	// MaxPendingTasks 是数据库中未终态任务（queued / running / retry_wait）
+	// 的总数上限。它限制的是持久化积压，不是内存队列容量：达到上限后
+	// 新提交在落库之前就被拒绝。
+	MaxPendingTasks int
+
+	// ScanIntervalSeconds 是调度器周期扫描数据库中到期任务的间隔（秒）。
+	// 即使提交后的唤醒通知丢失，任务也会在这个间隔内被重新发现。
+	ScanIntervalSeconds int
+
+	// ScanBatchSize 是单次扫描最多取回多少条到期任务。
+	ScanBatchSize int
 }
 
 // HTTP 对应 [HTTP]。
@@ -166,11 +178,14 @@ func defaultConfig() Config {
 		Upload: Upload{MaxParallelChunks: 2},
 		// 没有 [Task] 段的旧配置也使用这些默认值，和 queue 包的默认值一致。
 		Task: Task{
-			Workers:            2,
-			QueueCapacity:      64,
-			TimeoutSeconds:     600,
-			RetentionSeconds:   3600,
-			MaxTerminalRecords: 10000,
+			Workers:             2,
+			QueueCapacity:       64,
+			TimeoutSeconds:      600,
+			RetentionSeconds:    3600,
+			MaxTerminalRecords:  10000,
+			MaxPendingTasks:     1000,
+			ScanIntervalSeconds: 5,
+			ScanBatchSize:       50,
 		},
 		Storage:  Storage{LocalRoots: make(map[string]string)},
 		Database: Database{Port: 3306},
@@ -306,6 +321,17 @@ func (c Config) validate() error {
 	}
 	if c.Task.MaxTerminalRecords < 1 || c.Task.MaxTerminalRecords > 1000000 {
 		return fmt.Errorf("Task.MaxTerminalRecords must be between 1 and 1000000")
+	}
+	// 数据库积压和扫描参数同样必须有界：上限太大等于没有上限，
+	// 扫描间隔太小会让空闲进程反复查询数据库。
+	if c.Task.MaxPendingTasks < 1 || c.Task.MaxPendingTasks > 1000000 {
+		return fmt.Errorf("Task.MaxPendingTasks must be between 1 and 1000000")
+	}
+	if c.Task.ScanIntervalSeconds < 1 || c.Task.ScanIntervalSeconds > 3600 {
+		return fmt.Errorf("Task.ScanIntervalSeconds must be between 1 and 3600")
+	}
+	if c.Task.ScanBatchSize < 1 || c.Task.ScanBatchSize > 1000 {
+		return fmt.Errorf("Task.ScanBatchSize must be between 1 and 1000")
 	}
 
 	// 存储目录必须写。至于它到底能不能写，要等启动时实际试一下才知道（见 internal/app）。

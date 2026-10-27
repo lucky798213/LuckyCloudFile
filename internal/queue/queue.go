@@ -65,6 +65,10 @@ var (
 	ErrQueueFull   = errors.New("queue is full")
 	ErrQueueClosed = errors.New("queue is closed")
 	ErrNotFound    = errors.New("task not found")
+
+	// ErrDuplicate 表示这个任务 ID 已经在排队或执行中。
+	// 重复扫描、重复通知不能把同一任务再放一份进队列。
+	ErrDuplicate = errors.New("task is already queued or running")
 )
 
 // Job 是业务与队列的边界。
@@ -225,6 +229,9 @@ func normalizeOptions(options Options) (Options, error) {
 
 // Submit 登记任务并放入等待队列，返回任务 ID。
 // 任务的执行 context 由队列生命周期和 timeout 生成，调用方不需要传。
+//
+// 它适合纯内存任务：ID 由队列生成。已经有稳定 ID 的任务（例如从数据库
+// 恢复的任务）必须用 Enqueue，否则同一个业务任务会得到第二个 ID。
 func (q *Queue) Submit(ownerID int, job Job) (string, error) {
 	if job == nil {
 		return "", errors.New("job is required")
@@ -234,15 +241,43 @@ func (q *Queue) Submit(ownerID int, job Job) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if err := q.Enqueue(id, ownerID, job); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// Enqueue 把“已经有稳定 ID”的任务放入等待队列。
+//
+// 数据库是持久化任务的唯一事实来源：调度器扫描到一条到期记录后，用原 ID
+// 调用这里，而不是重新 Submit 生成新 ID。队列只保存运行期的 Job 和快照。
+//
+// 同一个 ID 在排队或执行期间再次入队会返回 ErrDuplicate；已经进入终态的
+// 记录允许重新入队（等待重试的任务到期后就是这种情况），此时快照重置为
+// queued，旧的 Job 被新的替换。等待队列满时返回 ErrQueueFull，并且不留下
+// 任何“排着队但永远不会被取走”的假记录。
+func (q *Queue) Enqueue(id string, ownerID int, job Job) error {
+	if id == "" {
+		return errors.New("task id is required")
+	}
+	if job == nil {
+		return errors.New("job is required")
+	}
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	if q.closed {
-		return "", ErrQueueClosed
+		return ErrQueueClosed
 	}
 
-	// 必须先登记，再让 worker 有机会取到任务。
+	if existing, ok := q.tasks[id]; ok && !isTerminal(existing.snapshot.Status) {
+		return ErrDuplicate
+	}
+
+	// 终态记录可以复用 ID：先保存旧快照，入队失败时恢复，避免出现
+	// queued 状态却没有对应 channel 项的记录。
+	previous, existed := q.tasks[id]
 	q.tasks[id] = &record{snapshot: Snapshot{
 		ID:      id,
 		OwnerID: ownerID,
@@ -252,11 +287,14 @@ func (q *Queue) Submit(ownerID int, job Job) (string, error) {
 
 	select {
 	case q.jobs <- item{id: id, job: job}:
-		return id, nil
+		return nil
 	default:
-		// 没有接收成功，不得留下永久 queued 的记录。
-		delete(q.tasks, id)
-		return "", ErrQueueFull
+		if existed {
+			q.tasks[id] = previous
+		} else {
+			delete(q.tasks, id)
+		}
+		return ErrQueueFull
 	}
 }
 

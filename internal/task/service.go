@@ -1,24 +1,22 @@
-// Package task 负责任务记录在 MySQL 中的持久化。
+// Package task 负责任务的持久化、接收与调度。
 //
-// 这一阶段（P8.1）只做“事实存储”：任务先落库，之后才可能被调度执行。
-// 执行器、类型注册和恢复扫描会在后续步骤接入，所以这里刻意不依赖
-// internal/queue 或 internal/archive，避免把数据库事实和运行期对象绑死。
+// 事实来源永远是 MySQL 里的 tasks 行，内存里的队列快照只是运行期缓存：
 //
-// 仓储层负责三件事：
+//   - Submit 先做准入检查、把任务落库，提交成功后才尝试唤醒调度器；
+//   - Dispatcher 周期扫描（过期通知也能被找回），按数据库里的原 ID
+//     把任务放入有界执行队列；
+//   - worker 出队后先 TryStart 做条件更新，只有取得执行资格的那一次
+//     才会真正运行业务。
 //
-//   - 把默认值和状态校验收敛在一处，调用方不需要自己拼 WHERE；
-//   - 面向用户的查询一律带 owner_id，查不到时统一返回 ErrNotFound，
-//     不泄露“任务存在但不属于你”；
-//   - 会改变执行状态的更新都做条件更新，只有真正取得执行资格的那一次
-//     才能继续，防止重复扫描或迟到的回调覆盖新一轮状态。
-//
-// 这里不做的：真正的任务执行、重试调度、ZIP 业务和结果幂等。
+// 业务执行通过 Runner 注入（例如 ZIP 打包），本包不直接依赖
+// internal/archive。恢复工厂、阶段检查点和结果幂等留给后续步骤。
 package task
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -37,6 +35,10 @@ const (
 	// DefaultListLimit 是 ListDue 的默认批量大小。
 	// 扫描器每次只取有限一批，避免一次把积压任务全部读进内存。
 	DefaultListLimit = 100
+
+	// DefaultMaxPending 是数据库中未终态任务总数的默认上限。
+	// 它限制 queued + running + retry_wait，不是内存队列长度。
+	DefaultMaxPending = 1000
 )
 
 var (
@@ -47,6 +49,10 @@ var (
 	// ErrConflict 表示条件更新没有命中：任务已经进入终态、被另一次执行
 	// 接管、还没到执行时间，或者次数已经用完。调用方不应继续本次执行。
 	ErrConflict = errors.New("task state changed")
+
+	// ErrTooManyPending 表示数据库里已经有太多未终态任务。
+	// 它必须在插入之前返回，不能先落库再用失败响应“补丁式”拒绝。
+	ErrTooManyPending = errors.New("too many pending tasks")
 )
 
 // CreateParams 是创建一条排队任务的输入。
@@ -89,23 +95,95 @@ type Checkpoint struct {
 	StateJSON    string
 }
 
-// Service 是任务表的仓储入口。
+// Service 是任务表的仓储和接收入口。
 //
-// 它只持有数据库连接，不持有任务对象、队列或锁；所以“销毁并重建
-// Service”不会丢失任何已经提交的任务，新对象仍能按原 ID 查询。
+// 它只持有数据库连接和唤醒通道，不持有任务对象、队列或锁；所以
+// “销毁并重建 Service”不会丢失任何已经提交的任务，新对象仍能按原 ID 查询。
 type Service struct {
 	db *gorm.DB
+
+	// wake 是提交成功后唤醒调度器的信号。容量 1 且只做非阻塞发送：
+	// 重复提交合并成一次通知，通知丢失也不影响正确性（周期扫描兜底）。
+	wake chan struct{}
+
+	// admitMu 串行化“统计未终态任务 + 插入”这一段。单实例部署下用它
+	// 保证准入判断和插入之间不会插进另一个提交；多实例部署仍需要数据库
+	// 级的调度槽才能得到同样的上限，属于后续步骤。
+	admitMu    sync.Mutex
+	maxPending int
 }
 
 // NewService 创建任务仓储。db 必须是已经完成迁移的连接。
 func NewService(db *gorm.DB) *Service {
-	return &Service{db: db}
+	return &Service{
+		db:   db,
+		wake: make(chan struct{}, 1),
+	}
 }
 
-// Create 插入一条 queued 任务。
+// WithMaxPending 设置数据库中未终态任务的总数上限。
+// 非正数表示使用 DefaultMaxPending；应在开始接受请求前调用。
+func (s *Service) WithMaxPending(limit int) *Service {
+	s.maxPending = limit
+	return s
+}
+
+// Submit 是 HTTP 等外部入口接收任务的唯一方式。
 //
-// 它只负责落库，不负责唤醒执行器：调用方应该先提交本事务，再尝试通知；
-// 通知丢失时由到期扫描兜底。
+// 顺序不能反：
+//
+//	准入检查 → 插入 queued 行并提交 → 非阻塞唤醒调度器 → 返回原 taskID
+//
+// 落库之后就不再因为内存队列满而回头报错：任务已经算接收成功，扫描器
+// 迟早会把它放进队列。只有插入之前的准入限制（ErrTooManyPending）才是
+// 真正的拒绝。
+func (s *Service) Submit(ctx context.Context, params CreateParams) (*model.Task, error) {
+	s.admitMu.Lock()
+	defer s.admitMu.Unlock()
+
+	limit := s.maxPending
+	if limit <= 0 {
+		limit = DefaultMaxPending
+	}
+
+	var pending int64
+	err := s.db.WithContext(ctx).
+		Model(&model.Task{}).
+		Where("status IN ?", []string{
+			model.TaskStatusQueued,
+			model.TaskStatusRunning,
+			model.TaskStatusRetryWait,
+		}).
+		Count(&pending).Error
+	if err != nil {
+		return nil, fmt.Errorf("count pending tasks: %w", err)
+	}
+	if pending >= int64(limit) {
+		return nil, ErrTooManyPending
+	}
+
+	task, err := s.Create(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	s.wakeDispatcher()
+	return task, nil
+}
+
+// wakeDispatcher 发出一次非阻塞唤醒。通知只是优化：
+// 丢掉了也有周期扫描，不能因此把已落库的任务当成失败。
+func (s *Service) wakeDispatcher() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// Create 插入一条 queued 任务，但不做准入检查，也不唤醒调度器。
+//
+// 外部入口（HTTP）必须用 Submit：它会在插入前检查数据库积压上限，并在
+// 提交成功后通知调度器。Create 只供恢复、测试和内部步骤使用；直接调用它
+// 的任务仍会被周期扫描发现，但绕过了 MaxPending 限制。
 func (s *Service) Create(ctx context.Context, params CreateParams) (*model.Task, error) {
 	if params.Type == "" {
 		return nil, errors.New("task type is required")

@@ -126,30 +126,11 @@ func New(
 	if ownerID <= 0 {
 		return nil, errors.New("archive: owner ID must be positive")
 	}
-	if len(sourceIDs) == 0 {
-		return nil, ErrNoSources
-	}
-	if !safeEntryName(name) {
-		return nil, fmt.Errorf("%w: %q", ErrInvalidName, name)
-	}
 
-	maxFiles := opts.MaxFiles
-	if maxFiles <= 0 {
-		maxFiles = DefaultMaxFiles
-	}
-	if len(sourceIDs) > maxFiles {
-		return nil, fmt.Errorf("%w: limit is %d", ErrTooManyFiles, maxFiles)
-	}
-
-	seen := make(map[string]struct{}, len(sourceIDs))
-	for _, id := range sourceIDs {
-		if id == "" {
-			return nil, ErrInvalidFileID
-		}
-		if _, ok := seen[id]; ok {
-			return nil, fmt.Errorf("%w: %s", ErrDuplicateFile, id)
-		}
-		seen[id] = struct{}{}
+	// 静态校验集中在 NewTaskState，提交时和执行时共用同一套规则。
+	state, err := NewTaskState(sourceIDs, parentID, name, opts)
+	if err != nil {
+		return nil, err
 	}
 
 	maxSourceBytes := opts.MaxSourceBytes
@@ -172,9 +153,9 @@ func New(
 	return &Job{
 		files:           files,
 		ownerID:         ownerID,
-		sourceIDs:       append([]string(nil), sourceIDs...),
-		parentID:        parentID,
-		name:            name,
+		sourceIDs:       state.SourceIDs,
+		parentID:        state.ParentID,
+		name:            state.Name,
 		tempDir:         tempDir,
 		maxSourceBytes:  maxSourceBytes,
 		maxArchiveBytes: maxArchiveBytes,

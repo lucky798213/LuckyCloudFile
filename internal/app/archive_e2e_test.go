@@ -439,7 +439,7 @@ func waitE2ETask(t *testing.T, client *http.Client, base, token, taskID string) 
 			t.Fatal(err)
 		}
 		switch task.Status {
-		case "queued", "running":
+		case "queued", "running", "retry_wait":
 		case "completed", "failed":
 			return task
 		default:

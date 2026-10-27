@@ -773,3 +773,133 @@ func TestOptionsDefaultsAndNegativeValues(t *testing.T) {
 		}
 	}
 }
+
+// waitQueueTask 轮询队列快照直到满足条件。执行发生在 worker 里，
+// 没有额外回调可用，所以这里用带截止时间的条件轮询，而不是固定 sleep。
+func waitQueueTask(
+	t *testing.T,
+	q *Queue,
+	ownerID int,
+	id string,
+	want func(Snapshot) bool,
+) Snapshot {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		task, err := q.Get(ownerID, id)
+		if err == nil && want(task) {
+			return task
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("task %s did not reach the expected state: %+v (err=%v)", id, task, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestEnqueueUsesExistingID 验证按已有 ID 入队不会生成第二个身份，
+// 同一个 ID 在排队或执行期间不能重复入队，终态后可以用于下一轮重试。
+func TestEnqueueUsesExistingID(t *testing.T) {
+	q := newTestQueue(t, 1, 1, time.Minute)
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+
+	started := make(chan struct{})
+	if err := q.Enqueue("stable-id", 7, JobFunc(func(context.Context) (string, error) {
+		close(started)
+		<-release
+		return "ok", nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+
+	// 执行中再次入队必须被拒绝，不能把同一任务排两份。
+	if err := q.Enqueue("stable-id", 7, JobFunc(func(context.Context) (string, error) {
+		return "duplicate", nil
+	})); !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("duplicate enqueue error = %v, want ErrDuplicate", err)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	waitQueueTask(t, q, 7, "stable-id", func(s Snapshot) bool {
+		return s.Status == Completed && s.Result == "ok"
+	})
+
+	// 终态记录允许复用同一个 ID（等待重试的任务到期后就是这样）。
+	ranAgain := make(chan struct{})
+	if err := q.Enqueue("stable-id", 7, JobFunc(func(context.Context) (string, error) {
+		close(ranAgain)
+		return "second", nil
+	})); err != nil {
+		t.Fatalf("re-enqueue terminal task: %v", err)
+	}
+	<-ranAgain
+	waitQueueTask(t, q, 7, "stable-id", func(s Snapshot) bool {
+		return s.Status == Completed && s.Result == "second"
+	})
+}
+
+// TestEnqueueQueueFullLeavesNoRecord 验证等待队列满时不会留下
+// “排着队但永远不会被 worker 取走”的假快照。
+func TestEnqueueQueueFullLeavesNoRecord(t *testing.T) {
+	q := newTestQueue(t, 1, 1, time.Minute)
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+
+	started := make(chan struct{})
+	if err := q.Enqueue("blocker", 1, JobFunc(func(context.Context) (string, error) {
+		close(started)
+		<-release
+		return "", nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+
+	// worker 被占住，这一个占满等待槽。
+	if err := q.Enqueue("filler", 1, JobFunc(func(context.Context) (string, error) {
+		<-release
+		return "", nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := q.Enqueue("rejected", 1, JobFunc(func(context.Context) (string, error) {
+		return "", nil
+	})); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("enqueue when full error = %v, want ErrQueueFull", err)
+	}
+	if _, err := q.Get(1, "rejected"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("rejected task left a snapshot behind: %v", err)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+}
+
+func TestEnqueueRejectsClosedQueue(t *testing.T) {
+	q, err := New(Options{Workers: 1, Capacity: 1, Timeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.Shutdown()
+
+	if err := q.Enqueue("after-close", 1, JobFunc(func(context.Context) (string, error) {
+		return "", nil
+	})); !errors.Is(err, ErrQueueClosed) {
+		t.Fatalf("enqueue after shutdown error = %v, want ErrQueueClosed", err)
+	}
+	if err := q.Enqueue("", 1, JobFunc(func(context.Context) (string, error) {
+		return "", nil
+	})); err == nil {
+		t.Fatal("enqueue accepted an empty task id")
+	}
+	if err := q.Enqueue("no-job", 1, nil); err == nil {
+		t.Fatal("enqueue accepted a nil job")
+	}
+}

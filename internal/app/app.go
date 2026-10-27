@@ -19,6 +19,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"luckyCloudFile/internal/archive"
 	"luckyCloudFile/internal/auth"
 	"luckyCloudFile/internal/config"
 	"luckyCloudFile/internal/database"
@@ -28,6 +29,7 @@ import (
 	"luckyCloudFile/internal/pathlock"
 	"luckyCloudFile/internal/queue"
 	"luckyCloudFile/internal/storage"
+	"luckyCloudFile/internal/task"
 )
 
 // uploadRecoverer 是启动恢复这一步的调用签名。
@@ -47,7 +49,7 @@ func recoverUnfinishedUploads(ctx context.Context, svc *file.Service, batchSize 
 // 整个启动过程是“一步一步来”的，任何一步失败都直接返回错误：
 //
 //	检查存储目录 → 连接 MySQL → 创建 HTTP Server → 绑定端口
-//	→ 作废旧上传会话 → 启动后台清理 → 开始服务
+//	→ 作废旧上传会话 → 启动后台清理 → 启动任务调度器 → 开始服务
 func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	return run(ctx, cfg, logger, recoverUnfinishedUploads)
 }
@@ -92,9 +94,13 @@ func run(
 		WithChunkParallel(cfg.Upload.MaxParallelChunks)
 	authService := auth.NewService(db)
 
+	// 任务服务负责持久化事实：提交先做准入并落库，成功后才唤醒调度器。
+	// MaxPendingTasks 限制数据库里的未终态积压，不随内存队列上限浮动。
+	taskService := task.NewService(db).WithMaxPending(cfg.Task.MaxPendingTasks)
+
 	// 任务队列随应用生命周期创建和关闭。关闭顺序是：
-	// HTTP 先停止接收（serve 内部完成）→ 队列取消执行并等 worker 退出
-	// → database.Close（更早注册的 defer 最后执行）。
+	// HTTP 先停止接收（serve 内部完成）→ 调度器停止扫描 → 队列取消执行并
+	// 等 worker 退出 → database.Close（更早注册的 defer 最后执行）。
 	// 任务可能还在读写数据库，所以队列必须先于数据库关闭。
 	//
 	// Workers / QueueCapacity 限制同时存在的排队和执行任务；
@@ -111,10 +117,29 @@ func run(
 	}
 	defer taskQueue.Shutdown()
 
+	// 调度器按数据库里的原 taskID 入队，不经过 queue.Submit，因此恢复或
+	// 重复扫描不会生成第二个任务 ID。提交通知丢失时，周期扫描会兜底。
+	taskDispatcher, err := task.NewDispatcher(task.DispatcherOptions{
+		Service:      taskService,
+		Queue:        taskQueue,
+		Runner:       archive.NewTaskRunner(fileService, archive.Options{Logger: logger}),
+		ScanInterval: time.Duration(cfg.Task.ScanIntervalSeconds) * time.Second,
+		BatchSize:    cfg.Task.ScanBatchSize,
+		Logger:       logger,
+	})
+	if err != nil {
+		return fmt.Errorf("initialize task dispatcher: %w", err)
+	}
+	// 注册在 taskQueue.Shutdown 之后：defer 后进先出，调度器先停止扫描，
+	// 再让队列取消并等待正在执行的任务退出。
+	defer taskDispatcher.Shutdown()
+
 	// 第四步：创建 HTTP Server。它只是一个“配置好的对象”，还没开始监听。
 	// Handler 就是路由表，来自 internal/httpapi。
 	server := &http.Server{
-		Handler: httpapi.NewRouterWithTasks(logger, fileService, authService, taskQueue),
+		Handler: httpapi.NewRouterWithTasks(
+			logger, fileService, authService, taskService, taskQueue,
+		),
 		// 读请求头的超时，防止有人只连接不发数据把连接一直占着。
 		ReadHeaderTimeout: 5 * time.Second,
 		// 读整个请求（含上传的文件）最多花 5 分钟。
@@ -157,7 +182,14 @@ func run(
 		fileService.CleanupLoop(cleanupCtx, file.DefaultCleanupInterval, file.DefaultCleanupBatchSize)
 	}()
 
-	// 第八步：开始服务，直到收到退出信号。
+	// 第八步：旧上传会话已经作废，现在才开始调度数据库里遗留的任务。
+	//
+	// 顺序很重要：调度器启动时会立即扫描一次，若它更早启动，重启前的
+	// queued 任务可能在旧会话还没失效时就开始执行。HTTP 也还没开始接收
+	// 新请求，所以此刻被唤醒的任务都来自上次进程。
+	taskDispatcher.Start()
+
+	// 第九步：开始服务，直到收到退出信号。
 	shutdownTimeout := time.Duration(cfg.HTTP.ShutdownTimeoutSeconds) * time.Second
 	serveErr := serve(ctx, server, listener, shutdownTimeout, logger)
 

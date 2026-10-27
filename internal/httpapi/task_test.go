@@ -1,7 +1,9 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,65 +14,106 @@ import (
 	"testing"
 
 	"luckyCloudFile/internal/archive"
+	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/queue"
+	"luckyCloudFile/internal/task"
 )
 
-// fakeTaskQueue 只记录提交并返回预设快照，用来测试 HTTP 映射。
-type fakeTaskQueue struct {
+// fakeTaskService 模拟 task.Service 的持久化接口：
+// 提交时生成稳定 ID 并保存记录，查询时按 owner 隔离。
+type fakeTaskService struct {
 	mu        sync.Mutex
 	next      int
-	jobs      []queue.Job
-	owners    []int
-	tasks     map[string]queue.Snapshot
+	submitted []task.CreateParams
+	tasks     map[string]*model.Task
 	submitErr error
 }
 
-func newFakeTaskQueue() *fakeTaskQueue {
-	return &fakeTaskQueue{tasks: make(map[string]queue.Snapshot)}
+func newFakeTaskService() *fakeTaskService {
+	return &fakeTaskService{tasks: make(map[string]*model.Task)}
 }
 
-func (f *fakeTaskQueue) Submit(ownerID int, job queue.Job) (string, error) {
+func (f *fakeTaskService) Submit(
+	ctx context.Context,
+	params task.CreateParams,
+) (*model.Task, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	if f.submitErr != nil {
-		return "", f.submitErr
+		return nil, f.submitErr
 	}
 	f.next++
-	id := fmt.Sprintf("task-%d", f.next)
-	f.jobs = append(f.jobs, job)
-	f.owners = append(f.owners, ownerID)
-	f.tasks[id] = queue.Snapshot{
-		ID:      id,
-		OwnerID: ownerID,
-		Status:  queue.Queued,
-		Stage:   "queued",
+	params.ID = fmt.Sprintf("task-%d", f.next)
+	f.submitted = append(f.submitted, params)
+
+	record := &model.Task{
+		ID:           params.ID,
+		Type:         params.Type,
+		OwnerID:      params.OwnerID,
+		Status:       model.TaskStatusQueued,
+		Phase:        params.Phase,
+		StateVersion: params.StateVersion,
+		StateJSON:    params.StateJSON,
 	}
-	return id, nil
+	f.tasks[record.ID] = record
+	return record, nil
 }
 
-func (f *fakeTaskQueue) Get(ownerID int, id string) (queue.Snapshot, error) {
+func (f *fakeTaskService) GetOwned(
+	ctx context.Context,
+	ownerID int,
+	id string,
+) (*model.Task, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	task, ok := f.tasks[id]
-	if !ok || task.OwnerID != ownerID {
+	record, ok := f.tasks[id]
+	if !ok || record.OwnerID != ownerID {
+		return nil, task.ErrNotFound
+	}
+	copied := *record
+	return &copied, nil
+}
+
+func (f *fakeTaskService) setTask(record model.Task) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tasks[record.ID] = &record
+}
+
+// fakeTaskSnapshots 提供运行期进度；没有条目时返回 ErrNotFound。
+type fakeTaskSnapshots struct {
+	tasks map[string]queue.Snapshot
+}
+
+func newFakeTaskSnapshots() *fakeTaskSnapshots {
+	return &fakeTaskSnapshots{tasks: make(map[string]queue.Snapshot)}
+}
+
+func (f *fakeTaskSnapshots) Get(ownerID int, id string) (queue.Snapshot, error) {
+	snapshot, ok := f.tasks[id]
+	if !ok || snapshot.OwnerID != ownerID {
 		return queue.Snapshot{}, queue.ErrNotFound
 	}
-	return task, nil
+	return snapshot, nil
 }
 
-func (f *fakeTaskQueue) setTask(task queue.Snapshot) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.tasks[task.ID] = task
+func (f *fakeTaskSnapshots) setTask(snapshot queue.Snapshot) {
+	f.tasks[snapshot.ID] = snapshot
 }
 
-func newTaskRouter(t *testing.T, tasks *fakeTaskQueue) http.Handler {
+func newTaskRouter(
+	t *testing.T,
+	tasks *fakeTaskService,
+	snapshots *fakeTaskSnapshots,
+) http.Handler {
 	t.Helper()
 
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	return NewRouterWithTasks(logger, newFakeFileService(), newFakeAuthService(), tasks)
+	return NewRouterWithTasks(
+		logger, newFakeFileService(), newFakeAuthService(), tasks, snapshots,
+	)
 }
 
 func taskRequest(method, path, body, token string) *http.Request {
@@ -117,26 +160,26 @@ func TestCreateArchiveTask(t *testing.T) {
 			wantCode:   "invalid_request",
 		},
 		{
-			name:       "queue full",
+			name:       "pending limit",
 			body:       `{"file_ids":["file-a"],"name":"bundle.zip"}`,
-			submitErr:  queue.ErrQueueFull,
+			submitErr:  task.ErrTooManyPending,
 			wantStatus: http.StatusServiceUnavailable,
-			wantCode:   "queue_full",
+			wantCode:   "task_limit",
 		},
 		{
-			name:       "queue closed",
+			name:       "database error",
 			body:       `{"file_ids":["file-a"],"name":"bundle.zip"}`,
-			submitErr:  queue.ErrQueueClosed,
-			wantStatus: http.StatusServiceUnavailable,
-			wantCode:   "queue_shutdown",
+			submitErr:  errors.New("database down"),
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "internal_error",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tasks := newFakeTaskQueue()
+			tasks := newFakeTaskService()
 			tasks.submitErr = tc.submitErr
-			router := newTaskRouter(t, tasks)
+			router := newTaskRouter(t, tasks, newFakeTaskSnapshots())
 
 			recorder := httptest.NewRecorder()
 			router.ServeHTTP(recorder, taskRequest(http.MethodPost, "/api/archive-tasks", tc.body, testTokenA))
@@ -156,19 +199,70 @@ func TestCreateArchiveTask(t *testing.T) {
 			if body.TaskID != "task-1" {
 				t.Fatalf("task_id = %q, want task-1", body.TaskID)
 			}
-			if len(tasks.jobs) != 1 || tasks.owners[0] != testUserAID {
-				t.Fatalf("submitted owners = %v, want one task for user %d", tasks.owners, testUserAID)
+
+			// 提交给持久化层的是可重建的输入参数，不是 Job 指针。
+			if len(tasks.submitted) != 1 {
+				t.Fatalf("submitted %d tasks, want 1", len(tasks.submitted))
 			}
-			if _, ok := tasks.jobs[0].(*archive.Job); !ok {
-				t.Fatalf("submitted job is %T, want *archive.Job", tasks.jobs[0])
+			submitted := tasks.submitted[0]
+			if submitted.OwnerID != testUserAID ||
+				submitted.Type != archive.TaskType ||
+				submitted.Phase != "prepare" ||
+				submitted.StateVersion != archive.TaskStateVersion {
+				t.Fatalf("unexpected submit params: %+v", submitted)
+			}
+			var state archive.TaskState
+			if err := json.Unmarshal([]byte(submitted.StateJSON), &state); err != nil {
+				t.Fatal(err)
+			}
+			if len(state.SourceIDs) != 2 ||
+				state.SourceIDs[0] != "file-a" ||
+				state.SourceIDs[1] != "file-b" ||
+				state.ParentID != "dir-1" ||
+				state.Name != "bundle.zip" {
+				t.Fatalf("unexpected archive state: %+v", state)
 			}
 		})
 	}
 }
 
 func TestGetTask(t *testing.T) {
-	tasks := newFakeTaskQueue()
-	tasks.setTask(queue.Snapshot{
+	tasks := newFakeTaskService()
+	tasks.setTask(model.Task{
+		ID:      "task-running",
+		OwnerID: testUserAID,
+		Status:  model.TaskStatusRunning,
+		Phase:   "compress",
+	})
+	result := "file-9"
+	tasks.setTask(model.Task{
+		ID:           "task-done",
+		OwnerID:      testUserAID,
+		Status:       model.TaskStatusCompleted,
+		Phase:        "publish",
+		ResultFileID: &result,
+	})
+	tasks.setTask(model.Task{
+		ID:        "task-retry",
+		OwnerID:   testUserAID,
+		Status:    model.TaskStatusRetryWait,
+		Phase:     "prepare",
+		LastError: "temporary",
+	})
+	tasks.setTask(model.Task{
+		ID:      "task-queued",
+		OwnerID: testUserAID,
+		Status:  model.TaskStatusQueued,
+		Phase:   "prepare",
+	})
+	tasks.setTask(model.Task{
+		ID:      "task-other",
+		OwnerID: testUserBID,
+		Status:  model.TaskStatusQueued,
+	})
+
+	snapshots := newFakeTaskSnapshots()
+	snapshots.setTask(queue.Snapshot{
 		ID:        "task-running",
 		OwnerID:   testUserAID,
 		Status:    queue.Running,
@@ -176,7 +270,7 @@ func TestGetTask(t *testing.T) {
 		Processed: 1,
 		Total:     3,
 	})
-	tasks.setTask(queue.Snapshot{
+	snapshots.setTask(queue.Snapshot{
 		ID:        "task-done",
 		OwnerID:   testUserAID,
 		Status:    queue.Completed,
@@ -185,14 +279,23 @@ func TestGetTask(t *testing.T) {
 		Total:     3,
 		Result:    "file-9",
 	})
-	tasks.setTask(queue.Snapshot{
-		ID:      "task-other",
-		OwnerID: testUserBID,
-		Status:  queue.Queued,
-		Stage:   "queued",
+	// 等待重试时内存快照可能还是上一轮失败，状态必须以数据库为准。
+	snapshots.setTask(queue.Snapshot{
+		ID:      "task-retry",
+		OwnerID: testUserAID,
+		Status:  queue.Failed,
+		Stage:   "failed",
+	})
+	// 数据库已经重新排队，但内存里还是上一轮的 failed 快照：
+	// 展示阶段不能跟着显示 failed。
+	snapshots.setTask(queue.Snapshot{
+		ID:      "task-queued",
+		OwnerID: testUserAID,
+		Status:  queue.Failed,
+		Stage:   "failed",
 	})
 
-	router := newTaskRouter(t, tasks)
+	router := newTaskRouter(t, tasks, snapshots)
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, taskRequest(http.MethodGet, "/api/tasks/task-running", "", testTokenA))
@@ -218,8 +321,35 @@ func TestGetTask(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &done); err != nil {
 		t.Fatal(err)
 	}
-	if done.Status != "completed" || done.ResultFileID != "file-9" {
+	if done.Status != "completed" || done.Stage != "completed" ||
+		done.ResultFileID != "file-9" || done.ProcessedFiles != 3 || done.TotalFiles != 3 {
 		t.Fatalf("unexpected completed task: %+v", done)
+	}
+
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, taskRequest(http.MethodGet, "/api/tasks/task-retry", "", testTokenA))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var retry taskStatusResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &retry); err != nil {
+		t.Fatal(err)
+	}
+	if retry.Status != "retry_wait" || retry.Stage != "prepare" || retry.Error != "temporary" {
+		t.Fatalf("database status must win over stale snapshot: %+v", retry)
+	}
+
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, taskRequest(http.MethodGet, "/api/tasks/task-queued", "", testTokenA))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var queued taskStatusResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &queued); err != nil {
+		t.Fatal(err)
+	}
+	if queued.Status != "queued" || queued.Stage != "prepare" {
+		t.Fatalf("stale failed snapshot must not override queued stage: %+v", queued)
 	}
 
 	// 别人的任务和不存在的任务必须同样返回 404。
