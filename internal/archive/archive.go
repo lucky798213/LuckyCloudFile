@@ -4,13 +4,16 @@
 // 写服务器自己的临时 ZIP，完成后通过已有上传会话链发布成普通文件。
 // 它不知道 HTTP、队列调度和数据库表结构。
 //
-// 失败语义：任一源文件打不开或读不完，整个任务失败，不发布半成品 ZIP；
-// 临时文件无论成功失败都会删除。
+// 失败语义：任一源文件打不开或读不完，整个任务失败，不发布半成品 ZIP。
+// 一次性 Run 结束时总会删除临时 ZIP；可恢复任务只在 finalize 成功后删除
+// 工作目录，失败重试时保留已提交的完整产物供 publish 阶段复用。
 package archive
 
 import (
 	"archive/zip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -84,6 +87,11 @@ type Options struct {
 	// 文件名由 os.CreateTemp 生成，不使用客户端的任何名字。
 	TempDir string
 
+	// WorkDir 是持久化任务的工作根目录；为空时使用 os.TempDir()。
+	// 每个任务在它下面的 task-<taskID> 里写完整 ZIP，路径会写进检查点。
+	// 直接调用 Run 的一次性任务不使用这个目录。
+	WorkDir string
+
 	MaxFiles        int
 	MaxSourceBytes  int64
 	MaxArchiveBytes int64
@@ -101,6 +109,7 @@ type Job struct {
 	name      string
 
 	tempDir         string
+	workDir         string
 	maxSourceBytes  int64
 	maxArchiveBytes int64
 	logger          *slog.Logger
@@ -145,6 +154,10 @@ func New(
 	if tempDir == "" {
 		tempDir = os.TempDir()
 	}
+	workDir := opts.WorkDir
+	if workDir == "" {
+		workDir = os.TempDir()
+	}
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -157,6 +170,7 @@ func New(
 		parentID:        state.ParentID,
 		name:            state.Name,
 		tempDir:         tempDir,
+		workDir:         workDir,
 		maxSourceBytes:  maxSourceBytes,
 		maxArchiveBytes: maxArchiveBytes,
 		logger:          logger,
@@ -171,7 +185,7 @@ func (j *Job) Run(ctx context.Context) (string, error) {
 
 // RunWithProgress 生成 ZIP 并发布，返回发布后的结果文件 ID。
 //
-// 只有 ZIP writer、文件 Close、会话上传和完成都成功才返回 nil；
+// 只有 ZIP writer、文件 Sync/Close、会话上传和完成都成功才返回 nil；
 // 临时 ZIP 在返回前删除。只有 CompleteUploadSession 成功才算任务成功。
 func (j *Job) RunWithProgress(ctx context.Context, report queue.ProgressFunc) (string, error) {
 	out, err := os.CreateTemp(j.tempDir, "archive-*.zip")
@@ -179,40 +193,16 @@ func (j *Job) RunWithProgress(ctx context.Context, report queue.ProgressFunc) (s
 		return "", fmt.Errorf("archive: create temporary file: %w", err)
 	}
 	path := out.Name()
-	// 先注册删除、再注册关闭：返回时先关闭句柄再删文件（Windows 上也能删）。
-	// 正常路径仍显式 Close 并检查错误，这里只兜 panic 跳过的关闭。
+	if err := out.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("archive: close temporary file: %w", err)
+	}
+	// 一次性任务无论成功失败都删除临时 ZIP；可恢复任务由 finalize 清理。
 	defer j.removeTemp(path)
-	defer out.Close()
 
-	total := len(j.sourceIDs)
-	j.report(report, queue.Progress{Stage: "compressing", Total: total})
-
-	// 输出上限包在 zip.Writer 外层：ZIP 的条目头和中央目录也会被计入。
-	zw := zip.NewWriter(&limitWriter{w: out, remaining: j.maxArchiveBytes})
-
-	buildErr := j.writeEntries(ctx, zw, report)
-	// 无论成功失败都关闭 writer 和文件，避免句柄泄漏；
-	// 但失败路径只报告 buildErr，避免用半成品的关闭错误掩盖真实原因。
-	zipErr := zw.Close()
-	fileErr := out.Close()
-
-	if buildErr != nil {
-		return "", buildErr
-	}
-	if zipErr != nil {
-		return "", fmt.Errorf("archive: finalize zip: %w", zipErr)
-	}
-	if fileErr != nil {
-		return "", fmt.Errorf("archive: close temporary file: %w", fileErr)
-	}
-
-	info, err := os.Stat(path)
+	size, _, err := j.writeArchive(ctx, path, report)
 	if err != nil {
-		return "", fmt.Errorf("archive: stat temporary file: %w", err)
-	}
-	// limitWriter 已经拦截超限；这里再按落盘大小核对一次。
-	if info.Size() > j.maxArchiveBytes {
-		return "", fmt.Errorf("%w: limit is %d bytes", ErrArchiveTooLarge, j.maxArchiveBytes)
+		return "", err
 	}
 
 	// 压缩期间被取消：不要在这个边界之后发布结果。
@@ -220,7 +210,65 @@ func (j *Job) RunWithProgress(ctx context.Context, report queue.ProgressFunc) (s
 		return "", err
 	}
 
-	return j.publish(ctx, path, info.Size(), report)
+	return j.publish(ctx, path, size, report)
+}
+
+// writeArchive 把一个完整 ZIP 写到 path（覆盖已有内容），返回字节数和 SHA-256。
+//
+// 它只生成产物，不发布；一次性 Run 和可恢复的 compress 阶段共用它。
+// 写入过程中同步计算摘要，最后 Sync + Close，成功返回时文件已经完整。
+func (j *Job) writeArchive(
+	ctx context.Context,
+	path string,
+	report queue.ProgressFunc,
+) (int64, string, error) {
+	out, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return 0, "", fmt.Errorf("archive: create archive file: %w", err)
+	}
+	// 正常路径会显式 Close 并检查错误；这里只兜 panic 跳过的关闭。
+	defer out.Close()
+
+	total := len(j.sourceIDs)
+	j.report(report, queue.Progress{Stage: "compressing", Total: total})
+
+	// 摘要和 limitWriter 看到的是同一批字节：ZIP 条目头、内容和中央目录
+	// 都会经过这里，所以校验的是最终产物，不是源文件。
+	digest := sha256.New()
+	zw := zip.NewWriter(io.MultiWriter(
+		&limitWriter{w: out, remaining: j.maxArchiveBytes},
+		digest,
+	))
+
+	buildErr := j.writeEntries(ctx, zw, report)
+	// 无论成功失败都关闭 writer 和文件，避免句柄泄漏；
+	// 但失败路径只报告 buildErr，避免用半成品的关闭错误掩盖真实原因。
+	zipErr := zw.Close()
+	syncErr := out.Sync()
+	fileErr := out.Close()
+
+	if buildErr != nil {
+		return 0, "", buildErr
+	}
+	if zipErr != nil {
+		return 0, "", fmt.Errorf("archive: finalize zip: %w", zipErr)
+	}
+	if syncErr != nil {
+		return 0, "", fmt.Errorf("archive: sync archive file: %w", syncErr)
+	}
+	if fileErr != nil {
+		return 0, "", fmt.Errorf("archive: close archive file: %w", fileErr)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, "", fmt.Errorf("archive: stat archive file: %w", err)
+	}
+	// limitWriter 已经拦截超限；这里再按落盘大小核对一次。
+	if info.Size() > j.maxArchiveBytes {
+		return 0, "", fmt.Errorf("%w: limit is %d bytes", ErrArchiveTooLarge, j.maxArchiveBytes)
+	}
+	return info.Size(), hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 // publish 通过已有上传会话链发布 ZIP：

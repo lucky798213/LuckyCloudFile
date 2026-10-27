@@ -122,7 +122,7 @@ func createArchiveTask(logger *slog.Logger, tasks taskService) gin.HandlerFunc {
 		submitted, err := tasks.Submit(c.Request.Context(), task.CreateParams{
 			Type:         archive.TaskType,
 			OwnerID:      ownerID,
-			Phase:        "prepare",
+			Phase:        archive.PhasePrepare,
 			StateVersion: archive.TaskStateVersion,
 			StateJSON:    string(stateJSON),
 		})

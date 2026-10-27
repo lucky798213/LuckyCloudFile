@@ -98,6 +98,20 @@ func run(
 	// MaxPendingTasks 限制数据库里的未终态积压，不随内存队列上限浮动。
 	taskService := task.NewService(db).WithMaxPending(cfg.Task.MaxPendingTasks)
 
+	// 任务类型注册表：type → 重建工厂。工厂依赖在这里注入一次；恢复时
+	// 只读取 tasks 记录里的 owner、phase 和 state_json，没有旧 Job 指针。
+	taskFactories := task.NewRegistry()
+	if err := taskFactories.Register(
+		archive.TaskType,
+		archive.NewTaskFactory(
+			fileService,
+			taskService,
+			archive.Options{Logger: logger},
+		),
+	); err != nil {
+		return fmt.Errorf("register archive task factory: %w", err)
+	}
+
 	// 任务队列随应用生命周期创建和关闭。关闭顺序是：
 	// HTTP 先停止接收（serve 内部完成）→ 调度器停止扫描 → 队列取消执行并
 	// 等 worker 退出 → database.Close（更早注册的 defer 最后执行）。
@@ -122,7 +136,7 @@ func run(
 	taskDispatcher, err := task.NewDispatcher(task.DispatcherOptions{
 		Service:      taskService,
 		Queue:        taskQueue,
-		Runner:       archive.NewTaskRunner(fileService, archive.Options{Logger: logger}),
+		Runner:       taskFactories,
 		ScanInterval: time.Duration(cfg.Task.ScanIntervalSeconds) * time.Second,
 		BatchSize:    cfg.Task.ScanBatchSize,
 		Logger:       logger,
