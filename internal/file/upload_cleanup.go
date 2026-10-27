@@ -62,7 +62,10 @@ func (s *Service) handoffTerminatedSession(
 	handoffCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), orphanCleanupTimeout)
 	defer cancel()
 
-	var entityID int64
+	var (
+		entityID   int64
+		terminated bool
+	)
 	err := s.db.WithContext(handoffCtx).Transaction(func(tx *gorm.DB) error {
 		var session model.UploadSession
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -84,6 +87,7 @@ func (s *Service) handoffTerminatedSession(
 
 		// 会话已经进入终态，分片账本不会再有合法请求使用。
 		// 物理清理可能失败，但账本不需要跟着重试。
+		terminated = true
 		s.chunks.remove(sessionID)
 
 		var entity model.Entity
@@ -134,6 +138,11 @@ func (s *Service) handoffTerminatedSession(
 	})
 	if err != nil {
 		return err
+	}
+	if terminated {
+		// 终态清理也关闭资源锁：取消/过期路径已经关过一次，这里是幂等的。
+		// 物理删除失败不会让锁一直保留，后续交给现有清理器重试。
+		s.closeUploadSessionLock(sessionID)
 	}
 	if entityID == 0 {
 		return nil

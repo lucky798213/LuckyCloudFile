@@ -118,10 +118,11 @@ func TestCreateUploadSessionAllowsEmptyFile(t *testing.T) {
 	}
 }
 
-// TestCreateUploadSessionUsesTargetDirectoryAndDoesNotReserveName 验证两点：
+// TestCreateUploadSessionReservesTargetName 验证三点：
 //   - 会话保存显式传入的目录 ID；
-//   - 创建会话不预占文件名，同名会话可以先建多个。
-func TestCreateUploadSessionUsesTargetDirectoryAndDoesNotReserveName(t *testing.T) {
+//   - 创建会话时占住最终目标，同名会话不能同时存在；
+//   - 前一个会话取消后目标锁释放，同名会话可以重新创建。
+func TestCreateUploadSessionReservesTargetName(t *testing.T) {
 	env := newTestEnv(t)
 	ctx := context.Background()
 
@@ -134,21 +135,31 @@ func TestCreateUploadSessionUsesTargetDirectoryAndDoesNotReserveName(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := env.service.CreateUploadSession(
+		ctx, env.ownerA.ID, dir.ID, "same.bin", 2,
+	); !errors.Is(err, ErrUploadSessionConflict) {
+		t.Fatalf("second session with the same name error = %v, want ErrUploadSessionConflict", err)
+	}
+	if got := countRows(t, env.db, &model.UploadSession{}); got != 1 {
+		t.Fatalf("wanted 1 session, got %d", got)
+	}
+	if got := countRows(t, env.db, &model.Entity{}); got != 1 {
+		t.Fatalf("wanted 1 placeholder entity, got %d", got)
+	}
+
+	// 取消先结束会话生命周期并释放目标锁，同名会话才能重新开始。
+	if _, err := env.service.CancelUploadSession(ctx, env.ownerA.ID, first.ID); err != nil {
+		t.Fatal(err)
+	}
 	second, err := env.service.CreateUploadSession(ctx, env.ownerA.ID, dir.ID, "same.bin", 2)
 	if err != nil {
-		t.Fatalf("creating a second session with the same name must succeed: %v", err)
+		t.Fatalf("creating a session after cancel must succeed: %v", err)
 	}
 	if first.ParentID != dir.ID || second.ParentID != dir.ID {
 		t.Fatalf("session parents = %q / %q, want %q", first.ParentID, second.ParentID, dir.ID)
 	}
 	if first.ID == second.ID {
 		t.Fatal("two sessions got the same ID")
-	}
-	if got := countRows(t, env.db, &model.UploadSession{}); got != 2 {
-		t.Fatalf("wanted 2 sessions, got %d", got)
-	}
-	if got := countRows(t, env.db, &model.Entity{}); got != 2 {
-		t.Fatalf("wanted 2 placeholder entities, got %d", got)
 	}
 	if got := countKind(t, env.db, model.KindFile); got != 0 {
 		t.Fatalf("sessions created %d formal file(s)", got)

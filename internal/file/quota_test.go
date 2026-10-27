@@ -195,7 +195,10 @@ func TestCompleteUploadSessionSettlesQuotaOnce(t *testing.T) {
 }
 
 // TestCompleteUploadSessionFailureKeepsReservation 覆盖“发布失败但预留保留”：
-// 同名冲突让整个事务回滚，预留不能被回滚掉；删除冲突后可以重试完成。
+// 事务回滚后预留不能被回滚掉；同一个会话在有效期内可以重试完成。
+//
+// 失败用一次性数据库错误模拟，而不是真的制造同名冲突：会话目标路径被
+// 资源锁占住，同名冲突文件在会话存活期间也无法通过 Service 删除。
 func TestCompleteUploadSessionFailureKeepsReservation(t *testing.T) {
 	env := newTestEnv(t)
 	ctx := context.Background()
@@ -203,37 +206,54 @@ func TestCompleteUploadSessionFailureKeepsReservation(t *testing.T) {
 	const size = int64(5)
 	setUserQuota(t, env.db, env.ownerA.ID, 100)
 
-	created, _, _ := mustReadyUploadSession(t, env, env.ownerA.ID, "conflict.txt", "hello")
+	created, _, _ := mustReadyUploadSession(t, env, env.ownerA.ID, "retry.bin", "hello")
 	assertAccounting(t, env.db, env.ownerA.ID, 0, size)
 
-	// 先在同一个目录放一个同名文件，让完成时的唯一索引冲突。
-	conflict, err := env.service.Upload(ctx, env.ownerA.ID, "", "conflict.txt", strings.NewReader("other"))
-	if err != nil {
+	const callbackName = "test:fail_completion_update_once"
+	forcedErr := errors.New("forced completion update failure")
+	failed := false
+	if err := env.db.Callback().Update().Before("gorm:update").Register(
+		callbackName,
+		func(tx *gorm.DB) {
+			if failed || tx.Statement.Schema == nil ||
+				tx.Statement.Schema.Table != (model.UploadSession{}).TableName() {
+				return
+			}
+			failed = true
+			_ = tx.AddError(forcedErr)
+		},
+	); err != nil {
 		t.Fatal(err)
 	}
-	assertAccounting(t, env.db, env.ownerA.ID, size, size)
+	t.Cleanup(func() {
+		if err := env.db.Callback().Update().Remove(callbackName); err != nil {
+			t.Logf("remove test callback: %v", err)
+		}
+	})
 
-	if _, err := env.service.CompleteUploadSession(ctx, env.ownerA.ID, created.ID); !errors.Is(err, ErrAlreadyExists) {
-		t.Fatalf("conflicting completion error = %v, want ErrAlreadyExists", err)
+	if _, err := env.service.CompleteUploadSession(ctx, env.ownerA.ID, created.ID); !errors.Is(err, forcedErr) {
+		t.Fatalf("failed completion error = %v, want forced failure", err)
 	}
 	// 事务回滚：会话仍然 ready，预留和已用都没有变化，内容也还在。
 	session := loadSessionOnly(t, env, created.ID)
 	if session.Status != model.UploadStatusReady {
 		t.Fatalf("failed completion status = %q, want ready", session.Status)
 	}
-	assertAccounting(t, env.db, env.ownerA.ID, size, size)
-	assertSessionReserved(t, env.db, created.ID, size)
-
-	// 移除冲突后再完成：只结算这一次，最终 used 是两份文件的大小。
-	if err := env.service.Delete(ctx, env.ownerA.ID, conflict.ID); err != nil {
-		t.Fatal(err)
-	}
 	assertAccounting(t, env.db, env.ownerA.ID, 0, size)
+	assertSessionReserved(t, env.db, created.ID, size)
+	if _, ok := env.service.uploadLocks.lookup(created.ID); !ok {
+		t.Fatal("failed completion must keep the session resource lock for retry")
+	}
+
+	// 会话锁没有被失败释放：同一个会话重试完成，只结算这一次。
 	if _, err := env.service.CompleteUploadSession(ctx, env.ownerA.ID, created.ID); err != nil {
-		t.Fatal(err)
+		t.Fatalf("retry completion: %v", err)
 	}
 	assertAccounting(t, env.db, env.ownerA.ID, size, 0)
 	assertSessionReserved(t, env.db, created.ID, 0)
+	if _, ok := env.service.uploadLocks.lookup(created.ID); ok {
+		t.Fatal("completed session must release the resource lock")
+	}
 }
 
 // TestTerminatedUploadSessionsReleaseReservationOnce 对应验收 4 和 7 的账目部分：

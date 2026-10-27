@@ -5,11 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"time"
 
 	"gorm.io/gorm"
 
 	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/pathlock"
+)
+
+const (
+	// 路径冲突通常只持续一个短事务；短暂等待后重试，避免把并发写直接变成 500。
+	pathLockRetryAttempts = 100
+	pathLockRetryDelay    = 5 * time.Millisecond
 )
 
 // maxPathDepth 限制从节点走到根目录的层数，异常数据不能把请求拖死。
@@ -18,6 +25,10 @@ const maxPathDepth = 1000
 // ErrResourceChanged 表示读取路径快照之后、取得锁之前，数据库里的节点变了。
 // 调用方应释放旧快照并重新发起操作，不能继续按旧路径执行。
 var ErrResourceChanged = errors.New("file path changed while acquiring lock")
+
+// ErrResourceLocked 表示目标路径正被另一个操作占用，例如进行中的上传会话
+// 已经占住了最终目标。HTTP 层把它映射成 409。
+var ErrResourceLocked = pathlock.ErrConflict
 
 // nodeSnapshot 是路径上一个节点的身份和层级信息。
 type nodeSnapshot struct {
@@ -43,6 +54,10 @@ type pathSnapshot struct {
 type pathLockRequest struct {
 	Snapshot pathSnapshot
 	Scope    pathlock.Scope
+
+	// ExpiresAt 是这把锁的过期时间。零值表示永不过期；
+	// 上传会话锁直接用会话的 ExpiresAt，避免上传会话还活着但锁先失效。
+	ExpiresAt time.Time
 }
 
 // resolvePath 从 nodeID 沿 parent_id 向上读取，构造用户虚拟路径。
@@ -173,14 +188,20 @@ func (s *Service) resolveTargetPath(
 	}, nil
 }
 
-// verifyPathSnapshot 重新查询快照里的每一个节点，并逐字段比较。
-//
-// 必须按快照遍历，而不是只遍历查询结果：如果某个节点已经被删除，查询结果里
-// 少了它，也只有按快照核对才能发现。
+// verifyPathSnapshot 用服务自己的连接复查快照，供测试和事务外调用使用。
 func (s *Service) verifyPathSnapshot(ctx context.Context, snapshot pathSnapshot) error {
+	return verifyPathSnapshotWith(ctx, s.db, snapshot)
+}
+
+// verifyPathSnapshotWith 重新查询快照里的每一个节点，并逐字段比较。
+//
+// 传入 tx 时，复查发生在已经开始的数据库事务里。必须按快照遍历，
+// 而不是只遍历查询结果：如果某个节点已经被删除，查询结果里少了它，
+// 也只有按快照核对才能发现。
+func verifyPathSnapshotWith(ctx context.Context, db *gorm.DB, snapshot pathSnapshot) error {
 	for _, node := range snapshot.Ancestors {
 		var record model.File
-		err := s.db.WithContext(ctx).First(&record, "id = ?", node.ID).Error
+		err := db.WithContext(ctx).First(&record, "id = ?", node.ID).Error
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return fmt.Errorf("%w: node %s no longer exists", ErrResourceChanged, node.ID)
@@ -199,17 +220,21 @@ func (s *Service) verifyPathSnapshot(ctx context.Context, snapshot pathSnapshot)
 	return nil
 }
 
-// acquirePathLocks 批量申请路径锁，并在锁内复查所有快照。
+// pathLockGuard 保存本次批量申请的锁和对应的 Confirm 短时保护。
+type pathLockGuard struct {
+	manager  *pathlock.Manager
+	leases   []pathlock.Lease
+	releases []func()
+}
+
+// acquirePathLocks 批量申请路径锁，并为每把锁进入一次 Confirm 短时保护。
 //
-// 成功时返回的 release 必须由调用方在操作结束后调用。复查发现节点被删除或
-// 字段变化时，先释放本次申请的全部锁，再返回 ErrResourceChanged，调用方应
-// 重新解析路径并重试，不能继续使用旧快照。
-func (s *Service) acquirePathLocks(
-	ctx context.Context,
-	requests ...pathLockRequest,
-) (func(), error) {
+// 锁的粒度由调用方按路径和操作类型决定。成功后必须调用 release：
+// 先退出短时保护，再 Unlock 本次申请的全部锁。
+func (s *Service) acquirePathLocks(requests ...pathLockRequest) (*pathLockGuard, error) {
+	guard := &pathLockGuard{manager: s.pathLocks}
 	if len(requests) == 0 {
-		return func() {}, nil
+		return guard, nil
 	}
 
 	locks := make([]pathlock.Request, len(requests))
@@ -218,6 +243,7 @@ func (s *Service) acquirePathLocks(
 			Namespace: request.Snapshot.Namespace,
 			Path:      request.Snapshot.Path,
 			Scope:     request.Scope,
+			ExpiresAt: request.ExpiresAt,
 		}
 	}
 
@@ -225,21 +251,166 @@ func (s *Service) acquirePathLocks(
 	if err != nil {
 		return nil, err
 	}
+	guard.leases = leases
 
-	release := func() {
-		for _, lease := range leases {
-			_ = s.pathLocks.Unlock(lease.Request.Namespace, lease.Token)
+	for _, lease := range leases {
+		release, err := s.pathLocks.Confirm(
+			lease.Request.Namespace,
+			lease.Request.Path,
+			lease.Token,
+		)
+		if err != nil {
+			guard.release()
+			return nil, err
+		}
+		guard.releases = append(guard.releases, release)
+	}
+	return guard, nil
+}
+
+// release 先退出全部短时保护，再释放本次申请的资源锁。
+func (g *pathLockGuard) release() {
+	if g == nil {
+		return
+	}
+	g.releaseProtection()
+	g.unlock()
+}
+
+// releaseProtection 只退出本次短时保护，保留资源锁供后续 Confirm。
+//
+// 上传会话创建成功后用它结束创建请求的保护：锁本身要跨请求保留到
+// 会话完成、取消或过期。
+func (g *pathLockGuard) releaseProtection() {
+	if g == nil {
+		return
+	}
+	for _, release := range g.releases {
+		release()
+	}
+	g.releases = nil
+}
+
+// unlock 释放本次申请的资源锁。调用方必须先退出自己的短时保护。
+func (g *pathLockGuard) unlock() {
+	if g == nil {
+		return
+	}
+	for _, lease := range g.leases {
+		_ = g.manager.Unlock(lease.Request.Namespace, lease.Token)
+	}
+	g.leases = nil
+}
+
+// withLockedTx 在资源锁和短时保护内开启事务，先复查快照，再执行 fn。
+func (s *Service) withLockedTx(
+	ctx context.Context,
+	requests []pathLockRequest,
+	fn func(tx *gorm.DB) error,
+) error {
+	guard, err := s.acquirePathLocks(requests...)
+	if err != nil {
+		return err
+	}
+	defer guard.release()
+
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := verifyPathSnapshotsWith(ctx, tx, requests); err != nil {
+			return err
+		}
+		return fn(tx)
+	})
+}
+
+func verifyPathSnapshotsWith(ctx context.Context, db *gorm.DB, requests []pathLockRequest) error {
+	for _, request := range requests {
+		if err := verifyPathSnapshotWith(ctx, db, request.Snapshot); err != nil {
+			return err
 		}
 	}
+	return nil
+}
 
-	for _, request := range requests {
-		if err := s.verifyPathSnapshot(ctx, request.Snapshot); err != nil {
-			release()
+// runLockedOperation 先解析快照，再在锁内执行事务。
+//
+// 另一请求正持有一把冲突的锁，或者解析之后路径被改动时，重新解析快照并重试。
+// 这样同一个路径上的并发操作会串行完成，而不是直接返回一个内部错误。
+func (s *Service) runLockedOperation(
+	ctx context.Context,
+	prepare func() ([]pathLockRequest, error),
+	fn func(tx *gorm.DB) error,
+) error {
+	var lastErr error
+	for attempt := 0; attempt < pathLockRetryAttempts; attempt++ {
+		requests, err := prepare()
+		if err != nil {
+			return err
+		}
+
+		lastErr = s.withLockedTx(ctx, requests, fn)
+		if !isRetryablePathError(lastErr) {
+			return lastErr
+		}
+		if err := waitPathLockRetry(ctx); err != nil {
+			return err
+		}
+	}
+	return lastErr
+}
+
+// acquirePathLocksWithRetry 用于 Upload：在读取内容之前先拿到目标路径锁。
+func (s *Service) acquirePathLocksWithRetry(
+	ctx context.Context,
+	prepare func() ([]pathLockRequest, error),
+) (*pathLockGuard, error) {
+	var lastErr error
+	for attempt := 0; attempt < pathLockRetryAttempts; attempt++ {
+		requests, err := prepare()
+		if err != nil {
+			return nil, err
+		}
+
+		guard, err := s.acquirePathLocks(requests...)
+		if err == nil {
+			return guard, nil
+		}
+		if !errors.Is(err, pathlock.ErrConflict) {
+			return nil, err
+		}
+
+		lastErr = err
+		if err := waitPathLockRetry(ctx); err != nil {
 			return nil, err
 		}
 	}
+	return nil, lastErr
+}
 
-	return release, nil
+func isRetryablePathError(err error) bool {
+	return errors.Is(err, pathlock.ErrConflict) || errors.Is(err, ErrResourceChanged)
+}
+
+func waitPathLockRetry(ctx context.Context) error {
+	timer := time.NewTimer(pathLockRetryDelay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// snapshotContainsNode 判断快照的祖先链里是否包含指定节点。
+// 用于目录移动的成环预检：看目标父目录是不是源目录本身或它的后代。
+func snapshotContainsNode(snapshot pathSnapshot, nodeID string) bool {
+	for _, ancestor := range snapshot.Ancestors {
+		if ancestor.ID == nodeID {
+			return true
+		}
+	}
+	return false
 }
 
 func equalParentID(a, b *string) bool {

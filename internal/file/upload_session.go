@@ -10,6 +10,7 @@ import (
 
 	"luckyCloudFile/internal/idgen"
 	"luckyCloudFile/internal/model"
+	"luckyCloudFile/internal/pathlock"
 	"luckyCloudFile/internal/quota"
 	"luckyCloudFile/internal/upload"
 )
@@ -71,15 +72,19 @@ func (s *Service) CreateUploadSession(
 //
 // 顺序：
 //  1. 校验模式、名字和大小；
-//  2. 校验目标目录（为空时解析成当前用户根目录）；
+//  2. 解析目标目录和最终虚拟路径（parentID 为空时解析成当前用户根目录）；
 //  3. 读取一次用户默认存储策略，确认驱动已注册；
 //  4. 生成会话 ID 和占位内容的 storage key；
-//  5. 在一个事务里：锁用户 → 原子预留容量 → 重新检查目录
+//  5. 申请最终目标路径的节点锁并 Confirm：锁的过期时间与会话 ExpiresAt 一致；
+//  6. 在事务提交前建立 sessionID → 资源锁绑定；
+//  7. 在一个事务里：锁用户 → 原子预留容量 → 按快照复查父目录链
 //     → 写入占位 Entity 和 UploadSession。
 //
 // 容量始终按整个文件大小预留一次，分片上传不会重复预留；预留、占位记录
 // 和会话必须一起成功。剩余容量不足时返回 ErrQuotaExceeded；后面任何一步
-// 失败都会让整个事务回滚，预留和占位 Entity 一起撤销。
+// 失败都会让整个事务回滚，预留和占位 Entity 一起撤销，创建时申请的锁也
+// 一并释放。事务返回错误但可能已经提交时，用独立短事务的锁定读核对会话，
+// 锁定读会等待原事务结束；确认存在就保留锁，超时无法确认也保留锁。
 // 空文件（size=0）只允许 full 模式，不占容量。
 func (s *Service) CreateUploadSessionWithMode(
 	ctx context.Context,
@@ -115,11 +120,13 @@ func (s *Service) CreateUploadSessionWithMode(
 		}
 	}
 
-	// 先做一次目录校验，快速拒绝明显不合法的请求；事务里还会再查一次。
-	parent, err := s.requireDirectory(ctx, ownerID, parentID)
+	// 先解析目标路径。锁按虚拟路径申请，快照里的祖先链稍后还要在事务内
+	// 复查；目标节点本身尚未落库，所以快照只包含已经存在的父目录链。
+	target, err := s.resolveTargetPath(ctx, ownerID, parentID, name)
 	if err != nil {
 		return UploadSessionInfo{}, err
 	}
+	parentNode := target.Ancestors[len(target.Ancestors)-1]
 
 	// 本次上传只选一次策略。占位实体记住这个策略 ID，
 	// 后续传输内容时直接使用它，不再跟随用户默认策略变化。
@@ -137,10 +144,12 @@ func (s *Service) CreateUploadSessionWithMode(
 		return UploadSessionInfo{}, err
 	}
 
+	// 会话和资源锁共用同一个过期时间：锁不会比会话先失效。
+	expiresAt := time.Now().Add(UploadSessionTTL)
 	session := model.UploadSession{
 		ID:            sessionID,
 		OwnerID:       ownerID,
-		ParentID:      parent.ID,
+		ParentID:      parentNode.ID,
 		Name:          name,
 		ExpectedSize:  size,
 		ActualSize:    0,
@@ -148,8 +157,37 @@ func (s *Service) CreateUploadSessionWithMode(
 		ChunkSize:     chunkSize,
 		ReservedBytes: size,
 		Status:        status,
-		ExpiresAt:     time.Now().Add(UploadSessionTTL),
+		ExpiresAt:     expiresAt,
 	}
+
+	// 先占住最终目标，再创建会话。锁覆盖整个会话生命周期，直到完成、
+	// 取消或过期；这里的短时保护只覆盖本次创建请求。
+	guard, err := s.acquirePathLocks(pathLockRequest{
+		Snapshot:  target,
+		Scope:     pathlock.Node,
+		ExpiresAt: expiresAt,
+	})
+	if err != nil {
+		if errors.Is(err, pathlock.ErrConflict) {
+			return UploadSessionInfo{}, ErrUploadSessionConflict
+		}
+		return UploadSessionInfo{}, err
+	}
+	keepLock := false
+	defer func() {
+		if keepLock {
+			// 事务已经提交：只退出本次创建请求的保护，资源锁和绑定保留。
+			guard.releaseProtection()
+			return
+		}
+		// 确定没有会话：撤销绑定并释放锁。放在 defer 里，异常退出也不会漏锁。
+		s.uploadLocks.remove(sessionID)
+		guard.release()
+	}()
+
+	// 绑定必须在事务提交之前建立：会话一旦对其它请求可见，token 已经可用。
+	// 事务失败时用独立短事务的锁定读核对会话，再决定保留还是撤销绑定。
+	s.uploadLocks.bind(sessionID, guard.leases[0])
 
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// 容量事务固定先锁用户，再创建占位 Entity 和 Session。
@@ -164,8 +202,16 @@ func (s *Service) CreateUploadSessionWithMode(
 			return err
 		}
 
+		// 解析和加锁之间父目录链可能被改名或移动，事务内按快照复查。
+		if err := verifyPathSnapshotWith(ctx, tx, target); err != nil {
+			if errors.Is(err, ErrResourceChanged) {
+				return ErrUploadSessionConflict
+			}
+			return err
+		}
+
 		// 接收期间目录可能被删除或换到别人名下，事务内必须重新核对。
-		if _, err := queryDirectory(ctx, tx, ownerID, parent.ID); err != nil {
+		if _, err := queryDirectory(ctx, tx, ownerID, parentNode.ID); err != nil {
 			return err
 		}
 
@@ -187,8 +233,35 @@ func (s *Service) CreateUploadSessionWithMode(
 		return nil
 	})
 	if err != nil {
-		return UploadSessionInfo{}, err
+		// 提交结果不确定时，用独立短事务的锁定读核对会话是否已经提交。
+		// 锁定读会等待原事务结束，不能把“仍在提交”误判成“确定回滚”。
+		verified, keep, verifyErr := s.settleFailedUploadSessionCreation(
+			ctx, ownerID, sessionID, guard,
+		)
+		if verifyErr != nil {
+			// 核对不了就按“可能已经提交”处理：保留锁，等会话过期时回收。
+			keepLock = true
+			s.logger.Warn("cannot verify upload session creation; keeping resource lock",
+				"session_id", sessionID,
+				"path", target.Path,
+				"error", err,
+				"verify_error", verifyErr,
+			)
+			return UploadSessionInfo{}, err
+		}
+		keepLock = keep
+		if verified == nil {
+			return UploadSessionInfo{}, err
+		}
+
+		if verified.Mode == model.UploadModeChunked {
+			s.chunks.create(verified.ID)
+		}
+		return toUploadSessionInfo(*verified), nil
 	}
+
+	// 事务提交成功：资源锁和绑定保留，defer 只退出创建请求自己的短时保护。
+	keepLock = true
 
 	// 分片账本从创建时开始存在，后续请求才能跨请求累计进度。
 	// 空文件也会有一个空账本，完成/取消时统一删除。

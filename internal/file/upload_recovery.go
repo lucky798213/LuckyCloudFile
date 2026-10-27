@@ -154,5 +154,10 @@ func (s *Service) invalidateUnfinishedUploadSession(
 	if err != nil {
 		return false, err
 	}
+	if invalidated {
+		// 重启边界不恢复旧令牌：这里只是清掉当前进程里可能残留的绑定。
+		// 新进程本来就没有绑定，Unlock 是空操作。
+		s.closeUploadSessionLock(sessionID)
+	}
 	return invalidated, nil
 }

@@ -183,6 +183,9 @@ func (s *Service) expireUploadSession(
 	// 这里不等待 done：阻塞的 Read 可能很久才退出，过期扫描不能被它拖住。
 	s.uploads.cancel(sessionID)
 
+	// 关闭会话资源锁，拒绝新的 Confirm；已有保护区退出后自动移除。
+	s.closeUploadSessionLock(sessionID)
+
 	if err := s.handoffTerminatedSession(ctx, ownerID, sessionID); err != nil {
 		// 会话已经是 expired，失败只会让 Entity 留在 uploading/pending_delete，
 		// 下一轮清理会继续处理。把错误返回给调用方记录日志即可。

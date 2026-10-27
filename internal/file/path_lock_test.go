@@ -224,7 +224,7 @@ func TestPathLockRecheckRejectsRenamedParent(t *testing.T) {
 
 		<-proceed
 
-		release, err := service.acquirePathLocks(ctx, pathLockRequest{
+		release, err := service.acquirePathLocks(pathLockRequest{
 			Snapshot: snapshot,
 			Scope:    pathlock.Subtree,
 		})
@@ -232,9 +232,13 @@ func TestPathLockRecheckRejectsRenamedParent(t *testing.T) {
 			finished <- err
 			return
 		}
-		defer release()
+		defer release.release()
 
 		// 只有加锁和复查都成功，才允许执行真正的写入。
+		if err := service.verifyPathSnapshot(ctx, snapshot); err != nil {
+			finished <- err
+			return
+		}
 		_, err = service.CreateDirectory(ctx, ownerA.ID, docs.ID, "new")
 		finished <- err
 	}()
@@ -242,24 +246,8 @@ func TestPathLockRecheckRejectsRenamedParent(t *testing.T) {
 	first := <-resolved
 	var renameErr error
 	if first.err == nil {
-		// 请求 B：拿锁、改名、释放锁。
-		renameErr = func() error {
-			snapshot, err := service.resolvePath(ctx, ownerA.ID, docs.ID)
-			if err != nil {
-				return err
-			}
-			release, err := service.acquirePathLocks(ctx, pathLockRequest{
-				Snapshot: snapshot,
-				Scope:    pathlock.Subtree,
-			})
-			if err != nil {
-				return err
-			}
-			defer release()
-
-			_, err = service.Rename(ctx, ownerA.ID, docs.ID, "archive")
-			return err
-		}()
+		// 请求 B：自己完成改名。改名前后的路径锁由 Rename 内部申请和释放。
+		_, renameErr = service.Rename(ctx, ownerA.ID, docs.ID, "archive")
 	}
 
 	// 请求 A 继续：申请旧路径 /docs 的锁一定成功，但复查会发现名字已变。
@@ -298,5 +286,144 @@ func TestPathLockRecheckRejectsRenamedParent(t *testing.T) {
 	}
 	if created != 0 {
 		t.Fatalf("request A created %d nodes despite failed recheck", created)
+	}
+}
+
+// holdPathLock 在测试里手动占住一条路径，用来验证具体操作申请了哪些锁。
+func holdPathLock(
+	t *testing.T,
+	service *Service,
+	ownerID int,
+	p string,
+	scope pathlock.Scope,
+) func() {
+	t.Helper()
+
+	leases, err := service.pathLocks.Create(pathlock.Request{
+		Namespace: pathlock.Namespace(ownerID),
+		Path:      p,
+		Scope:     scope,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		for _, lease := range leases {
+			if err := service.pathLocks.Unlock(lease.Request.Namespace, lease.Token); err != nil {
+				t.Errorf("release held lock: %v", err)
+			}
+		}
+	}
+}
+
+// TestCreateDirectoryDoesNotLockCommonParent 验证同目录下创建另一个目录
+// 不会被已有文件的节点锁阻塞。
+func TestCreateDirectoryDoesNotLockCommonParent(t *testing.T) {
+	service, _, _, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	docs, err := service.CreateDirectory(ctx, ownerA.ID, "", "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Upload(ctx, ownerA.ID, docs.ID, "a.txt", strings.NewReader("a")); err != nil {
+		t.Fatal(err)
+	}
+
+	release := holdPathLock(t, service, ownerA.ID, "/docs/a.txt", pathlock.Node)
+	defer release()
+
+	if _, err := service.CreateDirectory(ctx, ownerA.ID, docs.ID, "b"); err != nil {
+		t.Fatalf("creating a sibling must not be blocked by a node lock: %v", err)
+	}
+}
+
+// TestRenameDirectoryTakesSubtreeLocks 验证目录改名申请的是子树锁：
+// 即使只占住一个子节点，改名也必须等待。
+func TestRenameDirectoryTakesSubtreeLocks(t *testing.T) {
+	service, _, _, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	tree, err := service.CreateDirectory(ctx, ownerA.ID, "", "tree")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CreateDirectory(ctx, ownerA.ID, tree.ID, "child"); err != nil {
+		t.Fatal(err)
+	}
+
+	release := holdPathLock(t, service, ownerA.ID, "/tree/child", pathlock.Node)
+	if _, err := service.Rename(ctx, ownerA.ID, tree.ID, "renamed"); !errors.Is(err, pathlock.ErrConflict) {
+		release()
+		t.Fatalf("directory rename error = %v, want ErrConflict", err)
+	}
+	release()
+
+	renamed, err := service.Rename(ctx, ownerA.ID, tree.ID, "renamed")
+	if err != nil {
+		t.Fatalf("rename after releasing child lock: %v", err)
+	}
+	if renamed.Name != "renamed" {
+		t.Fatalf("renamed directory = %+v", renamed)
+	}
+}
+
+// TestDeleteDirectoryTakesSubtreeLock 验证目录删除用子树锁，
+// 并且锁释放后仍然只允许删除空目录。
+func TestDeleteDirectoryTakesSubtreeLock(t *testing.T) {
+	service, _, _, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	tree, err := service.CreateDirectory(ctx, ownerA.ID, "", "tree")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CreateDirectory(ctx, ownerA.ID, tree.ID, "child"); err != nil {
+		t.Fatal(err)
+	}
+
+	release := holdPathLock(t, service, ownerA.ID, "/tree/child", pathlock.Node)
+	if err := service.Delete(ctx, ownerA.ID, tree.ID); !errors.Is(err, pathlock.ErrConflict) {
+		release()
+		t.Fatalf("delete directory error = %v, want ErrConflict", err)
+	}
+	release()
+
+	if err := service.Delete(ctx, ownerA.ID, tree.ID); !errors.Is(err, ErrDirectoryNotEmpty) {
+		t.Fatalf("delete non-empty directory error = %v, want ErrDirectoryNotEmpty", err)
+	}
+}
+
+// TestCopyTakesSourceAndTargetNodeLocks 验证复制同时申请源文件和目标路径
+// 两把节点锁。
+func TestCopyTakesSourceAndTargetNodeLocks(t *testing.T) {
+	service, _, _, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	docs, err := service.CreateDirectory(ctx, ownerA.ID, "", "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := service.Upload(ctx, ownerA.ID, docs.ID, "a.txt", strings.NewReader("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	releaseSource := holdPathLock(t, service, ownerA.ID, "/docs/a.txt", pathlock.Node)
+	if _, err := service.Copy(ctx, ownerA.ID, source.ID, docs.ID, "b.txt"); !errors.Is(err, pathlock.ErrConflict) {
+		releaseSource()
+		t.Fatalf("copy with held source error = %v, want ErrConflict", err)
+	}
+	releaseSource()
+
+	releaseTarget := holdPathLock(t, service, ownerA.ID, "/docs/b.txt", pathlock.Node)
+	if _, err := service.Copy(ctx, ownerA.ID, source.ID, docs.ID, "b.txt"); !errors.Is(err, pathlock.ErrConflict) {
+		releaseTarget()
+		t.Fatalf("copy with held target error = %v, want ErrConflict", err)
+	}
+	releaseTarget()
+
+	if _, err := service.Copy(ctx, ownerA.ID, source.ID, docs.ID, "b.txt"); err != nil {
+		t.Fatalf("copy after releasing path locks: %v", err)
 	}
 }

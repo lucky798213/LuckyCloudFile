@@ -26,16 +26,19 @@ import (
 //  2. 计算这一片的偏移和准确长度（纯计算，不碰磁盘）；
 //  3. beginChunk：原子地占用编号和并行名额；同一编号、超上限、收尾中
 //     都在读取请求体之前被拒绝；
-//  4. 重新查会话状态，挡住预检查之后的取消/过期；
-//  5. 读取请求体（最多“本片长度 + 1”字节），检查少传、多传和读取中断；
-//  6. 服务端计算 SHA-256，检查账本里是不是已经收过这个编号；
-//  7. 首次编号才写盘：Prepare 临时文件，然后 WriteAt 到指定偏移；
-//  8. 写入成功后才登记 receipt；
-//  9. 同步累计进度（保持 receiving，不在这里自动 Finalize）；
-//  10. end：释放编号和名额；
-//  11. 所有片到齐时再取得收尾门禁，重新核对整个账本，收尾成 ready。
+//  4. 用会话创建时留下的绑定令牌 Confirm 会话资源锁；绑定缺失或令牌
+//     失效时直接拒绝，不重新申请新锁；
+//  5. 重新查会话状态，挡住预检查之后的取消/过期；
+//  6. 读取请求体（最多“本片长度 + 1”字节），检查少传、多传和读取中断；
+//  7. 服务端计算 SHA-256，检查账本里是不是已经收过这个编号；
+//  8. 首次编号才写盘：Prepare 临时文件，然后 WriteAt 到指定偏移；
+//  9. 写入成功后才登记 receipt；
+//  10. 同步累计进度（保持 receiving，不在这里自动 Finalize）；
+//  11. 先退出本片保护，再 end：释放编号和名额；会话级资源锁仍然保留；
+//  12. 所有片到齐时再取得收尾门禁，重新 Confirm 一次资源锁，
+//     核对整个账本，收尾成 ready。
 //
-// 第 11 步必须在 end 之后：否则最后一片会等待自己退出，形成自等待死锁。
+// 第 12 步必须在 end 之后：否则最后一片会等待自己退出，形成自等待死锁。
 func (s *Service) UploadSessionChunk(
 	ctx context.Context,
 	ownerID int,
@@ -129,8 +132,21 @@ func (s *Service) UploadSessionChunk(
 		}
 	}()
 
+	// 用会话创建时留下的绑定令牌进入本次分片请求的保护。
+	// 绑定不存在或令牌已经失效时拒绝继续，不能重新申请一把锁让旧会话复活。
+	lockRelease, err := s.confirmUploadSessionLock(sessionID)
+	if err != nil {
+		return UploadSessionInfo{}, err
+	}
+	lockReleased := false
+	defer func() {
+		if !lockReleased {
+			lockRelease()
+		}
+	}()
+
 	// 预检查之后会话可能已经被取消/过期，或者被另一个完成请求推进到 ready。
-	// 拿到名额后必须重新读一次，不能相信旧快照。
+	// 拿到名额并确认资源锁后必须重新读一次，不能相信旧快照。
 	current, err := s.findOwnedUploadSession(uploadCtx, ownerID, sessionID)
 	if err != nil {
 		return UploadSessionInfo{}, err
@@ -228,6 +244,8 @@ func (s *Service) UploadSessionChunk(
 		if syncErr != nil {
 			return UploadSessionInfo{}, syncErr
 		}
+		lockRelease()
+		lockReleased = true
 		endUpload()
 		if info.ActualSize < info.ExpectedSize {
 			return info, nil
@@ -282,7 +300,10 @@ func (s *Service) UploadSessionChunk(
 		return UploadSessionInfo{}, err
 	}
 
-	// 分片的读取、写盘、登记和进度同步都结束了，先释放编号和名额。
+	// 分片的读取、写盘、登记和进度同步都结束了：
+	// 先退出本片保护，再释放编号和名额。会话级资源锁仍然保留。
+	lockRelease()
+	lockReleased = true
 	endUpload()
 
 	// 全部收齐才尝试收尾。这里用原始 ctx：endUpload 已经取消 uploadCtx。
@@ -372,6 +393,27 @@ func (s *Service) finishUploadChunk(
 		return UploadSessionInfo{}, err
 	}
 	defer release()
+
+	// 进入收尾门禁后再次确认资源锁：上一片的保护已经退出，但会话级锁
+	// 仍然存在，核对账本、Finalize 和推进 ready 也要受它保护。
+	lockRelease, err := s.confirmUploadSessionLock(sessionID)
+	if err != nil {
+		// 等待门禁期间会话可能已经被并发完成、取消或过期。
+		current, findErr := s.findOwnedUploadSession(ctx, ownerID, sessionID)
+		if findErr == nil {
+			switch current.Status {
+			case model.UploadStatusCompleted:
+				return toUploadSessionInfo(*current), nil
+			case model.UploadStatusCanceled, model.UploadStatusExpired:
+				return UploadSessionInfo{}, ErrUploadSessionNotCompletable
+			}
+			if isUploadSessionInvalid(*current) {
+				return UploadSessionInfo{}, ErrUploadSessionExpired
+			}
+		}
+		return UploadSessionInfo{}, err
+	}
+	defer lockRelease()
 
 	// 重新核对每个编号、Finalize 临时文件、把会话推进到 ready。
 	// 已经 completed 时这里是空操作，下面的查询会返回原结果。

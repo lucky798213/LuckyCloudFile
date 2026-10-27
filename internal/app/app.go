@@ -25,6 +25,7 @@ import (
 	"luckyCloudFile/internal/file"
 	"luckyCloudFile/internal/httpapi"
 	"luckyCloudFile/internal/model"
+	"luckyCloudFile/internal/pathlock"
 	"luckyCloudFile/internal/storage"
 )
 
@@ -81,8 +82,12 @@ func run(
 		return fmt.Errorf("initialize storage: %w", err)
 	}
 	// 分片并行度是每个会话的上限，来自 [Upload] MaxParallelChunks。
+	// 路径锁管理器只在这里创建一次，注入给所有文件写操作共用；
+	// 不能每个请求或每个方法各自新建，否则锁之间不可见。
+	pathLocks := pathlock.NewManager()
 	fileService := file.NewService(db, stores).
 		WithLogger(logger).
+		WithPathLocks(pathLocks).
 		WithChunkParallel(cfg.Upload.MaxParallelChunks)
 	authService := auth.NewService(db)
 

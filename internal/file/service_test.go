@@ -1809,6 +1809,53 @@ func TestMoveDirectoryRejectsCycles(t *testing.T) {
 	}
 }
 
+// TestMoveDirectoryToOriginalParentIsIdempotent 目录移动到原父目录必须成功。
+// 新旧路径相同不代表成环，只有目标父目录是源目录本身或它的后代才是成环。
+func TestMoveDirectoryToOriginalParentIsIdempotent(t *testing.T) {
+	service, db, _, ownerA, _ := newTestService(t)
+	ctx := context.Background()
+
+	docs, err := service.CreateDirectory(ctx, ownerA.ID, "", "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := service.CreateDirectory(ctx, ownerA.ID, docs.ID, "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 不传 parent_id，表示移动到当前用户的根目录，也就是原来的父目录。
+	moved, err := service.Move(ctx, ownerA.ID, docs.ID, "")
+	if err != nil {
+		t.Fatalf("move directory to its original parent: %v", err)
+	}
+	if moved.ID != docs.ID || moved.ParentID == nil || *moved.ParentID != *ownerA.RootFileID {
+		t.Fatalf("unexpected moved directory: %+v", moved)
+	}
+
+	// 显式传根目录 ID 也要幂等成功。
+	if _, err := service.Move(ctx, ownerA.ID, docs.ID, *ownerA.RootFileID); err != nil {
+		t.Fatalf("move directory to original parent by explicit id: %v", err)
+	}
+
+	// 子树没有变化。
+	var storedChild model.File
+	if err := db.WithContext(ctx).First(&storedChild, "id = ?", child.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if storedChild.ParentID == nil || *storedChild.ParentID != docs.ID {
+		t.Fatalf("child parent changed to %v", storedChild.ParentID)
+	}
+
+	// 移动到自身或后代仍然必须拒绝。
+	if _, err := service.Move(ctx, ownerA.ID, docs.ID, docs.ID); !errors.Is(err, ErrInvalidMove) {
+		t.Fatalf("move directory into itself: wanted ErrInvalidMove, got %v", err)
+	}
+	if _, err := service.Move(ctx, ownerA.ID, docs.ID, child.ID); !errors.Is(err, ErrInvalidMove) {
+		t.Fatalf("move directory into descendant: wanted ErrInvalidMove, got %v", err)
+	}
+}
+
 // TestMoveValidation 覆盖源、目标、根目录和“同目录”的边界情况。
 func TestMoveValidation(t *testing.T) {
 	service, _, _, ownerA, ownerB := newTestService(t)

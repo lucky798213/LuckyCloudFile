@@ -112,6 +112,14 @@ func (s *Service) UploadSessionContent(
 		}
 	}()
 
+	// 整文件会话同样受会话级资源锁保护。绑定或令牌失效后不能再写，
+	// 避免旧会话在锁已经关闭之后继续产生内容。
+	lockRelease, err := s.confirmUploadSessionLock(sessionID)
+	if err != nil {
+		return UploadSessionInfo{}, err
+	}
+	defer lockRelease()
+
 	claimed, err := s.claimUploadSession(uploadCtx, ownerID, sessionID)
 	if err != nil {
 		return UploadSessionInfo{}, err

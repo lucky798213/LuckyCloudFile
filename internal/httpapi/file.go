@@ -495,6 +495,11 @@ func handleFileError(c *gin.Context, err error, notFoundCode, notFoundMessage st
 			Code:    "already_exists",
 			Message: "an entry with the same name already exists in this directory",
 		})
+	case errors.Is(err, file.ErrResourceLocked):
+		c.JSON(http.StatusConflict, ErrorResponse{
+			Code:    "resource_locked",
+			Message: "the target is locked by another operation or an active upload session",
+		})
 	case errors.Is(err, file.ErrRootDirectory):
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Code:    "root_directory",

@@ -116,6 +116,10 @@ func (s *Service) CancelUploadSession(
 	// 通知活跃写入停止；如果没有活跃写入，done 立刻关闭。
 	s.uploads.cancel(sessionID)
 
+	// 关闭会话资源锁：拒绝新的 Confirm。已有的保护区退出后锁才真正移除，
+	// 这里不等待传输请求，后续物理清理也不被它拖住。
+	s.closeUploadSessionLock(sessionID)
+
 	// 只有确认没有活跃写入，handoff 才会真正把 Entity 标记为待清理。
 	// 如果上传还在退出过程中，它会在 defer 里再次尝试；失败也不影响取消结果。
 	if err := s.handoffTerminatedSession(opCtx, ownerID, sessionID); err != nil {

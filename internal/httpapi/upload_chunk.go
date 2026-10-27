@@ -67,6 +67,12 @@ func uploadSessionChunk(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 					Code:    "invalid_chunk_index",
 					Message: "chunk index is outside the session's chunk range",
 				})
+			case errors.Is(err, file.ErrUploadSessionNotCompletable):
+				// 收尾阶段并发取消/过期：这一片已经不需要再写，按冲突返回。
+				c.JSON(http.StatusConflict, ErrorResponse{
+					Code:    "upload_session_not_completable",
+					Message: "upload session is no longer accepting content",
+				})
 			case errors.Is(err, file.ErrUploadSessionConflict):
 				c.JSON(http.StatusConflict, ErrorResponse{
 					Code:    "upload_session_conflict",

@@ -130,7 +130,13 @@ type Service struct {
 	chunks *chunkLedger
 
 	// pathLocks 是按虚拟路径申请的进程内锁，见 path_lock.go。
+	// 生产代码由 app 组装时注入同一个实例，所有写操作共用；
+	// 不能每个请求或每个方法各自新建，否则锁之间不可见。
 	pathLocks *pathlock.Manager
+
+	// uploadLocks 保存上传会话和目标路径锁的绑定，见 upload_lock.go。
+	// 会话创建时写入，完成、取消、过期和终态清理时删除。
+	uploadLocks *uploadLockRegistry
 }
 
 // NewService 创建文件服务。
@@ -147,7 +153,20 @@ func NewService(db *gorm.DB, stores *storage.Registry) *Service {
 		chunks: newChunkLedger(),
 		// 路径锁只在当前进程内有效，和数据库行锁互补。
 		pathLocks: pathlock.NewManager(),
+		// 会话锁绑定也只存在于当前进程，随会话结束一起移除。
+		uploadLocks: newUploadLockRegistry(),
 	}
+}
+
+// WithPathLocks 注入应用共享的路径锁管理器，返回自身方便链式调用。
+//
+// 生产代码在应用组装处创建一个实例并注入，所有文件写操作共用它；
+// 直接调用 NewService 的测试仍然会得到一个默认管理器。
+func (s *Service) WithPathLocks(locks *pathlock.Manager) *Service {
+	if locks != nil {
+		s.pathLocks = locks
+	}
+	return s
 }
 
 // WithLogger 给后台清理任务设置日志输出，返回自身方便链式调用。
@@ -175,30 +194,22 @@ func (s *Service) WithChunkParallel(n int) *Service {
 // parentID 为空时使用当前用户的根目录。
 //
 // 顺序是：
-//  1. 先确认父目录存在、属于当前用户、而且真的是目录
-//  2. 生成两个随机 ID：File 的公开 ID、Entity 的存储 key
-//  3. 通过 Store 保存内容（具体怎么写由存储实现决定）
-//  4. 再开一个短事务：重新核对父目录 → 检查并增加已用容量 → 写 Entity 和 File
+//  1. 生成两个随机 ID：File 的公开 ID、Entity 的存储 key
+//  2. 解析目标路径快照，申请目标路径的节点锁并 Confirm
+//  3. 读取用户上传策略，通过 Store 保存内容（具体怎么写由存储实现决定）
+//  4. 再开一个短事务：复查路径快照 → 核对父目录 → 检查并增加已用容量 → 写 Entity 和 File
+//
+// 目标路径锁只覆盖这一个新名字：同一目录下上传另一个文件不会互相阻塞，
+// 但改名、移动或删除父目录会与它冲突。
 //
 // 容量不足时第 4 步返回 ErrQuotaExceeded，已经落盘的内容会被补偿删除：
 // 旧上传没有提前预留的体验，但最终发布不能绕过配额检查。
 //
 // 为什么不把整个上传包在事务里？因为 32 MiB 可能要传几十秒，
-// 一直占着数据库事务会拖住其他请求。
+// 一直占着数据库事务会拖住其他请求。路径锁的持有时间因此覆盖内容写入，
+// 但它只锁目标节点，不会锁住共同父目录。
 func (s *Service) Upload(ctx context.Context, ownerID int, parentID, name string, r io.Reader) (File, error) {
 	if err := validateName(name); err != nil {
-		return File{}, err
-	}
-
-	parent, err := s.requireDirectory(ctx, ownerID, parentID)
-	if err != nil {
-		return File{}, err
-	}
-
-	// 整个上传只在这里选一次策略：后面即使服务端改了用户默认策略，
-	// 本次内容仍然写到已经选定的位置，Entity 也记录同一个策略 ID。
-	policyID, store, err := s.uploadStore(ctx, ownerID)
-	if err != nil {
 		return File{}, err
 	}
 
@@ -211,6 +222,30 @@ func (s *Service) Upload(ctx context.Context, ownerID int, parentID, name string
 		return File{}, err
 	}
 
+	// 先把目标路径锁住，再读取内容。锁和短时保护一直保留到数据库事务结束。
+	var target pathSnapshot
+	guard, err := s.acquirePathLocksWithRetry(ctx, func() ([]pathLockRequest, error) {
+		var err error
+		target, err = s.resolveTargetPath(ctx, ownerID, parentID, name)
+		if err != nil {
+			return nil, err
+		}
+		return []pathLockRequest{{Snapshot: target, Scope: pathlock.Node}}, nil
+	})
+	if err != nil {
+		return File{}, err
+	}
+	defer guard.release()
+
+	// 整个上传只在这里选一次策略：后面即使服务端改了用户默认策略，
+	// 本次内容仍然写到已经选定的位置，Entity 也记录同一个策略 ID。
+	policyID, store, err := s.uploadStore(ctx, ownerID)
+	if err != nil {
+		return File{}, err
+	}
+
+	targetParentID := target.Ancestors[len(target.Ancestors)-1].ID
+
 	// 先落盘。写入失败时数据库还没动过，直接返回即可。
 	size, err := store.Save(ctx, storageKey, r, MaxUploadBytes)
 	if err != nil {
@@ -221,7 +256,7 @@ func (s *Service) Upload(ctx context.Context, ownerID int, parentID, name string
 	}
 
 	// 再写数据库。失败就删除已写入的内容，保证两边一致。
-	if err := s.saveRecords(ctx, ownerID, parent.ID, fileID, storageKey, policyID, name, size); err != nil {
+	if err := s.saveRecords(ctx, ownerID, targetParentID, fileID, storageKey, policyID, name, size, target); err != nil {
 		// 补偿删除不能复用请求的 ctx：客户端断开或超时后 ctx 已经被取消，
 		// Remove 会立刻返回取消错误，内容就永远留在存储里了。
 		// 用 WithoutCancel 保留值但去掉取消/超时，再套一个独立的有限超时。
@@ -244,7 +279,7 @@ func (s *Service) Upload(ctx context.Context, ownerID int, parentID, name string
 		Name:     name,
 		Size:     size,
 		Kind:     model.KindFile,
-		ParentID: &parent.ID,
+		ParentID: &targetParentID,
 	}, nil
 }
 
@@ -282,15 +317,18 @@ func (s *Service) uploadStore(ctx context.Context, ownerID int) (int, storage.St
 // 两个表必须一起成功：只有 File 没有 Entity，就不知道内容在哪；
 // 只有 Entity 没有 File，就是一份没人引用的孤儿内容。
 //
-// 事务里会重新核对一次父目录：接收文件的过程中，目录可能已经被删掉，
-// 或者被换到了别人名下。
+// 事务里会重新核对一次路径快照和父目录：接收文件的过程中，目录可能已经被删掉，
+// 或者被换到了别人名下。复查必须发生在拿到任何数据库行锁之前。
 //
 // 旧上传没有提前预留容量，但发布同样不能绕过配额：这里先锁住用户行，
 // 再用一条受条件约束的 UPDATE 把实际大小加进 used_bytes。容量不足时
 // 整个事务回滚，调用方会删除已经落盘的内容（见 Upload 的补偿删除）。
 // 加锁顺序和所有容量事务一致：User → Entity → File。
-func (s *Service) saveRecords(ctx context.Context, ownerID int, parentID, fileID, storageKey string, policyID int, name string, size int64) error {
+func (s *Service) saveRecords(ctx context.Context, ownerID int, parentID, fileID, storageKey string, policyID int, name string, size int64, target pathSnapshot) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := verifyPathSnapshotWith(ctx, tx, target); err != nil {
+			return err
+		}
 		if _, err := quota.LockUser(tx, ownerID); err != nil {
 			return err
 		}
@@ -345,15 +383,11 @@ func (s *Service) saveRecords(ctx context.Context, ownerID int, parentID, fileID
 //
 // 加锁顺序：User → 源 File → Entity。这样复制和删除同一份文件时
 // 不会互相等待成环，也不会出现“刚复制完，Entity 已被标记为待删除”的中间状态。
+//
+// 路径锁在事务之前取得：源文件节点锁 + 目标路径节点锁。
+// 两个锁只覆盖各自节点，不会因为目标目录相同就锁住整个父目录。
 func (s *Service) Copy(ctx context.Context, ownerID int, id, parentID, name string) (File, error) {
 	if err := validateName(name); err != nil {
-		return File{}, err
-	}
-
-	// 先在事务外查一次目标目录，快速拒绝明显不合法的请求。
-	// 事务里还会再查一次，防止校验之后目录被改动。
-	parent, err := s.requireDirectory(ctx, ownerID, parentID)
-	if err != nil {
 		return File{}, err
 	}
 
@@ -362,85 +396,107 @@ func (s *Service) Copy(ctx context.Context, ownerID int, id, parentID, name stri
 		return File{}, err
 	}
 
+	var sourceSnapshot, targetSnapshot pathSnapshot
 	var copied model.File
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 容量事务固定先锁用户，再锁 File/Entity。
-		if _, err := quota.LockUser(tx, ownerID); err != nil {
-			return err
-		}
-		source, err := lockOwnedFile(ctx, tx, ownerID, id)
-		if err != nil {
-			return err
-		}
-		if source.Kind != model.KindFile {
-			return ErrIsDirectory
-		}
-		if source.EntityID == nil {
-			return fmt.Errorf("file %s has no entity", id)
-		}
-
-		entity, err := lockEntity(ctx, tx, *source.EntityID)
-		if err != nil {
-			return err
-		}
-		// 源 File 仍然引用这个 Entity，正常数据里 ref_count 至少是 1。
-		// 状态不是 active 或引用数已经归零，都说明数据库已经不一致；
-		// 这时继续复制只会把错误放大，宁可回滚。
-		if entity.Status != model.EntityStatusActive || entity.RefCount <= 0 {
-			return fmt.Errorf(
-				"entity %d cannot be referenced: status=%q ref_count=%d",
-				entity.ID, entity.Status, entity.RefCount,
-			)
-		}
-
-		// 事务内重新核对目标目录：它必须仍然属于当前用户、而且仍然是目录。
-		target, err := queryDirectory(ctx, tx, ownerID, parent.ID)
-		if err != nil {
-			return err
-		}
-
-		// 复制出的逻辑文件要再占一份容量。容量不足时整个事务回滚：
-		// 不会创建 File，也不会把源 Entity 的引用数加一。
-		if err := quota.Consume(tx, ownerID, entity.Size); err != nil {
-			return err
-		}
-
-		record := model.File{
-			ID:       newID,
-			Name:     name,
-			Kind:     model.KindFile,
-			ParentID: &target.ID,
-			EntityID: &entity.ID,
-			OwnerID:  ownerID,
-		}
-		// (owner_id, parent_id, name) 唯一索引负责最终的同名检查。
-		// 重名时整个事务回滚，源 Entity 的引用数不会被加一。
-		if err := tx.Create(&record).Error; err != nil {
-			if errors.Is(err, gorm.ErrDuplicatedKey) {
-				return ErrAlreadyExists
+	err = s.runLockedOperation(ctx,
+		func() ([]pathLockRequest, error) {
+			var err error
+			sourceSnapshot, err = s.resolvePath(ctx, ownerID, id)
+			if err != nil {
+				return nil, err
 			}
-			return fmt.Errorf("create copied file: %w", err)
-		}
+			if sourceSnapshot.Ancestors[len(sourceSnapshot.Ancestors)-1].Kind != model.KindFile {
+				return nil, ErrIsDirectory
+			}
 
-		incremented := tx.WithContext(ctx).
-			Model(&model.Entity{}).
-			Where("id = ? AND status = ? AND ref_count > 0", entity.ID, model.EntityStatusActive).
-			UpdateColumn("ref_count", gorm.Expr("ref_count + 1"))
-		if incremented.Error != nil {
-			return fmt.Errorf("increment ref count: %w", incremented.Error)
-		}
-		if incremented.RowsAffected != 1 {
-			return fmt.Errorf(
-				"increment ref count of entity %d: expected 1 row affected, got %d",
-				entity.ID, incremented.RowsAffected,
-			)
-		}
+			targetSnapshot, err = s.resolveTargetPath(ctx, ownerID, parentID, name)
+			if err != nil {
+				return nil, err
+			}
+			return []pathLockRequest{
+				{Snapshot: sourceSnapshot, Scope: pathlock.Node},
+				{Snapshot: targetSnapshot, Scope: pathlock.Node},
+			}, nil
+		},
+		func(tx *gorm.DB) error {
+			// 容量事务固定先锁用户，再锁 File/Entity。
+			if _, err := quota.LockUser(tx, ownerID); err != nil {
+				return err
+			}
+			source, err := lockOwnedFile(ctx, tx, ownerID, id)
+			if err != nil {
+				return err
+			}
+			if source.Kind != model.KindFile {
+				return ErrIsDirectory
+			}
+			if source.EntityID == nil {
+				return fmt.Errorf("file %s has no entity", id)
+			}
 
-		// 返回值里带 Size：toFile 从关联的 Entity 读取大小。
-		record.Entity = entity
-		copied = record
-		return nil
-	})
+			entity, err := lockEntity(ctx, tx, *source.EntityID)
+			if err != nil {
+				return err
+			}
+			// 源 File 仍然引用这个 Entity，正常数据里 ref_count 至少是 1。
+			// 状态不是 active 或引用数已经归零，都说明数据库已经不一致；
+			// 这时继续复制只会把错误放大，宁可回滚。
+			if entity.Status != model.EntityStatusActive || entity.RefCount <= 0 {
+				return fmt.Errorf(
+					"entity %d cannot be referenced: status=%q ref_count=%d",
+					entity.ID, entity.Status, entity.RefCount,
+				)
+			}
+
+			// 事务内重新核对目标目录：它必须仍然属于当前用户、而且仍然是目录。
+			targetParentID := targetSnapshot.Ancestors[len(targetSnapshot.Ancestors)-1].ID
+			target, err := queryDirectory(ctx, tx, ownerID, targetParentID)
+			if err != nil {
+				return err
+			}
+
+			// 复制出的逻辑文件要再占一份容量。容量不足时整个事务回滚：
+			// 不会创建 File，也不会把源 Entity 的引用数加一。
+			if err := quota.Consume(tx, ownerID, entity.Size); err != nil {
+				return err
+			}
+
+			record := model.File{
+				ID:       newID,
+				Name:     name,
+				Kind:     model.KindFile,
+				ParentID: &target.ID,
+				EntityID: &entity.ID,
+				OwnerID:  ownerID,
+			}
+			// (owner_id, parent_id, name) 唯一索引负责最终的同名检查。
+			// 重名时整个事务回滚，源 Entity 的引用数不会被加一。
+			if err := tx.Create(&record).Error; err != nil {
+				if errors.Is(err, gorm.ErrDuplicatedKey) {
+					return ErrAlreadyExists
+				}
+				return fmt.Errorf("create copied file: %w", err)
+			}
+
+			incremented := tx.WithContext(ctx).
+				Model(&model.Entity{}).
+				Where("id = ? AND status = ? AND ref_count > 0", entity.ID, model.EntityStatusActive).
+				UpdateColumn("ref_count", gorm.Expr("ref_count + 1"))
+			if incremented.Error != nil {
+				return fmt.Errorf("increment ref count: %w", incremented.Error)
+			}
+			if incremented.RowsAffected != 1 {
+				return fmt.Errorf(
+					"increment ref count of entity %d: expected 1 row affected, got %d",
+					entity.ID, incremented.RowsAffected,
+				)
+			}
+
+			// 返回值里带 Size：toFile 从关联的 Entity 读取大小。
+			record.Entity = entity
+			copied = record
+			return nil
+		})
 	if err != nil {
 		return File{}, err
 	}
@@ -456,52 +512,83 @@ func (s *Service) Copy(ctx context.Context, ownerID int, id, parentID, name stri
 // (owner_id, parent_id, name) 唯一索引拒绝，返回 ErrAlreadyExists。
 // 根目录是整棵树的起点（唯一 parent_id 为 NULL 的节点），
 // 名字由服务端固定为 "/"，不允许改名，返回 ErrRootDirectory。
+//
+// 路径锁覆盖旧路径和新路径：普通文件用节点锁，目录用子树锁。
+// 这样改名期间，别的请求既不能改这条路径，也不能在旧/新目录树里插入节点。
 func (s *Service) Rename(ctx context.Context, ownerID int, id, name string) (File, error) {
 	if err := validateName(name); err != nil {
 		return File{}, err
 	}
 
+	var sourceSnapshot, targetSnapshot pathSnapshot
 	var renamed model.File
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		record, err := lockOwnedFile(ctx, tx, ownerID, id)
-		if err != nil {
-			return err
-		}
-		// 目录和文件都能改名，唯独根目录不行。
-		if record.ParentID == nil {
-			return ErrRootDirectory
-		}
+	err := s.runLockedOperation(ctx,
+		func() ([]pathLockRequest, error) {
+			var err error
+			sourceSnapshot, err = s.resolvePath(ctx, ownerID, id)
+			if err != nil {
+				return nil, err
+			}
+			node := sourceSnapshot.Ancestors[len(sourceSnapshot.Ancestors)-1]
+			// 目录和文件都能改名，唯独根目录不行。
+			if node.ParentID == nil {
+				return nil, ErrRootDirectory
+			}
 
-		// 名字没变时 MySQL 的 RowsAffected 是 0（值没有变化），
-		// 这里直接当作成功，避免把“改成同一个名字”误判为失败。
-		if record.Name != name {
-			updated := tx.WithContext(ctx).
-				Model(&model.File{}).
-				Where("id = ? AND owner_id = ?", record.ID, ownerID).
-				UpdateColumn("name", name)
-			if updated.Error != nil {
-				if errors.Is(updated.Error, gorm.ErrDuplicatedKey) {
-					return ErrAlreadyExists
+			targetSnapshot, err = s.resolveTargetPath(ctx, ownerID, *node.ParentID, name)
+			if err != nil {
+				return nil, err
+			}
+
+			scope := pathlock.Node
+			if node.Kind == model.KindDirectory {
+				scope = pathlock.Subtree
+			}
+			return []pathLockRequest{
+				{Snapshot: sourceSnapshot, Scope: scope},
+				{Snapshot: targetSnapshot, Scope: scope},
+			}, nil
+		},
+		func(tx *gorm.DB) error {
+			record, err := lockOwnedFile(ctx, tx, ownerID, id)
+			if err != nil {
+				return err
+			}
+			// 目录和文件都能改名，唯独根目录不行。
+			if record.ParentID == nil {
+				return ErrRootDirectory
+			}
+
+			// 名字没变时 MySQL 的 RowsAffected 是 0（值没有变化），
+			// 这里直接当作成功，避免把“改成同一个名字”误判为失败。
+			if record.Name != name {
+				updated := tx.WithContext(ctx).
+					Model(&model.File{}).
+					Where("id = ? AND owner_id = ?", record.ID, ownerID).
+					UpdateColumn("name", name)
+				if updated.Error != nil {
+					if errors.Is(updated.Error, gorm.ErrDuplicatedKey) {
+						return ErrAlreadyExists
+					}
+					return fmt.Errorf("rename file: %w", updated.Error)
 				}
-				return fmt.Errorf("rename file: %w", updated.Error)
+				if updated.RowsAffected != 1 {
+					return fmt.Errorf(
+						"rename file %s: expected 1 row affected, got %d",
+						id, updated.RowsAffected,
+					)
+				}
+				record.Name = name
 			}
-			if updated.RowsAffected != 1 {
-				return fmt.Errorf(
-					"rename file %s: expected 1 row affected, got %d",
-					id, updated.RowsAffected,
-				)
+
+			// 在事务里读 Entity：此时 File 行锁还在，别的删除事务无法把它清理掉。
+			if err := attachEntity(ctx, tx, record); err != nil {
+				return err
 			}
-			record.Name = name
-		}
 
-		// 在事务里读 Entity：此时 File 行锁还在，别的删除事务无法把它清理掉。
-		if err := attachEntity(ctx, tx, record); err != nil {
-			return err
-		}
-
-		renamed = *record
-		return nil
-	})
+			renamed = *record
+			return nil
+		})
 	if err != nil {
 		return File{}, err
 	}
@@ -521,70 +608,111 @@ func (s *Service) Rename(ctx context.Context, ownerID int, id, name string) (Fil
 // 目录不能移动到自身或自己的后代，否则目录树会成环，返回 ErrInvalidMove。
 // 目标目录已有同名节点时由唯一索引拒绝，返回 ErrAlreadyExists。
 // 用户根目录是整棵树的起点，不能移动，返回 ErrRootDirectory。
+//
+// 路径锁覆盖旧路径和新路径：普通文件用节点锁，目录用子树锁。
+// 目录移动是否成环仍在事务里用 isDescendant 检查；申请锁之前先看目标
+// 父目录的祖先链里有没有源目录，是为了在批量锁内部出现覆盖时提前返回
+// ErrInvalidMove。这里不能按路径相等判断：移动到原父目录时新旧路径相同，
+// 但那是合法的幂等操作。
 func (s *Service) Move(ctx context.Context, ownerID int, id, parentID string) (File, error) {
+	var sourceSnapshot, targetSnapshot pathSnapshot
 	var moved model.File
 
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		record, err := lockOwnedFile(ctx, tx, ownerID, id)
-		if err != nil {
-			return err
-		}
-		// 根目录没有父目录，移动它等于换掉整棵树的起点，直接拒绝。
-		if record.ParentID == nil {
-			return ErrRootDirectory
-		}
+	err := s.runLockedOperation(ctx,
+		func() ([]pathLockRequest, error) {
+			var err error
+			sourceSnapshot, err = s.resolvePath(ctx, ownerID, id)
+			if err != nil {
+				return nil, err
+			}
+			node := sourceSnapshot.Ancestors[len(sourceSnapshot.Ancestors)-1]
+			// 根目录没有父目录，移动它等于换掉整棵树的起点，直接拒绝。
+			if node.ParentID == nil {
+				return nil, ErrRootDirectory
+			}
 
-		// 目标目录必须在事务内再核对一次，防止校验之后被删除或换到别人名下。
-		target, err := queryDirectory(ctx, tx, ownerID, parentID)
-		if err != nil {
-			return err
-		}
+			targetSnapshot, err = s.resolveTargetPath(ctx, ownerID, parentID, node.Name)
+			if err != nil {
+				return nil, err
+			}
 
-		// 只有目录可能把“自己”装进子树；文件没有子节点，不需要检查。
-		if record.Kind == model.KindDirectory {
-			cyclic, err := isDescendant(ctx, tx, record.ID, target.ID)
+			// 目标父目录是源目录本身或它的后代时，旧路径的子树会覆盖新路径，
+			// 这种批次无法同时申请两把锁，直接按业务错误返回。
+			// 目标父目录就是原父目录时，祖先链里没有源目录，仍然是幂等成功。
+			if node.Kind == model.KindDirectory && snapshotContainsNode(targetSnapshot, node.ID) {
+				return nil, ErrInvalidMove
+			}
+
+			scope := pathlock.Node
+			if node.Kind == model.KindDirectory {
+				scope = pathlock.Subtree
+			}
+			return []pathLockRequest{
+				{Snapshot: sourceSnapshot, Scope: scope},
+				{Snapshot: targetSnapshot, Scope: scope},
+			}, nil
+		},
+		func(tx *gorm.DB) error {
+			record, err := lockOwnedFile(ctx, tx, ownerID, id)
 			if err != nil {
 				return err
 			}
-			if cyclic {
-				return ErrInvalidMove
+			// 根目录没有父目录，移动它等于换掉整棵树的起点，直接拒绝。
+			if record.ParentID == nil {
+				return ErrRootDirectory
 			}
-		}
 
-		// 已经在目标目录里：幂等成功。这样也不用担心 MySQL 的 RowsAffected = 0。
-		if record.ParentID != nil && *record.ParentID == target.ID {
+			// 目标目录必须在事务内再核对一次，防止校验之后被删除或换到别人名下。
+			target, err := queryDirectory(ctx, tx, ownerID, parentID)
+			if err != nil {
+				return err
+			}
+
+			// 只有目录可能把“自己”装进子树；文件没有子节点，不需要检查。
+			if record.Kind == model.KindDirectory {
+				cyclic, err := isDescendant(ctx, tx, record.ID, target.ID)
+				if err != nil {
+					return err
+				}
+				if cyclic {
+					return ErrInvalidMove
+				}
+			}
+
+			// 已经在目标目录里：幂等成功。这样也不用担心 MySQL 的 RowsAffected = 0。
+			if record.ParentID != nil && *record.ParentID == target.ID {
+				if err := attachEntity(ctx, tx, record); err != nil {
+					return err
+				}
+				moved = *record
+				return nil
+			}
+
+			updated := tx.WithContext(ctx).
+				Model(&model.File{}).
+				Where("id = ? AND owner_id = ?", record.ID, ownerID).
+				UpdateColumn("parent_id", target.ID)
+			if updated.Error != nil {
+				if errors.Is(updated.Error, gorm.ErrDuplicatedKey) {
+					return ErrAlreadyExists
+				}
+				return fmt.Errorf("move file: %w", updated.Error)
+			}
+			if updated.RowsAffected != 1 {
+				return fmt.Errorf(
+					"move file %s: expected 1 row affected, got %d",
+					id, updated.RowsAffected,
+				)
+			}
+
+			newParentID := target.ID
+			record.ParentID = &newParentID
 			if err := attachEntity(ctx, tx, record); err != nil {
 				return err
 			}
 			moved = *record
 			return nil
-		}
-
-		updated := tx.WithContext(ctx).
-			Model(&model.File{}).
-			Where("id = ? AND owner_id = ?", record.ID, ownerID).
-			UpdateColumn("parent_id", target.ID)
-		if updated.Error != nil {
-			if errors.Is(updated.Error, gorm.ErrDuplicatedKey) {
-				return ErrAlreadyExists
-			}
-			return fmt.Errorf("move file: %w", updated.Error)
-		}
-		if updated.RowsAffected != 1 {
-			return fmt.Errorf(
-				"move file %s: expected 1 row affected, got %d",
-				id, updated.RowsAffected,
-			)
-		}
-
-		parentID := target.ID
-		record.ParentID = &parentID
-		if err := attachEntity(ctx, tx, record); err != nil {
-			return err
-		}
-		moved = *record
-		return nil
-	})
+		})
 	if err != nil {
 		return File{}, err
 	}
@@ -641,13 +769,12 @@ func isDescendant(ctx context.Context, db *gorm.DB, ancestorID, nodeID string) (
 // CreateDirectory 在 parentID（为空表示根目录）下创建一个空目录。
 //
 // 目录只是 files 表里的一行：不写磁盘、不创建 Entity。
+//
+// 事务外先解析目标路径快照，事务前申请目标路径的节点锁并 Confirm；
+// 事务内先复查快照，再插入这一行。锁只覆盖新目录路径，
+// 同一父目录下创建另一个目录不会互相阻塞。
 func (s *Service) CreateDirectory(ctx context.Context, ownerID int, parentID, name string) (File, error) {
 	if err := validateName(name); err != nil {
-		return File{}, err
-	}
-
-	parent, err := s.requireDirectory(ctx, ownerID, parentID)
-	if err != nil {
 		return File{}, err
 	}
 
@@ -656,18 +783,38 @@ func (s *Service) CreateDirectory(ctx context.Context, ownerID int, parentID, na
 		return File{}, err
 	}
 
-	record := model.File{
-		ID:       id,
-		Name:     name,
-		Kind:     model.KindDirectory,
-		ParentID: &parent.ID,
-		OwnerID:  ownerID,
-	}
-	if err := s.db.WithContext(ctx).Create(&record).Error; err != nil {
-		if errors.Is(err, gorm.ErrDuplicatedKey) {
-			return File{}, ErrAlreadyExists
-		}
-		return File{}, fmt.Errorf("create directory: %w", err)
+	var target pathSnapshot
+	var record model.File
+	err = s.runLockedOperation(ctx,
+		func() ([]pathLockRequest, error) {
+			var err error
+			target, err = s.resolveTargetPath(ctx, ownerID, parentID, name)
+			if err != nil {
+				return nil, err
+			}
+			return []pathLockRequest{
+				{Snapshot: target, Scope: pathlock.Node},
+			}, nil
+		},
+		func(tx *gorm.DB) error {
+			targetParentID := target.Ancestors[len(target.Ancestors)-1].ID
+			record = model.File{
+				ID:       id,
+				Name:     name,
+				Kind:     model.KindDirectory,
+				ParentID: &targetParentID,
+				OwnerID:  ownerID,
+			}
+			if err := tx.WithContext(ctx).Create(&record).Error; err != nil {
+				if errors.Is(err, gorm.ErrDuplicatedKey) {
+					return ErrAlreadyExists
+				}
+				return fmt.Errorf("create directory: %w", err)
+			}
+			return nil
+		})
+	if err != nil {
+		return File{}, err
 	}
 
 	return toFile(record), nil
@@ -799,107 +946,135 @@ func (s *Service) Open(ctx context.Context, ownerID int, id string) (File, io.Re
 // 事务只保护“引用计数 + 逻辑记录 + 容量”这一小段，物理清理交给 cleanup.go。
 // 物理清理本身不再改动容量：预留/已用早在逻辑删除时就已经处理完了。
 //
-// 空目录检查也在同一个事务里：父目录行已经被 FOR UPDATE 锁住，
-// 并发的上传会等这个事务结束，不会出现“检查时是空的、删完又多出孩子”的情况。
+// 空目录检查也在同一个事务里：路径锁和父目录行锁都会阻止并发写入，
+// 不会出现“检查时是空的、删完又多出孩子”的情况。
+//
+// 事务前先解析路径快照并申请锁：普通文件用节点锁，目录用子树锁；
+// 事务内先复查快照，再做空目录检查和容量结算。
 func (s *Service) Delete(ctx context.Context, ownerID int, id string) error {
+	var snapshot pathSnapshot
 	var pendingEntityID int64
 
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 容量事务固定先锁用户行，再锁 File/Entity。
-		if _, err := quota.LockUser(tx, ownerID); err != nil {
-			return err
-		}
-		record, err := lockOwnedFile(ctx, tx, ownerID, id)
-		if err != nil {
-			return err
-		}
-		// 根目录同样 parent_id 为 NULL，必须在按目录处理之前拦住。
-		if record.ParentID == nil {
-			return ErrRootDirectory
-		}
-
-		// 目录只允许删除空的：先数直接子节点，非空就拒绝。
-		if record.Kind == model.KindDirectory {
-			var children int64
-			if err := tx.WithContext(ctx).
-				Model(&model.File{}).
-				Where("owner_id = ? AND parent_id = ?", ownerID, record.ID).
-				Count(&children).Error; err != nil {
-				return fmt.Errorf("count directory children: %w", err)
+	err := s.runLockedOperation(ctx,
+		func() ([]pathLockRequest, error) {
+			var err error
+			snapshot, err = s.resolvePath(ctx, ownerID, id)
+			if err != nil {
+				return nil, err
 			}
-			if children > 0 {
-				return ErrDirectoryNotEmpty
+			node := snapshot.Ancestors[len(snapshot.Ancestors)-1]
+			// 根目录同样 parent_id 为 NULL，必须在按目录处理之前拦住。
+			if node.ParentID == nil {
+				return nil, ErrRootDirectory
 			}
-			return deleteFileRow(ctx, tx, ownerID, record.ID)
-		}
 
-		if record.EntityID == nil {
-			return fmt.Errorf("file %s has no entity", id)
-		}
+			scope := pathlock.Node
+			if node.Kind == model.KindDirectory {
+				scope = pathlock.Subtree
+			}
+			return []pathLockRequest{
+				{Snapshot: snapshot, Scope: scope},
+			}, nil
+		},
+		func(tx *gorm.DB) error {
+			// 重试时上一次事务已经回滚，不能把上半次的结果带进来。
+			pendingEntityID = 0
 
-		entity, err := lockEntity(ctx, tx, *record.EntityID)
-		if err != nil {
-			return err
-		}
-		// 到这里 File 和 Entity 都被锁住了，entity.RefCount 是事务内的最新值，
-		// 不再是事务外预读的旧值。
-		if entity.RefCount <= 0 {
-			return fmt.Errorf(
-				"entity %d has ref_count %d while file %s still references it",
-				entity.ID, entity.RefCount, id,
-			)
-		}
+			// 容量事务固定先锁用户行，再锁 File/Entity。
+			if _, err := quota.LockUser(tx, ownerID); err != nil {
+				return err
+			}
+			record, err := lockOwnedFile(ctx, tx, ownerID, id)
+			if err != nil {
+				return err
+			}
+			// 根目录同样 parent_id 为 NULL，必须在按目录处理之前拦住。
+			if record.ParentID == nil {
+				return ErrRootDirectory
+			}
 
-		// 先删 File 行。RowsAffected 必须正好是 1，否则说明这一行已经被别的事务删掉了，
-		// 继续扣引用就会重复计数，所以直接回滚。
-		if err := deleteFileRow(ctx, tx, ownerID, record.ID); err != nil {
-			return err
-		}
+			// 目录只允许删除空的：先数直接子节点，非空就拒绝。
+			if record.Kind == model.KindDirectory {
+				var children int64
+				if err := tx.WithContext(ctx).
+					Model(&model.File{}).
+					Where("owner_id = ? AND parent_id = ?", ownerID, record.ID).
+					Count(&children).Error; err != nil {
+					return fmt.Errorf("count directory children: %w", err)
+				}
+				if children > 0 {
+					return ErrDirectoryNotEmpty
+				}
+				return deleteFileRow(ctx, tx, ownerID, record.ID)
+			}
 
-		// 用带 ref_count > 0 条件的原子自减，防止重复扣引用。
-		decremented := tx.WithContext(ctx).
-			Model(&model.Entity{}).
-			Where("id = ? AND ref_count > 0", entity.ID).
-			UpdateColumn("ref_count", gorm.Expr("ref_count - 1"))
-		if decremented.Error != nil {
-			return fmt.Errorf("decrement ref count: %w", decremented.Error)
-		}
-		if decremented.RowsAffected != 1 {
-			return fmt.Errorf(
-				"decrement ref count of entity %d: expected 1 row affected, got %d",
-				entity.ID, decremented.RowsAffected,
-			)
-		}
+			if record.EntityID == nil {
+				return fmt.Errorf("file %s has no entity", id)
+			}
 
-		// 释放这一份逻辑文件的用量。是否还有别的 File 引用同一个 Entity
-		// 与计费无关：逻辑用量按 File 计，删一份就释放一份。
-		if err := quota.ReleaseUsed(tx, ownerID, entity.Size); err != nil {
-			return err
-		}
+			entity, err := lockEntity(ctx, tx, *record.EntityID)
+			if err != nil {
+				return err
+			}
+			// 到这里 File 和 Entity 都被锁住了，entity.RefCount 是事务内的最新值，
+			// 不再是事务外预读的旧值。
+			if entity.RefCount <= 0 {
+				return fmt.Errorf(
+					"entity %d has ref_count %d while file %s still references it",
+					entity.ID, entity.RefCount, id,
+				)
+			}
 
-		// 还有其他 File 引用这份内容：保持 active，不碰磁盘。
-		if entity.RefCount > 1 {
+			// 先删 File 行。RowsAffected 必须正好是 1，否则说明这一行已经被别的事务删掉了，
+			// 继续扣引用就会重复计数，所以直接回滚。
+			if err := deleteFileRow(ctx, tx, ownerID, record.ID); err != nil {
+				return err
+			}
+
+			// 用带 ref_count > 0 条件的原子自减，防止重复扣引用。
+			decremented := tx.WithContext(ctx).
+				Model(&model.Entity{}).
+				Where("id = ? AND ref_count > 0", entity.ID).
+				UpdateColumn("ref_count", gorm.Expr("ref_count - 1"))
+			if decremented.Error != nil {
+				return fmt.Errorf("decrement ref count: %w", decremented.Error)
+			}
+			if decremented.RowsAffected != 1 {
+				return fmt.Errorf(
+					"decrement ref count of entity %d: expected 1 row affected, got %d",
+					entity.ID, decremented.RowsAffected,
+				)
+			}
+
+			// 释放这一份逻辑文件的用量。是否还有别的 File 引用同一个 Entity
+			// 与计费无关：逻辑用量按 File 计，删一份就释放一份。
+			if err := quota.ReleaseUsed(tx, ownerID, entity.Size); err != nil {
+				return err
+			}
+
+			// 还有其他 File 引用这份内容：保持 active，不碰磁盘。
+			if entity.RefCount > 1 {
+				return nil
+			}
+
+			// 最后一个引用也删掉了。这里不删 Entity，只标记 pending_delete，
+			// 交给 cleanup.go 在事务提交后删物理对象；这样两个崩溃点都能收敛。
+			marked := tx.WithContext(ctx).
+				Model(&model.Entity{}).
+				Where("id = ? AND ref_count = 0 AND status = ?", entity.ID, model.EntityStatusActive).
+				UpdateColumn("status", model.EntityStatusPendingDelete)
+			if marked.Error != nil {
+				return fmt.Errorf("mark entity pending deletion: %w", marked.Error)
+			}
+			if marked.RowsAffected != 1 {
+				return fmt.Errorf(
+					"mark entity %d pending deletion: expected 1 row affected, got %d",
+					entity.ID, marked.RowsAffected,
+				)
+			}
+			pendingEntityID = entity.ID
 			return nil
-		}
-
-		// 最后一个引用也删掉了。这里不删 Entity，只标记 pending_delete，
-		// 交给 cleanup.go 在事务提交后删物理对象；这样两个崩溃点都能收敛。
-		marked := tx.WithContext(ctx).
-			Model(&model.Entity{}).
-			Where("id = ? AND ref_count = 0 AND status = ?", entity.ID, model.EntityStatusActive).
-			UpdateColumn("status", model.EntityStatusPendingDelete)
-		if marked.Error != nil {
-			return fmt.Errorf("mark entity pending deletion: %w", marked.Error)
-		}
-		if marked.RowsAffected != 1 {
-			return fmt.Errorf(
-				"mark entity %d pending deletion: expected 1 row affected, got %d",
-				entity.ID, marked.RowsAffected,
-			)
-		}
-		pendingEntityID = entity.ID
-		return nil
-	})
+		})
 	if err != nil {
 		return err
 	}

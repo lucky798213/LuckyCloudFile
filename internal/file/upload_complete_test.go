@@ -218,12 +218,14 @@ func TestCompleteUploadSessionRejectsNotReady(t *testing.T) {
 func TestCompleteUploadSessionNameConflictKeepsContent(t *testing.T) {
 	env := newTestEnv(t)
 	ctx := context.Background()
-	created, _, entity := mustReadyUploadSession(t, env, env.ownerA.ID, "same.txt", "hello")
 
-	// 先在同一个目录放一个同名文件。
+	// 先在同一个目录放一个同名文件，再创建会话并传好内容。
+	// 会话创建不检查目标是否已经存在，但会占住这个路径；
+	// 真正的同名冲突仍由完成事务里的唯一索引兜底。
 	if _, err := env.service.Upload(ctx, env.ownerA.ID, "", "same.txt", strings.NewReader("other")); err != nil {
 		t.Fatal(err)
 	}
+	created, _, entity := mustReadyUploadSession(t, env, env.ownerA.ID, "same.txt", "hello")
 	before := countKind(t, env.db, model.KindFile)
 
 	if _, err := env.service.CompleteUploadSession(ctx, env.ownerA.ID, created.ID); !errors.Is(err, ErrAlreadyExists) {
@@ -257,8 +259,10 @@ func TestCompleteUploadSessionMissingDirectoryKeepsContent(t *testing.T) {
 	created := mustCreateUploadContentSessionInParent(t, env, env.ownerA.ID, dir.ID, "gone.txt", "hello")
 	_, entity := loadUploadSessionAndEntity(t, env, created.ID)
 
-	// 上传期间目录被删除。
-	if err := env.service.Delete(ctx, env.ownerA.ID, dir.ID); err != nil {
+	// 上传期间目录被删除。会话锁占住了目标路径，通过 Service 的 Delete
+	// 会被资源锁挡住；这里直接删数据库行，模拟目录在锁之外失效（例如
+	// 锁已经过期、或者由运维直接清理），用来覆盖完成事务内的复查。
+	if err := env.db.Delete(&model.File{}, "id = ?", dir.ID).Error; err != nil {
 		t.Fatal(err)
 	}
 	if _, err := env.service.CompleteUploadSession(ctx, env.ownerA.ID, created.ID); !errors.Is(err, ErrNotFound) {

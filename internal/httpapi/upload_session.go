@@ -68,6 +68,15 @@ func createUploadSession(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 				})
 				return
 			}
+			// 同一个目标路径已经有一个上传会话持有资源锁：
+			// 会话创建时占住最终目标，第二个会话必须等前一个结束。
+			if errors.Is(err, file.ErrUploadSessionConflict) {
+				c.JSON(http.StatusConflict, ErrorResponse{
+					Code:    "upload_session_conflict",
+					Message: "another upload session already holds this target",
+				})
+				return
+			}
 			if handleFileError(c, err, "parent_not_found", "parent directory not found") {
 				return
 			}

@@ -39,13 +39,16 @@ var (
 // 尝试一次；缺任何一片都不会因为文件长度已经等于总大小而发布。
 //
 // 顺序：
-//  1. 分片会话先做收尾准备：门禁 → 核对账本 → FinalizeChunks → ready；
-//  2. 在事务里先锁用户行，再按 sessionID + ownerID 锁会话；
-//  3. completed 直接返回原 ResultFileID（先于过期检查，支持幂等重放）；
-//  4. ready 且未过期才继续，其余状态拒绝；
-//  5. 重新校验目标目录和占位 Entity（uploading / 0，三处大小一致）；
-//  6. 把会话预留量转成已用量（reserved → used），
-//     创建 File → 激活 Entity（active / 1）→ 会话标记 completed、预留清零。
+//  1. 先读会话；completed 直接返回原 ResultFileID（先于锁和过期检查，支持幂等重放）；
+//  2. canceled / expired 直接拒绝；首次完成必须在有效期内且绑定令牌有效；
+//  3. 用会话创建时留下的令牌进入本次请求保护，令牌失效时拒绝发布；
+//  4. 分片会话先做收尾准备：门禁 → 再确认锁 → 核对账本 → FinalizeChunks → ready；
+//  5. 在事务里先锁用户行，再按 sessionID + ownerID 锁会话；
+//  6. ready 且未过期才继续，其余状态拒绝；
+//  7. 重新校验目标目录和占位 Entity（uploading / 0，三处大小一致）；
+//  8. 把会话预留量转成已用量（reserved → used），
+//     创建 File → 激活 Entity（active / 1）→ 会话标记 completed、预留清零；
+//  9. 提交成功后关闭会话资源锁；失败保留锁，允许在有效期内重试。
 //
 // 容量结算是这个事务的一部分，但不在事务提交后的回调里做：
 // 否则会出现“文件发布了，但账没记上”的窗口。结算按会话上持久化的
@@ -59,16 +62,48 @@ func (s *Service) CompleteUploadSession(
 	ownerID int,
 	sessionID string,
 ) (UploadSessionInfo, error) {
-	// 分片会话：先确认内容真的收齐，再进入发布事务。
-	//
-	// 已经 completed 的会话不再拿门禁，直接交给下面的发布事务返回原结果，
-	// 这样 completed 仍然先于过期判断。
 	current, err := s.findOwnedUploadSession(ctx, ownerID, sessionID)
 	if err != nil {
 		return UploadSessionInfo{}, err
 	}
-	if current.Mode == model.UploadModeChunked &&
-		current.Status != model.UploadStatusCompleted {
+
+	// 已经完成：无条件幂等返回原结果。会话锁可能已经释放或过期，
+	// 不能因为令牌不可用而拒绝重放。
+	if current.Status == model.UploadStatusCompleted {
+		// completed 是终态：无论结果是否完整，都不再需要会话锁。
+		s.finishCompletedUpload(sessionID)
+		if current.ResultFileID == nil || *current.ResultFileID == "" {
+			return UploadSessionInfo{}, ErrUploadSessionInconsistent
+		}
+		return toUploadSessionInfo(*current), nil
+	}
+	// canceled / expired 已经不可能再发布，也不需要确认资源锁。
+	if current.Status == model.UploadStatusCanceled ||
+		current.Status == model.UploadStatusExpired {
+		return UploadSessionInfo{}, ErrUploadSessionNotCompletable
+	}
+	// 首次完成必须在会话有效期内，并且绑定令牌仍然有效。
+	if !current.ExpiresAt.After(time.Now()) {
+		return UploadSessionInfo{}, ErrUploadSessionExpired
+	}
+
+	lockRelease, err := s.confirmUploadSessionLock(sessionID)
+	if err != nil {
+		// 并发完成可能已经发布并关闭了会话锁；completed 仍然幂等返回。
+		if latest, findErr := s.findOwnedUploadSession(ctx, ownerID, sessionID); findErr == nil &&
+			latest.Status == model.UploadStatusCompleted {
+			s.finishCompletedUpload(sessionID)
+			if latest.ResultFileID == nil || *latest.ResultFileID == "" {
+				return UploadSessionInfo{}, ErrUploadSessionInconsistent
+			}
+			return toUploadSessionInfo(*latest), nil
+		}
+		return UploadSessionInfo{}, err
+	}
+	defer lockRelease()
+
+	// 分片会话：先确认内容真的收齐，再进入发布事务。
+	if current.Mode == model.UploadModeChunked {
 		release, gateErr := s.uploads.beginFinalize(ctx, sessionID)
 		if gateErr != nil {
 			return UploadSessionInfo{}, gateErr
@@ -264,9 +299,9 @@ func (s *Service) CompleteUploadSession(
 		return nil
 	})
 	if err == nil {
-		// 会话已经发布，分片账本和运行状态都不再需要。
-		s.chunks.remove(sessionID)
-		s.uploads.forget(sessionID)
+		// 会话已经发布：关闭资源锁，分片账本和运行状态都不再需要。
+		// 本次请求的短时保护退出后，锁才真正从管理器移除。
+		s.finishCompletedUpload(sessionID)
 		return completed, nil
 	}
 
@@ -274,8 +309,8 @@ func (s *Service) CompleteUploadSession(
 	// 而是用独立 context 加锁重新核对；确认 completed 就返回已有结果。
 	verified, verifyErr := s.verifyCompletedUploadSession(ctx, ownerID, sessionID)
 	if verifyErr == nil && verified != nil {
-		s.chunks.remove(sessionID)
-		s.uploads.forget(sessionID)
+		// 提交结果已经确认是 completed：可以结束锁生命周期。
+		s.finishCompletedUpload(sessionID)
 		return *verified, nil
 	}
 	if verifyErr != nil {
@@ -286,6 +321,17 @@ func (s *Service) CompleteUploadSession(
 		)
 	}
 	return UploadSessionInfo{}, err
+}
+
+// finishCompletedUpload 收掉已经发布会话的运行期资源。
+//
+// 完成、幂等重放和“提交结果不确定但核对到 completed”都走这里：
+// 关闭资源锁、删除分片账本、清除运行状态。这些操作都是幂等的；
+// 关闭锁只标记 closing，等当前请求（以及其它在途保护区）退出后才真正移除。
+func (s *Service) finishCompletedUpload(sessionID string) {
+	s.closeUploadSessionLock(sessionID)
+	s.chunks.remove(sessionID)
+	s.uploads.forget(sessionID)
 }
 
 // prepareChunkedCompletion 是分片会话的收尾准备阶段。
