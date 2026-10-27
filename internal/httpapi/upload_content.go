@@ -62,6 +62,10 @@ func uploadSessionContent(logger *slog.Logger, svc fileService) gin.HandlerFunc 
 					Message: "uploaded content size does not match the declared size",
 				})
 			default:
+				// 复用公共映射：资源锁冲突、路径变化等业务错误不能落成 500。
+				if handleFileError(c, err, "upload_session_not_found", "upload session not found") {
+					return
+				}
 				logger.Error("upload session content", "error", err)
 				c.JSON(http.StatusInternalServerError, ErrorResponse{
 					Code:    "upload_content_failed",

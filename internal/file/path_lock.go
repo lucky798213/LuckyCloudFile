@@ -24,11 +24,12 @@ const maxPathDepth = 1000
 
 // ErrResourceChanged 表示读取路径快照之后、取得锁之前，数据库里的节点变了。
 // 调用方应释放旧快照并重新发起操作，不能继续按旧路径执行。
+// HTTP 层把它映射成 409 resource_changed，和“资源被占用”区分开。
 var ErrResourceChanged = errors.New("file path changed while acquiring lock")
 
 // ErrResourceLocked 表示目标路径正被另一个操作占用，例如进行中的上传会话
-// 已经占住了最终目标。HTTP 层把它映射成 409。
-var ErrResourceLocked = pathlock.ErrConflict
+// 已经占住了最终目标。HTTP 层把它映射成 409 resource_locked。
+var ErrResourceLocked = errors.New("resource is locked by a conflicting operation")
 
 // nodeSnapshot 是路径上一个节点的身份和层级信息。
 type nodeSnapshot struct {
@@ -355,6 +356,9 @@ func (s *Service) runLockedOperation(
 			return err
 		}
 	}
+	if errors.Is(lastErr, pathlock.ErrConflict) {
+		return wrapResourceLocked(lastErr)
+	}
 	return lastErr
 }
 
@@ -383,7 +387,14 @@ func (s *Service) acquirePathLocksWithRetry(
 			return nil, err
 		}
 	}
-	return nil, lastErr
+	return nil, wrapResourceLocked(lastErr)
+}
+
+// wrapResourceLocked 把内部的锁冲突翻译成业务错误。
+//
+// 同时保留原 pathlock 错误，调用方仍可以用 errors.Is 判断底层原因。
+func wrapResourceLocked(err error) error {
+	return fmt.Errorf("%w: %w", ErrResourceLocked, err)
 }
 
 func isRetryablePathError(err error) bool {

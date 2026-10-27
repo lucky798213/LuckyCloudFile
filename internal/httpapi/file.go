@@ -460,11 +460,40 @@ func deleteFile(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	}
 }
 
+// handleResourceError 映射资源锁相关的业务错误。
+//
+// 两种冲突都返回 409，但错误码必须区分：
+//   - resource_locked：目标被另一个操作或上传会话占住，等对方结束后重试；
+//   - resource_changed：取得锁后路径快照已经变化，重新发起请求。
+//
+// 上传专用处理器在 default 分支复用这个函数，避免新错误落入 500。
+func handleResourceError(c *gin.Context, err error) bool {
+	switch {
+	case errors.Is(err, file.ErrResourceLocked):
+		c.JSON(http.StatusConflict, ErrorResponse{
+			Code:    "resource_locked",
+			Message: "the target is locked by another operation or an active upload session",
+		})
+	case errors.Is(err, file.ErrResourceChanged):
+		c.JSON(http.StatusConflict, ErrorResponse{
+			Code:    "resource_changed",
+			Message: "the target path changed while preparing the operation; retry the request",
+		})
+	default:
+		return false
+	}
+	return true
+}
+
 // handleFileError 把业务层的哨兵错误映射成 HTTP 状态码。
 //
 // 返回 true 表示已经写过响应；false 表示这是未知错误，交给调用方记日志并返回 500。
 // notFoundCode/notFoundMessage 让“文件不存在”和“父目录不存在”可以用不同的提示。
 func handleFileError(c *gin.Context, err error, notFoundCode, notFoundMessage string) bool {
+	if handleResourceError(c, err) {
+		return true
+	}
+
 	switch {
 	case errors.Is(err, file.ErrNotFound):
 		c.JSON(http.StatusNotFound, ErrorResponse{Code: notFoundCode, Message: notFoundMessage})
@@ -494,11 +523,6 @@ func handleFileError(c *gin.Context, err error, notFoundCode, notFoundMessage st
 		c.JSON(http.StatusConflict, ErrorResponse{
 			Code:    "already_exists",
 			Message: "an entry with the same name already exists in this directory",
-		})
-	case errors.Is(err, file.ErrResourceLocked):
-		c.JSON(http.StatusConflict, ErrorResponse{
-			Code:    "resource_locked",
-			Message: "the target is locked by another operation or an active upload session",
 		})
 	case errors.Is(err, file.ErrRootDirectory):
 		c.JSON(http.StatusBadRequest, ErrorResponse{

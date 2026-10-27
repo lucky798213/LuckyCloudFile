@@ -168,8 +168,10 @@ func (s *Service) CreateUploadSessionWithMode(
 		ExpiresAt: expiresAt,
 	})
 	if err != nil {
+		// 目标路径已经被另一个会话或文件操作占住：这是资源锁冲突，
+		// 交给公共映射返回 409 resource_locked。
 		if errors.Is(err, pathlock.ErrConflict) {
-			return UploadSessionInfo{}, ErrUploadSessionConflict
+			return UploadSessionInfo{}, wrapResourceLocked(err)
 		}
 		return UploadSessionInfo{}, err
 	}
@@ -203,10 +205,8 @@ func (s *Service) CreateUploadSessionWithMode(
 		}
 
 		// 解析和加锁之间父目录链可能被改名或移动，事务内按快照复查。
+		// ErrResourceChanged 原样返回，由公共映射返回 409 resource_changed。
 		if err := verifyPathSnapshotWith(ctx, tx, target); err != nil {
-			if errors.Is(err, ErrResourceChanged) {
-				return ErrUploadSessionConflict
-			}
 			return err
 		}
 

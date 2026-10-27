@@ -84,6 +84,10 @@ func uploadSessionChunk(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 					Message: "chunk size does not match the expected size",
 				})
 			default:
+				// 复用公共映射：资源锁冲突、路径变化等业务错误不能落成 500。
+				if handleFileError(c, err, "upload_session_not_found", "upload session not found") {
+					return
+				}
 				logger.Error("upload session chunk", "error", err)
 				c.JSON(http.StatusInternalServerError, ErrorResponse{
 					Code:    "upload_chunk_failed",

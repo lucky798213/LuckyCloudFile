@@ -68,12 +68,12 @@ func createUploadSession(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 				})
 				return
 			}
-			// 同一个目标路径已经有一个上传会话持有资源锁：
-			// 会话创建时占住最终目标，第二个会话必须等前一个结束。
+			// 兜底：上传会话自身的状态冲突。目标路径被占住属于
+			// ErrResourceLocked，会走下面的公共映射返回 resource_locked。
 			if errors.Is(err, file.ErrUploadSessionConflict) {
 				c.JSON(http.StatusConflict, ErrorResponse{
 					Code:    "upload_session_conflict",
-					Message: "another upload session already holds this target",
+					Message: "upload session conflicts with the target or its current state",
 				})
 				return
 			}

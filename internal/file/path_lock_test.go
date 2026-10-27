@@ -353,9 +353,10 @@ func TestRenameDirectoryTakesSubtreeLocks(t *testing.T) {
 	}
 
 	release := holdPathLock(t, service, ownerA.ID, "/tree/child", pathlock.Node)
-	if _, err := service.Rename(ctx, ownerA.ID, tree.ID, "renamed"); !errors.Is(err, pathlock.ErrConflict) {
+	if _, err := service.Rename(ctx, ownerA.ID, tree.ID, "renamed"); !errors.Is(err, ErrResourceLocked) ||
+		!errors.Is(err, pathlock.ErrConflict) {
 		release()
-		t.Fatalf("directory rename error = %v, want ErrConflict", err)
+		t.Fatalf("directory rename error = %v, want ErrResourceLocked and pathlock.ErrConflict", err)
 	}
 	release()
 

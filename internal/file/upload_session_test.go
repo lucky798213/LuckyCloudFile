@@ -137,8 +137,8 @@ func TestCreateUploadSessionReservesTargetName(t *testing.T) {
 	}
 	if _, err := env.service.CreateUploadSession(
 		ctx, env.ownerA.ID, dir.ID, "same.bin", 2,
-	); !errors.Is(err, ErrUploadSessionConflict) {
-		t.Fatalf("second session with the same name error = %v, want ErrUploadSessionConflict", err)
+	); !errors.Is(err, ErrResourceLocked) {
+		t.Fatalf("second session with the same name error = %v, want ErrResourceLocked", err)
 	}
 	if got := countRows(t, env.db, &model.UploadSession{}); got != 1 {
 		t.Fatalf("wanted 1 session, got %d", got)

@@ -18,6 +18,9 @@ import (
 // 会话创建时申请一把目标节点锁，把 token 留在这里；之后每次传输和发布
 // 都用同一个 token 进入短时保护，不会重新申请一把新锁。令牌失效或绑定
 // 不存在时请求必须失败，不能悄悄拿一把新锁让旧会话恢复写入。
+//
+// token 是服务端内部协调信息：只由服务端生成和保存，不接受客户端指定，
+// 也不通过任何 API 返回。本阶段不提供前端加锁/解锁接口。
 type uploadLockBinding struct {
 	namespace string
 	path      string
