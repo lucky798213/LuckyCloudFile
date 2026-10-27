@@ -20,6 +20,7 @@ import (
 
 	"luckyCloudFile/internal/idgen"
 	"luckyCloudFile/internal/model"
+	"luckyCloudFile/internal/pathlock"
 	"luckyCloudFile/internal/quota"
 	"luckyCloudFile/internal/storage"
 )
@@ -127,6 +128,9 @@ type Service struct {
 	// chunks 是跨请求保留的分片账本，和 uploads（当前是否有请求在写）
 	// 职责分开。它只保存内存状态，不落库。
 	chunks *chunkLedger
+
+	// pathLocks 是按虚拟路径申请的进程内锁，见 path_lock.go。
+	pathLocks *pathlock.Manager
 }
 
 // NewService 创建文件服务。
@@ -141,6 +145,8 @@ func NewService(db *gorm.DB, stores *storage.Registry) *Service {
 		uploads: newUploadController(),
 		// 分片账本也由 Service 持有，跨请求保留到会话结束。
 		chunks: newChunkLedger(),
+		// 路径锁只在当前进程内有效，和数据库行锁互补。
+		pathLocks: pathlock.NewManager(),
 	}
 }
 
