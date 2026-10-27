@@ -50,7 +50,7 @@ type Store interface {
 // Options 是清理任务的依赖和参数。
 type Options struct {
 	// WorkDir 是任务工作目录根。清理任务会删除已经完成任务的
-	// task-<taskID> 子目录；为空时跳过目录回收并明确报错。
+	// task-<taskID> 子目录；为空时目录回收会明确报错，不会静默跳过。
 	WorkDir string
 
 	// BatchSize 为零时使用 DefaultBatchSize。
