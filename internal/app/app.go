@@ -21,6 +21,7 @@ import (
 
 	"luckyCloudFile/internal/archive"
 	"luckyCloudFile/internal/auth"
+	"luckyCloudFile/internal/cleanup"
 	"luckyCloudFile/internal/config"
 	"luckyCloudFile/internal/database"
 	"luckyCloudFile/internal/file"
@@ -48,8 +49,10 @@ func recoverUnfinishedUploads(ctx context.Context, svc *file.Service, batchSize 
 //
 // 整个启动过程是“一步一步来”的，任何一步失败都直接返回错误：
 //
-//	检查存储目录 → 连接 MySQL → 创建 HTTP Server → 绑定端口
-//	→ 作废旧上传会话 → 启动后台清理 → 启动任务调度器 → 开始服务
+//	检查存储目录 → 连接 MySQL/迁移 → 创建文件服务和锁
+//	→ 同步作废旧上传会话 → 注册任务工厂
+//	→ 收敛遗留 running 任务 → 启动有界执行器和清理触发器
+//	→ 绑定端口 → 开始服务
 func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	return run(ctx, cfg, logger, recoverUnfinishedUploads)
 }
@@ -118,6 +121,13 @@ func run(
 	// MaxPendingTasks 限制数据库里的未终态积压，不随内存队列上限浮动。
 	taskService := task.NewService(db).WithMaxPending(cfg.Task.MaxPendingTasks)
 
+	// 清理任务需要一个内部所有者来满足 tasks.owner_id 外键。这个账号
+	// 没有可用配额，密码随机且从不输出，不能登录或上传。
+	cleanupOwner, err := cleanup.EnsureOwner(ctx, db)
+	if err != nil {
+		return fmt.Errorf("initialize cleanup owner: %w", err)
+	}
+
 	// 任务类型注册表：type → 重建工厂。工厂依赖在这里注入一次；恢复时
 	// 只读取 tasks 记录里的 owner、phase 和 state_json，没有旧 Job 指针。
 	taskFactories := task.NewRegistry()
@@ -130,6 +140,16 @@ func run(
 		),
 	); err != nil {
 		return fmt.Errorf("register archive task factory: %w", err)
+	}
+	if err := taskFactories.Register(
+		cleanup.TaskType,
+		cleanup.NewTaskFactory(
+			fileService,
+			taskService,
+			cleanup.Options{Logger: logger, WorkDir: cfg.Task.WorkDir},
+		),
+	); err != nil {
+		return fmt.Errorf("register cleanup task factory: %w", err)
 	}
 
 	// 处理上一次进程留下的 running 任务。此时还没有启动调度器，也没有
@@ -184,6 +204,30 @@ func run(
 	// 再让队列取消并等待正在执行的任务退出。
 	defer taskDispatcher.Shutdown()
 
+	// 清理不再由进程内的定时循环直接执行，而是确保 tasks 表里有一条
+	// storage_cleanup_v1 任务。同一个 tick 只复用未终态记录，不会无限创建；
+	// 清理失败由任务自身的 retry_wait 和下一次周期触发继续重试。
+	cleanupScheduler, err := cleanup.NewScheduler(
+		taskService, cleanupOwner.ID, cleanup.DefaultInterval, logger,
+	)
+	if err != nil {
+		return fmt.Errorf("initialize cleanup scheduler: %w", err)
+	}
+	if _, err := cleanupScheduler.Ensure(ctx); err != nil {
+		return fmt.Errorf("schedule cleanup task: %w", err)
+	}
+	cleanupCtx, stopCleanup := context.WithCancel(ctx)
+	cleanupDone := make(chan struct{})
+	go func() {
+		defer close(cleanupDone)
+		cleanupScheduler.Run(cleanupCtx)
+	}()
+	// 先停止触发器，再让调度器和队列收尾，最后关闭数据库。
+	defer func() {
+		stopCleanup()
+		<-cleanupDone
+	}()
+
 	// 第四步：创建 HTTP Server。它只是一个“配置好的对象”，还没开始监听。
 	// Handler 就是路由表，来自 internal/httpapi。
 	server := &http.Server{
@@ -208,33 +252,16 @@ func run(
 	}
 	defer listener.Close()
 
-	// 第六步：开始后台物理清理。
-	// 先立即扫描一次（补上上次进程崩溃留下的 pending_delete），之后定时扫描。
-	// 它只在监听和旧会话作废都成功后才启动；Run 返回时一定先取消并等它退出，
-	// 不留下孤儿 goroutine。
-	cleanupCtx, stopCleanup := context.WithCancel(ctx)
-	cleanupDone := make(chan struct{})
-	go func() {
-		defer close(cleanupDone)
-		fileService.CleanupLoop(cleanupCtx, file.DefaultCleanupInterval, file.DefaultCleanupBatchSize)
-	}()
-
-	// 第七步：旧上传会话已经作废，现在才开始调度数据库里遗留的任务。
+	// 第六步：旧上传会话已经作废，现在才开始调度数据库里遗留的任务。
 	//
 	// 顺序很重要：调度器启动时会立即扫描一次，若它更早启动，重启前的
 	// queued 任务可能在旧会话还没失效时就开始执行。HTTP 也还没开始接收
 	// 新请求，所以此刻被唤醒的任务都来自上次进程。
 	taskDispatcher.Start()
 
-	// 第九步：开始服务，直到收到退出信号。
+	// 第七步：开始服务，直到收到退出信号。
 	shutdownTimeout := time.Duration(cfg.HTTP.ShutdownTimeoutSeconds) * time.Second
-	serveErr := serve(ctx, server, listener, shutdownTimeout, logger)
-
-	// 显式取消并等待后台清理退出，保证 Run 返回前没有孤儿 goroutine。
-	// ctx 被取消时清理循环已经开始退出；这里再做一次是为了覆盖 serve 自己出错退出的情况。
-	stopCleanup()
-	<-cleanupDone
-	return serveErr
+	return serve(ctx, server, listener, shutdownTimeout, logger)
 }
 
 // serve 让服务器一直跑，直到下面两件事之一发生：

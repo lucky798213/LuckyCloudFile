@@ -41,6 +41,14 @@ const (
 	DefaultMaxPending = 1000
 )
 
+// unfinishedTaskStatuses 是仍需调度或等待收尾的任务状态。
+// completed / failed 是终态，不再进入扫描和周期去重判断。
+var unfinishedTaskStatuses = []string{
+	model.TaskStatusQueued,
+	model.TaskStatusRunning,
+	model.TaskStatusRetryWait,
+}
+
 var (
 	// ErrNotFound 表示任务不存在，或者不属于这个用户。
 	// 两种情况的对外表现必须一致，避免靠 ID 探测别人的任务。
@@ -149,11 +157,7 @@ func (s *Service) Submit(ctx context.Context, params CreateParams) (*model.Task,
 	var pending int64
 	err := s.db.WithContext(ctx).
 		Model(&model.Task{}).
-		Where("status IN ?", []string{
-			model.TaskStatusQueued,
-			model.TaskStatusRunning,
-			model.TaskStatusRetryWait,
-		}).
+		Where("status IN ?", unfinishedTaskStatuses).
 		Count(&pending).Error
 	if err != nil {
 		return nil, fmt.Errorf("count pending tasks: %w", err)
@@ -237,6 +241,89 @@ func (s *Service) Create(ctx context.Context, params CreateParams) (*model.Task,
 		return nil, fmt.Errorf("create task %q: %w", id, err)
 	}
 	return task, nil
+}
+
+// EnsurePeriodic 保证同一类型最多只有一条未终态任务，用于周期任务去重。
+//
+// 定时触发器每个 tick 都会调用它：已有 queued / running / retry_wait
+// 记录时直接复用，不插入新行；只有上一条已经 completed / failed 才创建
+// 下一条。这样 tick 频率再高也不会无限堆积同类清理任务。
+//
+// 它和 Submit 的准入不同：周期清理属于内部维护工作，不能被用户任务
+// 积压上限完全饿死。单实例下由 admitMu 串行化“查询 + 插入”；多实例
+// 仍需要数据库唯一调度槽，本阶段不做。创建后会唤醒调度器。
+func (s *Service) EnsurePeriodic(
+	ctx context.Context,
+	params CreateParams,
+) (*model.Task, error) {
+	if params.Type == "" {
+		return nil, errors.New("task type is required")
+	}
+
+	s.admitMu.Lock()
+	defer s.admitMu.Unlock()
+
+	var existing model.Task
+	err := s.db.WithContext(ctx).
+		Where("type = ? AND status IN ?", params.Type, unfinishedTaskStatuses).
+		Order("created_at ASC, id ASC").
+		First(&existing).Error
+	if err == nil {
+		return &existing, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, fmt.Errorf("find pending %q task: %w", params.Type, err)
+	}
+
+	created, err := s.Create(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	s.wakeDispatcher()
+	return created, nil
+}
+
+// ListCleanupPending 返回已经进入终态、但还保留清理责任的记录。
+//
+// 只选择 completed / failed：running 任务可能正持有工作目录，不能由
+// 另一个清理任务并发回收。任务失败也不会删除记录，责任仍在数据库里，
+// 后续清理任务可以继续重试。
+func (s *Service) ListCleanupPending(
+	ctx context.Context,
+	limit int,
+) ([]model.Task, error) {
+	if limit <= 0 {
+		limit = DefaultListLimit
+	}
+
+	var tasks []model.Task
+	err := s.db.WithContext(ctx).
+		Where("cleanup_pending = ? AND status IN ?", true, []string{
+			model.TaskStatusCompleted,
+			model.TaskStatusFailed,
+		}).
+		Order("updated_at ASC, id ASC").
+		Limit(limit).
+		Find(&tasks).Error
+	if err != nil {
+		return nil, fmt.Errorf("list cleanup pending tasks: %w", err)
+	}
+	return tasks, nil
+}
+
+// ClearCleanupPending 收回一条已经清理完成的责任标记。
+//
+// 它不要求任务仍在 running：执行清理的是另一个清理任务，不是原任务。
+// 用 cleanup_pending=true 做条件，重复清理或并发清理都是幂等的。
+func (s *Service) ClearCleanupPending(ctx context.Context, id string) error {
+	result := s.db.WithContext(ctx).
+		Model(&model.Task{}).
+		Where("id = ? AND cleanup_pending = ?", id, true).
+		UpdateColumn("cleanup_pending", false)
+	if result.Error != nil {
+		return fmt.Errorf("clear cleanup pending of task %q: %w", id, result.Error)
+	}
+	return nil
 }
 
 // GetOwned 按 ID 和所有者取任务。不存在和越权都返回 ErrNotFound。
