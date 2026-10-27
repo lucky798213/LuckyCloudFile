@@ -52,7 +52,7 @@ func prepareLegacySchema(t *testing.T, dsn string) {
 
 	statements := []string{
 		"SET FOREIGN_KEY_CHECKS = 0",
-		"DROP TABLE IF EXISTS upload_sessions, auth_sessions, files, entities, users, storage_policies, schema_migrations",
+		"DROP TABLE IF EXISTS tasks, upload_sessions, auth_sessions, files, entities, users, storage_policies, schema_migrations",
 		"SET FOREIGN_KEY_CHECKS = 1",
 		`CREATE TABLE users (
 			id BIGINT NOT NULL AUTO_INCREMENT,
@@ -249,7 +249,7 @@ func TestStoragePolicyMigrationOnFreshDatabase(t *testing.T) {
 		t.Fatalf("fresh database policies = %+v", policies)
 	}
 
-	for _, table := range []string{"users", "entities", "files", "auth_sessions", "storage_policies", "upload_sessions"} {
+	for _, table := range []string{"users", "entities", "files", "auth_sessions", "storage_policies", "upload_sessions", "tasks"} {
 		if !db.Migrator().HasTable(table) {
 			t.Fatalf("fresh migration did not create %s", table)
 		}
@@ -280,7 +280,7 @@ func resetMigrationSchema(t *testing.T, dsn string) {
 	}
 	for _, statement := range []string{
 		"SET FOREIGN_KEY_CHECKS = 0",
-		"DROP TABLE IF EXISTS upload_sessions, auth_sessions, files, entities, users, storage_policies, schema_migrations",
+		"DROP TABLE IF EXISTS tasks, upload_sessions, auth_sessions, files, entities, users, storage_policies, schema_migrations",
 		"SET FOREIGN_KEY_CHECKS = 1",
 	} {
 		if _, err := conn.Exec(statement); err != nil {
@@ -463,5 +463,88 @@ func TestUploadSessionMigrationPreservesExistingFiles(t *testing.T) {
 		stored.Entity.RefCount != 1 ||
 		stored.Entity.Status != model.EntityStatusActive {
 		t.Fatalf("existing entity changed after migration: %+v", stored.Entity)
+	}
+}
+
+// TestTaskTableMigration 验证 P8.1 的任务表：
+//   - 新库会建出 tasks，带到期扫描和所有者查询要用的复合索引；
+//   - 所有字段都能落库并按原样读回，包括检查点 JSON 和清理标记；
+//   - owner 外键指向 users，删除账号时任务一起删除。
+func TestTaskTableMigration(t *testing.T) {
+	dsn := migrationDSN(t)
+	ctx := context.Background()
+	resetMigrationSchema(t, dsn)
+
+	db, err := database.OpenDSN(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close(db)
+
+	if !db.Migrator().HasTable("tasks") {
+		t.Fatal("fresh migration did not create tasks")
+	}
+	for _, index := range []string{"idx_tasks_due", "idx_tasks_owner_created"} {
+		if !db.Migrator().HasIndex(&model.Task{}, index) {
+			t.Fatalf("tasks is missing index %s", index)
+		}
+	}
+
+	user, _ := createMigrationUser(t, db)
+	nextRunAt := time.Now().Add(time.Minute).Truncate(time.Second)
+	task := model.Task{
+		ID:             "migration-task-1",
+		Type:           "fake_echo",
+		OwnerID:        user.ID,
+		Status:         model.TaskStatusRetryWait,
+		Phase:          "compress",
+		StateVersion:   2,
+		StateJSON:      `{"input":"hello"}`,
+		Attempts:       1,
+		MaxAttempts:    3,
+		NextRunAt:      nextRunAt,
+		LastError:      "temporary",
+		CleanupPending: true,
+	}
+	if err := db.WithContext(ctx).Create(&task).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	var stored model.Task
+	if err := db.WithContext(ctx).First(&stored, "id = ?", task.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Type != task.Type ||
+		stored.OwnerID != user.ID ||
+		stored.Status != model.TaskStatusRetryWait ||
+		stored.Phase != "compress" ||
+		stored.StateVersion != 2 ||
+		stored.StateJSON != task.StateJSON ||
+		stored.Attempts != 1 ||
+		stored.MaxAttempts != 3 ||
+		stored.LastError != "temporary" ||
+		!stored.CleanupPending {
+		t.Fatalf("task fields changed after migration: %+v", stored)
+	}
+	if !stored.NextRunAt.Equal(nextRunAt) {
+		t.Fatalf("next_run_at = %s, want %s", stored.NextRunAt, nextRunAt)
+	}
+	if stored.FinishedAt != nil || stored.ResultFileID != nil {
+		t.Fatalf("non-terminal task has result/finish time: %+v", stored)
+	}
+
+	// 所有者外键是 CASCADE：账号删除后任务不能留下悬空记录。
+	if err := db.Where("owner_id = ?", user.ID).Delete(&model.File{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Delete(&model.User{}, user.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	if err := db.Model(&model.Task{}).Where("id = ?", task.ID).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("deleting the owner left %d task(s) behind", count)
 	}
 }

@@ -279,3 +279,81 @@ type UploadSession struct {
 }
 
 func (UploadSession) TableName() string { return "upload_sessions" }
+
+// Task 的生命周期状态。转换规则不在模型里，见 internal/task：
+//
+//	queued → running → completed
+//	              ├→ retry_wait → running
+//	              └→ failed
+//
+// queued 还没有取得执行资格；retry_wait 是等退避到期，同样不占 worker；
+// completed / failed 是终态，不再被调度。
+const (
+	TaskStatusQueued    = "queued"
+	TaskStatusRunning   = "running"
+	TaskStatusRetryWait = "retry_wait"
+	TaskStatusCompleted = "completed"
+	TaskStatusFailed    = "failed"
+)
+
+// Task 是一条可以跨重启恢复的后台任务。
+//
+// 它只保存“重建执行需要的数据”，不保存 Job 对象、函数、Token、
+// context、io.Reader 或锁令牌：这些东西重启后无法还原，也不该落库。
+// 真正的执行器从 tasks 行重建任务，内存里的队列快照只是运行期缓存。
+//
+// state_json 的内容由 Type 对应的业务解释，仓储层只保证原样保存和读回；
+// state_version 用来拒绝当前代码不认识的旧格式，避免按零值误恢复。
+type Task struct {
+	// 服务端生成的公开 ID。提交响应和后续查询都用它。
+	// 恢复任务时必须复用原 ID，不能重新生成。
+	ID string `gorm:"type:varchar(255);primaryKey"`
+
+	// 任务类型，决定用哪个重建工厂解释 StateJSON。未知类型不执行。
+	Type string `gorm:"type:varchar(64);not null;index"`
+
+	// 任务所有者（users.id）。面向用户的查询必须同时匹配它。
+	OwnerID int `gorm:"not null;index:idx_tasks_owner_created,priority:1"`
+
+	// 所有者。删除用户时一并删除他的任务；任务本身不应该比账号活得更久。
+	Owner *User `gorm:"foreignKey:OwnerID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+
+	// 通用执行状态，取值见 TaskStatus*。
+	Status string `gorm:"type:varchar(16);not null;default:queued;index:idx_tasks_due,priority:1"`
+
+	// 下一步业务阶段，例如 prepare / compress / publish / finalize。
+	// 它是“接下来做什么”，不是进度百分比：phase=publish 表示完整的
+	// 中间产物已经提交，不是“压缩完成了百分之多少”。
+	Phase string `gorm:"type:varchar(32);not null;default:''"`
+
+	// 检查点数据的格式版本和内容。仓储层不解释内容，只按原样存取。
+	StateVersion int    `gorm:"not null;default:1"`
+	StateJSON    string `gorm:"type:longtext;not null"`
+
+	// 已经取得执行资格的次数，以及总次数上限。
+	// 每次 TryStart 成功都会加一，崩溃恢复也受这个上限约束。
+	Attempts    int `gorm:"not null;default:0"`
+	MaxAttempts int `gorm:"not null;default:3"`
+
+	// 最早可执行时间。retry_wait 用它保存退避到期时间，
+	// 到期扫描和 TryStart 都按它过滤。
+	NextRunAt time.Time `gorm:"not null;index:idx_tasks_due,priority:2"`
+
+	// 成功发布后的结果文件 ID。失败或尚未发布时为 NULL。
+	// 它是查询用的投影，真正的幂等凭据以后放在独立的结果表里。
+	ResultFileID *string `gorm:"type:varchar(255)"`
+
+	// 最后一次失败或等待重试的原因，只用于查询和排查，不保存堆栈。
+	LastError string `gorm:"type:text;not null"`
+
+	// 是否还有临时资源（任务工作目录、部分产物等）需要清理。
+	// 它和 Status 分开：任务可以已经 completed，但清理还没做完。
+	CleanupPending bool `gorm:"not null;default:false"`
+
+	// 创建、最后更新、进入终态的时间。完成时间在非终态为 NULL。
+	CreatedAt  time.Time  `gorm:"not null;autoCreateTime;index:idx_tasks_owner_created,priority:2"`
+	UpdatedAt  time.Time  `gorm:"not null;autoUpdateTime"`
+	FinishedAt *time.Time `gorm:"index"`
+}
+
+func (Task) TableName() string { return "tasks" }
