@@ -13,7 +13,7 @@ import (
 func newTestQueue(t *testing.T, workers, capacity int, timeout time.Duration) *Queue {
 	t.Helper()
 
-	q, err := New(workers, capacity, timeout)
+	q, err := New(Options{Workers: workers, Capacity: capacity, Timeout: timeout})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,7 +22,7 @@ func newTestQueue(t *testing.T, workers, capacity int, timeout time.Duration) *Q
 }
 
 func TestBoundedQueue(t *testing.T) {
-	q, err := New(2, 2, time.Minute)
+	q, err := New(Options{Workers: 2, Capacity: 2, Timeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +420,7 @@ func TestSuccessAfterDeadlineIsKept(t *testing.T) {
 
 // start 是任务开始的唯一边界：Shutdown 之后不能再把 queued 改成 running。
 func TestStartIsRejectedAfterShutdown(t *testing.T) {
-	q, err := New(1, 1, time.Minute)
+	q, err := New(Options{Workers: 1, Capacity: 1, Timeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +428,7 @@ func TestStartIsRejectedAfterShutdown(t *testing.T) {
 
 	// 模拟 worker 已取到任务、但还没执行 start 时的排队记录。
 	q.mu.Lock()
-	q.tasks["queued"] = Snapshot{ID: "queued", OwnerID: 1, Status: Queued}
+	q.tasks["queued"] = &record{snapshot: Snapshot{ID: "queued", OwnerID: 1, Status: Queued}}
 	q.mu.Unlock()
 
 	q.Shutdown()
@@ -449,7 +449,7 @@ func TestStartIsRejectedAfterShutdown(t *testing.T) {
 // Submit 与 Shutdown 并发时不能 panic，已接收的任务必须全部落到终态。
 func TestConcurrentSubmitAndShutdown(t *testing.T) {
 	for iter := 0; iter < 30; iter++ {
-		q, err := New(4, 16, time.Minute)
+		q, err := New(Options{Workers: 4, Capacity: 16, Timeout: time.Minute})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -502,14 +502,14 @@ func TestConcurrentSubmitAndShutdown(t *testing.T) {
 // start 先拿到锁则为 running；Shutdown 先拿到锁则保持 queued，绝不启动。
 func TestStartAndShutdownRace(t *testing.T) {
 	for iter := 0; iter < 200; iter++ {
-		q, err := New(1, 1, time.Minute)
+		q, err := New(Options{Workers: 1, Capacity: 1, Timeout: time.Minute})
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		const id = "queued"
 		q.mu.Lock()
-		q.tasks[id] = Snapshot{ID: id, OwnerID: 1, Status: Queued}
+		q.tasks[id] = &record{snapshot: Snapshot{ID: id, OwnerID: 1, Status: Queued}}
 		q.mu.Unlock()
 
 		started := make(chan bool, 1)
@@ -583,5 +583,193 @@ func TestProgressIsVisibleWhileRunning(t *testing.T) {
 	if task.Status != Completed || task.Stage != "completed" ||
 		task.Processed != 3 || task.Total != 3 || task.Result != "file-id" {
 		t.Fatalf("unexpected final snapshot: %+v", task)
+	}
+}
+
+// 终态记录必须在 retention 之后被回收，而不是只靠下一次查询顺手删除。
+// 这里不调用 Get，直接观察内部 map，确认后台回收协程真的把记录清掉了。
+func TestTerminalRecordsAreReclaimedAfterRetention(t *testing.T) {
+	q, err := New(Options{
+		Workers: 1, Capacity: 1, Timeout: time.Minute,
+		Retention: 40 * time.Millisecond, MaxTerminalRecords: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(q.Shutdown)
+
+	finished := make(chan struct{})
+	id, err := q.Submit(1, JobFunc(func(context.Context) (string, error) {
+		close(finished)
+		return "done", nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-finished
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		q.mu.Lock()
+		_, present := q.tasks[id]
+		q.mu.Unlock()
+		if !present {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("terminal record was not reclaimed after retention")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if _, err := q.Get(1, id); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired terminal record must not be readable: %v", err)
+	}
+}
+
+// 终态记录的数量上限必须同步生效，不能等到下一次清扫。
+func TestTerminalRecordLimitEvictsOldest(t *testing.T) {
+	q, err := New(Options{
+		Workers: 1, Capacity: 1, Timeout: time.Minute,
+		Retention: time.Minute, MaxTerminalRecords: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(q.Shutdown)
+
+	var ids []string
+	for i := 0; i < 4; i++ {
+		finished := make(chan struct{})
+		id, err := q.Submit(1, JobFunc(func(context.Context) (string, error) {
+			close(finished)
+			return "ok", nil
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		<-finished
+
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			task, err := q.Get(1, id)
+			if err == nil && task.Status == Completed {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("task %s did not complete: %v", id, err)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		q.mu.Lock()
+		stored := len(q.tasks)
+		q.mu.Unlock()
+		if stored > 2 {
+			t.Fatalf("terminal records = %d, want at most 2", stored)
+		}
+		ids = append(ids, id)
+	}
+
+	for _, id := range ids[:2] {
+		if _, err := q.Get(1, id); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("oldest terminal record %s should be evicted: %v", id, err)
+		}
+	}
+	for _, id := range ids[2:] {
+		task, err := q.Get(1, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if task.Status != Completed {
+			t.Fatalf("newest terminal record should stay: %+v", task)
+		}
+	}
+}
+
+// 数量上限只能影响终态记录：正在执行的任务不能被回收。
+func TestTerminalRecordLimitKeepsRunningTask(t *testing.T) {
+	q, err := New(Options{
+		Workers: 2, Capacity: 2, Timeout: time.Minute,
+		Retention: time.Minute, MaxTerminalRecords: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(q.Shutdown)
+
+	runningStarted := make(chan struct{})
+	release := make(chan struct{})
+	runningID, err := q.Submit(1, JobFunc(func(context.Context) (string, error) {
+		close(runningStarted)
+		<-release
+		return "slow", nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-runningStarted
+
+	fastDone := make(chan struct{})
+	fastID, err := q.Submit(1, JobFunc(func(context.Context) (string, error) {
+		close(fastDone)
+		return "fast", nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-fastDone
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		fast, err := q.Get(1, fastID)
+		if err == nil && fast.Status == Completed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fast task did not complete: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	running, err := q.Get(1, runningID)
+	if err != nil || running.Status != Running {
+		t.Fatalf("running task must not be evicted: %+v, %v", running, err)
+	}
+
+	close(release)
+	q.Shutdown()
+
+	slow, err := q.Get(1, runningID)
+	if err != nil || slow.Status != Completed || slow.Result != "slow" {
+		t.Fatalf("completed slow task should be kept: %+v, %v", slow, err)
+	}
+}
+
+func TestOptionsDefaultsAndNegativeValues(t *testing.T) {
+	q, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap(q.jobs) != DefaultCapacity {
+		t.Fatalf("capacity = %d, want %d", cap(q.jobs), DefaultCapacity)
+	}
+	if q.timeout != DefaultTimeout || q.retention != DefaultRetention ||
+		q.maxTerminal != DefaultMaxTerminalRecords {
+		t.Fatalf("unexpected defaults: timeout=%v retention=%v max=%d",
+			q.timeout, q.retention, q.maxTerminal)
+	}
+	q.Shutdown()
+
+	for _, options := range []Options{
+		{Workers: -1},
+		{Capacity: -1},
+		{Timeout: -time.Second},
+		{Retention: -time.Second},
+		{MaxTerminalRecords: -1},
+	} {
+		if _, err := New(options); err == nil {
+			t.Fatalf("negative option must be rejected: %+v", options)
+		}
 	}
 }

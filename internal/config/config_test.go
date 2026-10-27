@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"luckyCloudFile/internal/queue"
 )
 
 const validINI = `[System]
@@ -50,6 +53,73 @@ func TestLoad(t *testing.T) {
 	// 旧配置没有 [Upload] 段：必须保留默认值，不能拒绝启动。
 	if cfg.Upload.MaxParallelChunks != 2 {
 		t.Fatalf("default MaxParallelChunks = %d, want 2", cfg.Upload.MaxParallelChunks)
+	}
+	// 旧配置没有 [Task] 段：队列参数也必须有一组有界默认值。
+	if cfg.Task.Workers != 2 || cfg.Task.QueueCapacity != 64 ||
+		cfg.Task.TimeoutSeconds != 600 || cfg.Task.RetentionSeconds != 3600 ||
+		cfg.Task.MaxTerminalRecords != 10000 {
+		t.Fatalf("unexpected default task queue config: %+v", cfg.Task)
+	}
+}
+
+// TestTaskDefaultsMatchQueueDefaults 防止配置默认值和队列默认值各自漂移。
+func TestTaskDefaultsMatchQueueDefaults(t *testing.T) {
+	task := defaultConfig().Task
+	if task.Workers != queue.DefaultWorkers ||
+		task.QueueCapacity != queue.DefaultCapacity ||
+		time.Duration(task.TimeoutSeconds)*time.Second != queue.DefaultTimeout ||
+		time.Duration(task.RetentionSeconds)*time.Second != queue.DefaultRetention ||
+		task.MaxTerminalRecords != queue.DefaultMaxTerminalRecords {
+		t.Fatalf("config task defaults %+v do not match queue defaults", task)
+	}
+}
+
+// TestLoadTaskQueue 验证 [Task] 真正从配置读入，而不是固定常量。
+func TestLoadTaskQueue(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validINI+`
+[Task]
+Workers = 4
+QueueCapacity = 8
+TimeoutSeconds = 120
+RetentionSeconds = 60
+MaxTerminalRecords = 500
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Task{
+		Workers: 4, QueueCapacity: 8, TimeoutSeconds: 120,
+		RetentionSeconds: 60, MaxTerminalRecords: 500,
+	}
+	if cfg.Task != want {
+		t.Fatalf("Task = %+v, want %+v", cfg.Task, want)
+	}
+}
+
+// TestLoadRejectsInvalidTaskQueue 验证显式写错时启动失败，而不是悄悄回退默认值。
+func TestLoadRejectsInvalidTaskQueue(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		key   string
+		value string
+		want  string
+	}{
+		{"zero workers", "Workers", "0", "Task.Workers"},
+		{"too many workers", "Workers", "65", "Task.Workers"},
+		{"zero capacity", "QueueCapacity", "0", "Task.QueueCapacity"},
+		{"zero timeout", "TimeoutSeconds", "0", "Task.TimeoutSeconds"},
+		{"zero retention", "RetentionSeconds", "0", "Task.RetentionSeconds"},
+		{"zero max records", "MaxTerminalRecords", "0", "Task.MaxTerminalRecords"},
+		{"not integer", "Workers", "nope", "parse [Task]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(
+				t, validINI+"\n[Task]\n"+tc.key+" = "+tc.value+"\n",
+			))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("wanted error containing %q; got %v", tc.want, err)
+			}
+		})
 	}
 }
 

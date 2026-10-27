@@ -30,13 +30,6 @@ import (
 	"luckyCloudFile/internal/storage"
 )
 
-const (
-	// ZIP 任务队列参数。当前没有配置项，先固定为进程内的有限并发。
-	taskWorkers       = 2
-	taskQueueCapacity = 64
-	taskTimeout       = 10 * time.Minute
-)
-
 // uploadRecoverer 是启动恢复这一步的调用签名。
 //
 // 单独抽成参数，而不是在 run 里直接调用具体方法，是为了让测试能稳定地
@@ -103,7 +96,16 @@ func run(
 	// HTTP 先停止接收（serve 内部完成）→ 队列取消执行并等 worker 退出
 	// → database.Close（更早注册的 defer 最后执行）。
 	// 任务可能还在读写数据库，所以队列必须先于数据库关闭。
-	taskQueue, err := queue.New(taskWorkers, taskQueueCapacity, taskTimeout)
+	//
+	// Workers / QueueCapacity 限制同时存在的排队和执行任务；
+	// Retention / MaxTerminalRecords 限制完成后的内存快照，两部分都来自 [Task]。
+	taskQueue, err := queue.New(queue.Options{
+		Workers:            cfg.Task.Workers,
+		Capacity:           cfg.Task.QueueCapacity,
+		Timeout:            time.Duration(cfg.Task.TimeoutSeconds) * time.Second,
+		Retention:          time.Duration(cfg.Task.RetentionSeconds) * time.Second,
+		MaxTerminalRecords: cfg.Task.MaxTerminalRecords,
+	})
 	if err != nil {
 		return fmt.Errorf("initialize task queue: %w", err)
 	}

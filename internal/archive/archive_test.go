@@ -470,7 +470,7 @@ func TestPanickingReaderClosesHandlesAndWorkerContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	q, err := queue.New(1, 2, time.Minute)
+	q, err := queue.New(queue.Options{Workers: 1, Capacity: 2, Timeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -757,7 +757,7 @@ func TestQueueMarksCompletedOnlyAfterPublish(t *testing.T) {
 	files.completed = make(chan struct{})
 	job, dir := newTestJob(t, files, []string{"file-a"}, Options{})
 
-	q, err := queue.New(1, 1, time.Minute)
+	q, err := queue.New(queue.Options{Workers: 1, Capacity: 1, Timeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -794,7 +794,7 @@ func TestQueueFailsWhenPublishFails(t *testing.T) {
 	files.canceled = make(chan struct{})
 	job, dir := newTestJob(t, files, []string{"file-a"}, Options{})
 
-	q, err := queue.New(1, 1, time.Minute)
+	q, err := queue.New(queue.Options{Workers: 1, Capacity: 1, Timeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}

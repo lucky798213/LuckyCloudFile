@@ -35,6 +35,7 @@ type Config struct {
 	System   System
 	HTTP     HTTP
 	Upload   Upload
+	Task     Task
 	Storage  Storage
 	Database Database
 }
@@ -49,6 +50,27 @@ type Upload struct {
 	// MaxParallelChunks 是单个分片会话同时处理多少个分片请求。
 	// 它限制的是“每个会话”，不是整个进程：多个会话各自都可以达到这个上限。
 	MaxParallelChunks int
+}
+
+// Task 对应 [Task]，是 ZIP 异步任务队列的参数。
+//
+// 队列的内存边界由两层组成：
+//   - Workers + QueueCapacity 限制同时存在的排队/执行任务；
+//   - RetentionSeconds + MaxTerminalRecords 限制完成后的快照记录。
+//
+// 只限制前者不够：任务可以很快结束，但终态快照会一直占着内存。
+type Task struct {
+	// Workers 是同时执行 ZIP 任务的 worker 数。
+	Workers int
+	// QueueCapacity 是等待队列长度，不包含正在执行的任务。
+	QueueCapacity int
+	// TimeoutSeconds 是单个任务的最长执行时间。
+	TimeoutSeconds int
+	// RetentionSeconds 是 completed / failed 记录在内存中保留的秒数。
+	RetentionSeconds int
+	// MaxTerminalRecords 是 completed + failed 记录的数量上限。
+	// 超过时优先回收最早结束的记录。
+	MaxTerminalRecords int
 }
 
 // HTTP 对应 [HTTP]。
@@ -141,7 +163,15 @@ func defaultConfig() Config {
 		System: System{LogLevel: "info"},
 		HTTP:   HTTP{ShutdownTimeoutSeconds: 5},
 		// 没有 [Upload] 段的旧配置也使用这个默认值。
-		Upload:   Upload{MaxParallelChunks: 2},
+		Upload: Upload{MaxParallelChunks: 2},
+		// 没有 [Task] 段的旧配置也使用这些默认值，和 queue 包的默认值一致。
+		Task: Task{
+			Workers:            2,
+			QueueCapacity:      64,
+			TimeoutSeconds:     600,
+			RetentionSeconds:   3600,
+			MaxTerminalRecords: 10000,
+		},
 		Storage:  Storage{LocalRoots: make(map[string]string)},
 		Database: Database{Port: 3306},
 	}
@@ -153,7 +183,7 @@ func defaultConfig() Config {
 // 配置文件里的值都是字符串，而 Port 是 int，它负责把 "3306" 转成 3306，
 // 转不了（比如写成 "nope"）就返回错误。
 //
-// 这里五个 Section 分开写，而不是用一个循环加反射：
+// 这里每个 Section 分开写，而不是用一个循环加反射：
 // 段数很少，分开写时“配置文件的哪一段 → 哪个结构体”一眼就能对上。
 func mapSections(file *ini.File, cfg *Config) error {
 	if err := file.Section("System").StrictMapTo(&cfg.System); err != nil {
@@ -164,6 +194,9 @@ func mapSections(file *ini.File, cfg *Config) error {
 	}
 	if err := file.Section("Upload").StrictMapTo(&cfg.Upload); err != nil {
 		return fmt.Errorf("parse [Upload]: %w", err)
+	}
+	if err := file.Section("Task").StrictMapTo(&cfg.Task); err != nil {
+		return fmt.Errorf("parse [Task]: %w", err)
 	}
 	if err := file.Section("Storage").StrictMapTo(&cfg.Storage); err != nil {
 		return fmt.Errorf("parse [Storage]: %w", err)
@@ -255,6 +288,24 @@ func (c Config) validate() error {
 	// 会话把进程的连接和锁争用占满。旧配置没有这一段时使用默认值 2。
 	if c.Upload.MaxParallelChunks < 1 || c.Upload.MaxParallelChunks > 8 {
 		return fmt.Errorf("Upload.MaxParallelChunks must be between 1 and 8")
+	}
+
+	// 任务队列的每个参数都必须显式落在合理范围内。这里不接受 0：
+	// 0 不是“使用默认值”，而是配置写错；默认值只在整段缺失时生效。
+	if c.Task.Workers < 1 || c.Task.Workers > 64 {
+		return fmt.Errorf("Task.Workers must be between 1 and 64")
+	}
+	if c.Task.QueueCapacity < 1 || c.Task.QueueCapacity > 100000 {
+		return fmt.Errorf("Task.QueueCapacity must be between 1 and 100000")
+	}
+	if c.Task.TimeoutSeconds < 1 || c.Task.TimeoutSeconds > 86400 {
+		return fmt.Errorf("Task.TimeoutSeconds must be between 1 and 86400")
+	}
+	if c.Task.RetentionSeconds < 1 || c.Task.RetentionSeconds > 604800 {
+		return fmt.Errorf("Task.RetentionSeconds must be between 1 and 604800")
+	}
+	if c.Task.MaxTerminalRecords < 1 || c.Task.MaxTerminalRecords > 1000000 {
+		return fmt.Errorf("Task.MaxTerminalRecords must be between 1 and 1000000")
 	}
 
 	// 存储目录必须写。至于它到底能不能写，要等启动时实际试一下才知道（见 internal/app）。
