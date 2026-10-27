@@ -10,8 +10,8 @@ import (
 
 // entry 是内存里的一把锁。
 //
-// holds 和 closing 留给后续的保护区进入/退出；第一版的 Create 和 Unlock
-// 只关心 lease，不修改这两个字段。
+// holds 记录当前已经 Confirm、但还没有释放的保护区。只要 holds > 0，
+// 即使锁已经过期或开始关闭，也要保留冲突占位，不能提前把它从 byToken 移除。
 type entry struct {
 	lease   Lease
 	holds   int  // 当前有多少个正在执行的保护区
@@ -20,8 +20,10 @@ type entry struct {
 
 // Manager 是纯内存锁管理器，零值可以直接使用。
 //
-// mu 只保护 byToken 的读取和修改。像生成令牌、读取时钟这类操作都在
-// 进入临界区之前完成；Create 和 Unlock 内部不会查询数据库或写磁盘。
+// mu 只保护 byToken 的读取和修改。生成令牌在进入临界区之前完成；
+// 用于过期判断的时钟在取得 mu 之后读取。Create 会先做一次预校验，
+// 但入锁后会重新读取时钟并复核，避免等待锁期间跨过过期时间。
+// 时钟不是数据库或磁盘 I/O，不会扩大临界区的实际开销。
 type Manager struct {
 	mu      sync.Mutex
 	byToken map[string]*entry
@@ -68,6 +70,14 @@ func (m *Manager) Create(requests ...Request) ([]Lease, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// 令牌生成期间可能已经跨过申请的有效期，入锁后必须重新校验。
+	now = m.currentTime()
+	for _, requested := range normalized {
+		if err := ensureRequestNotExpired(requested, now); err != nil {
+			return nil, err
+		}
+	}
+
 	if m.byToken == nil {
 		m.byToken = make(map[string]*entry)
 	}
@@ -103,22 +113,145 @@ func (m *Manager) Create(requests ...Request) ([]Lease, error) {
 	return leases, nil
 }
 
-// Unlock 按令牌移除锁。
+// Confirm 在令牌覆盖的路径上进入一次短时保护区。
 //
-// 令牌不存在、已经解锁或已经过期时返回 ErrNoSuchLock。
-// 移除只按令牌匹配，所以旧令牌不会影响后来创建的新锁。
-func (m *Manager) Unlock(token string) error {
-	now := m.currentTime()
+// 同一令牌可以同时有多个保护区，它们只增加 holds，不串行化请求。
+// 返回的释放函数用 sync.Once 保证只扣减一次；最后一次释放时，如果锁已经
+// 过期或正在关闭，才真正从 byToken 移除。
+func (m *Manager) Confirm(namespace, p, token string) (func(), error) {
+	if namespace == "" {
+		return nil, ErrInvalidNamespace
+	}
+	normalized, err := normalizePath(p)
+	if err != nil {
+		return nil, err
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.removeExpiredLocked(now)
-	if _, ok := m.byToken[token]; !ok {
+	now := m.currentTime()
+
+	held, ok := m.byToken[token]
+	if !ok || held.lease.Request.Namespace != namespace {
+		return nil, fmt.Errorf("%w: %q", ErrNoSuchLock, token)
+	}
+	if !requestCovers(held.lease.Request, normalized) {
+		return nil, fmt.Errorf(
+			"%w: %s %s does not cover %s",
+			ErrNotCovered,
+			held.lease.Request.Scope, held.lease.Request.Path, normalized,
+		)
+	}
+	if expiredLocked(held, now) {
+		return nil, fmt.Errorf("%w: %q", ErrExpired, token)
+	}
+	if held.closing {
+		return nil, fmt.Errorf("%w: %q", ErrClosing, token)
+	}
+
+	held.holds++
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.release(held)
+		})
+	}, nil
+}
+
+// Refresh 修改令牌的过期时间。
+//
+// 过期的锁不能通过 Refresh 复活；正在关闭的锁也不能续期。
+// until 为零值表示改为永不过期，否则必须是 now 之后的时间。
+func (m *Manager) Refresh(namespace, token string, until time.Time) error {
+	if namespace == "" {
+		return ErrInvalidNamespace
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := m.currentTime()
+
+	held, ok := m.byToken[token]
+	if !ok || held.lease.Request.Namespace != namespace {
 		return fmt.Errorf("%w: %q", ErrNoSuchLock, token)
 	}
-	delete(m.byToken, token)
+	if expiredLocked(held, now) {
+		return fmt.Errorf("%w: %q", ErrExpired, token)
+	}
+	if held.closing {
+		return fmt.Errorf("%w: %q", ErrClosing, token)
+	}
+	if !until.IsZero() && !until.After(now) {
+		return fmt.Errorf("%w: %s", ErrInvalidExpiry, until)
+	}
+
+	held.lease.Request.ExpiresAt = until
 	return nil
+}
+
+// Unlock 按命名空间和令牌移除锁。
+//
+// 令牌立即失效，新的 Confirm 和 Refresh 都会被拒绝。如果还有保护区没有退出，
+// 先保留冲突占位，等最后一个 release 执行时再真正移除。整批令牌要么全部
+// 标记关闭，要么全部保持不变。
+func (m *Manager) Unlock(namespace string, tokens ...string) error {
+	if namespace == "" {
+		return ErrInvalidNamespace
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := m.currentTime()
+
+	m.removeExpiredLocked(now)
+
+	entries := make([]*entry, 0, len(tokens))
+	seen := make(map[string]struct{}, len(tokens))
+	for _, token := range tokens {
+		if _, ok := seen[token]; ok {
+			continue
+		}
+		seen[token] = struct{}{}
+
+		held, ok := m.byToken[token]
+		if !ok || held.lease.Request.Namespace != namespace {
+			return fmt.Errorf("%w: %q", ErrNoSuchLock, token)
+		}
+		entries = append(entries, held)
+	}
+
+	for _, held := range entries {
+		held.closing = true
+		if held.holds == 0 {
+			m.removeEntryLocked(held)
+		}
+	}
+	return nil
+}
+
+// release 扣减一次保护区；只有最后一个保护区退出，并且锁已经过期或关闭，
+// 才真正移除锁。
+func (m *Manager) release(held *entry) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := m.currentTime()
+
+	if held.holds == 0 {
+		return
+	}
+	held.holds--
+	if held.holds > 0 {
+		return
+	}
+	if !held.closing && !expiredLocked(held, now) {
+		return
+	}
+	m.removeEntryLocked(held)
 }
 
 type requestKey struct {
@@ -147,8 +280,8 @@ func normalizeRequests(requests []Request, now time.Time) ([]Request, error) {
 		}
 		req.Path = normalized
 
-		if !req.ExpiresAt.IsZero() && !req.ExpiresAt.After(now) {
-			return nil, fmt.Errorf("%w: %s", ErrInvalidExpiry, req.ExpiresAt)
+		if err := ensureRequestNotExpired(req, now); err != nil {
+			return nil, err
 		}
 
 		key := requestKey{namespace: req.Namespace, path: req.Path}
@@ -200,15 +333,33 @@ func laterExpiry(a, b time.Time) time.Time {
 	}
 }
 
+func ensureRequestNotExpired(req Request, now time.Time) error {
+	if req.ExpiresAt.IsZero() || req.ExpiresAt.After(now) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrInvalidExpiry, req.ExpiresAt)
+}
+
 // removeExpiredLocked 惰性清理过期的锁，不维护额外的过期堆。
+// 还有保护区的锁即使过期也要保留，等最后一个 release 再移除。
 func (m *Manager) removeExpiredLocked(now time.Time) {
-	for token, held := range m.byToken {
-		expiresAt := held.lease.Request.ExpiresAt
-		if expiresAt.IsZero() || now.Before(expiresAt) {
+	for _, held := range m.byToken {
+		if held.holds > 0 || !expiredLocked(held, now) {
 			continue
 		}
-		delete(m.byToken, token)
+		m.removeEntryLocked(held)
 	}
+}
+
+func (m *Manager) removeEntryLocked(held *entry) {
+	if current, ok := m.byToken[held.lease.Token]; ok && current == held {
+		delete(m.byToken, held.lease.Token)
+	}
+}
+
+func expiredLocked(held *entry, now time.Time) bool {
+	expiresAt := held.lease.Request.ExpiresAt
+	return !expiresAt.IsZero() && !now.Before(expiresAt)
 }
 
 func (m *Manager) currentTime() time.Time {

@@ -20,6 +20,13 @@ func conflicts(held, requested Request) bool {
 	return requested.Scope == Subtree && covers(requested.Path, held.Path)
 }
 
+// requestCovers 判断一把锁是否覆盖 target。
+// Node 只覆盖完全相同的路径；Subtree 还覆盖全部后代。
+func requestCovers(req Request, target string) bool {
+	return req.Path == target ||
+		(req.Scope == Subtree && covers(req.Path, target))
+}
+
 // covers 判断 root 是否覆盖 target。两者都是已经规范化的绝对路径。
 //
 // 不能写成 strings.HasPrefix(target, root)：那样会把 /a/bb 误判为 /a/b 的后代。

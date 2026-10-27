@@ -52,7 +52,10 @@ type Request struct {
 	ExpiresAt time.Time
 }
 
-// Lease 是申请成功后返回的锁。Token 由服务端生成，调用方只需保存它。
+// Lease 是 Create 成功后保留的资源锁。它由 Unlock 显式释放。
+//
+// Confirm 返回的 release 只释放当前这一次请求的短时保护，不会释放整个 Lease。
+// Token 由服务端生成，调用方只需保存它。
 type Lease struct {
 	Token   string
 	Request Request
@@ -68,14 +71,23 @@ var (
 	// ErrInvalidScope 表示锁的粒度未知。
 	ErrInvalidScope = errors.New("pathlock: invalid scope")
 
-	// ErrInvalidExpiry 表示申请时过期时间已经不在未来。
-	ErrInvalidExpiry = errors.New("pathlock: expiration is not in the future")
+	// ErrInvalidExpiry 表示过期时间不合法，或者已经不在未来。
+	ErrInvalidExpiry = errors.New("pathlock: invalid expiration")
 
 	// ErrConflict 表示申请与同一命名空间里已有的锁冲突。
 	ErrConflict = errors.New("pathlock: lock conflicts with a held lock")
 
-	// ErrNoSuchLock 表示令牌不存在，或者对应的锁已经过期、已经解锁。
+	// ErrNoSuchLock 表示令牌不存在、命名空间不匹配，或者对应的锁已经解锁。
 	ErrNoSuchLock = errors.New("pathlock: no such lock")
+
+	// ErrExpired 表示令牌存在，但已经过期。
+	ErrExpired = errors.New("pathlock: lock has expired")
+
+	// ErrClosing 表示锁正在关闭，不能再 Confirm 或 Refresh。
+	ErrClosing = errors.New("pathlock: lock is closing")
+
+	// ErrNotCovered 表示令牌存在，但它的路径和粒度不覆盖请求的路径。
+	ErrNotCovered = errors.New("pathlock: lock does not cover the requested path")
 )
 
 // Namespace 返回用户对应的锁命名空间。
