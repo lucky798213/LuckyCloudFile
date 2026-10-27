@@ -22,6 +22,11 @@ const (
 	// finalizeTimeout 是任务结束后写终态的独立超时。
 	// 执行 context 可能已经超时或取消，不能用它去写数据库。
 	finalizeTimeout = 10 * time.Second
+
+	// DefaultRetryBase 是第一次重试的等待时间。之后按 attempts 指数退避，
+	// 最长不超过 maxRetryDelay。等待期间任务只占数据库行，不占 worker。
+	DefaultRetryBase = time.Second
+	maxRetryDelay    = time.Minute
 )
 
 // DispatcherOptions 是调度器的依赖和参数。
@@ -39,6 +44,10 @@ type DispatcherOptions struct {
 	ScanInterval time.Duration
 	BatchSize    int
 
+	// RetryBase 是第一次重试的等待时间；为零时使用 DefaultRetryBase。
+	// 负数非法。测试可以调小它，生产使用指数退避。
+	RetryBase time.Duration
+
 	// Logger 为空时使用 slog.Default()。
 	Logger *slog.Logger
 }
@@ -54,6 +63,7 @@ type Dispatcher struct {
 	runner       Runner
 	scanInterval time.Duration
 	batchSize    int
+	retryBase    time.Duration
 	logger       *slog.Logger
 
 	// inFlight 是当前进程已经放进队列、但还没有执行结束的任务 ID。
@@ -79,6 +89,9 @@ func NewDispatcher(options DispatcherOptions) (*Dispatcher, error) {
 	if options.Runner == nil {
 		return nil, errors.New("task dispatcher: runner is required")
 	}
+	if options.RetryBase < 0 {
+		return nil, errors.New("task dispatcher: retry base must not be negative")
+	}
 
 	scanInterval := options.ScanInterval
 	if scanInterval <= 0 {
@@ -87,6 +100,10 @@ func NewDispatcher(options DispatcherOptions) (*Dispatcher, error) {
 	batchSize := options.BatchSize
 	if batchSize <= 0 {
 		batchSize = DefaultScanBatchSize
+	}
+	retryBase := options.RetryBase
+	if retryBase == 0 {
+		retryBase = DefaultRetryBase
 	}
 	logger := options.Logger
 	if logger == nil {
@@ -100,6 +117,7 @@ func NewDispatcher(options DispatcherOptions) (*Dispatcher, error) {
 		runner:       options.Runner,
 		scanInterval: scanInterval,
 		batchSize:    batchSize,
+		retryBase:    retryBase,
 		logger:       logger,
 		inFlight:     make(map[string]struct{}),
 		ctx:          ctx,
@@ -231,10 +249,15 @@ func (j *dispatchedJob) RunWithProgress(
 
 	result, runErr := j.dispatcher.runner.Run(ctx, *started, report)
 	if runErr != nil {
-		if ctx.Err() != nil {
-			// 取消或超时：数据库先保持 running。启动恢复会重新处理残留
-			// running 记录（后续步骤）；不能在取消之后草率改成 failed，
-			// 否则正常关闭会把可继续的任务错误地终结。
+		// 取消/超时也走 retry_wait：worker 已经返回，业务停在最后一个
+		// 已提交的检查点，下一次调度可以继续。这里用独立 context 写数据库，
+		// 不把执行期的取消带进状态更新。
+		if ctx.Err() != nil || IsRetryable(runErr) {
+			if markErr := j.dispatcher.markRetry(ctx, started, runErr); markErr != nil {
+				j.dispatcher.logger.Warn(
+					"mark task retry", "task_id", started.ID, "error", markErr,
+				)
+			}
 			return "", runErr
 		}
 		if markErr := j.dispatcher.finalize(ctx, func(finalizeCtx context.Context) error {
@@ -263,6 +286,58 @@ func (j *dispatchedJob) RunWithProgress(
 	}
 
 	return result, nil
+}
+
+// markRetry 把任务放回 retry_wait，并在次数用完时明确 failed。
+//
+// 等待时间保存进 next_run_at，worker 立即释放；不在 worker 里 sleep。
+// 这样重启后仍按原来的到期时间继续，也不会因为等待占住并发名额。
+func (d *Dispatcher) markRetry(
+	ctx context.Context,
+	started *model.Task,
+	cause error,
+) error {
+	return d.finalize(ctx, func(finalizeCtx context.Context) error {
+		if started.Attempts >= started.MaxAttempts {
+			if err := d.service.MarkFailed(
+				finalizeCtx, started.ID, started.Attempts, cause,
+			); err != nil {
+				return err
+			}
+			d.logger.Warn("task retries exhausted",
+				"task_id", started.ID,
+				"attempts", started.Attempts,
+				"error", cause,
+			)
+			return nil
+		}
+
+		nextRunAt := time.Now().Add(d.retryDelay(started.Attempts))
+		if err := d.service.MarkRetry(
+			finalizeCtx, started.ID, started.Attempts, nextRunAt, cause,
+		); err != nil {
+			return err
+		}
+		d.logger.Warn("task will retry",
+			"task_id", started.ID,
+			"attempts", started.Attempts,
+			"next_run_at", nextRunAt,
+			"error", cause,
+		)
+		return nil
+	})
+}
+
+// retryDelay 按本次执行编号做指数退避：1x、2x、4x……最多 maxRetryDelay。
+func (d *Dispatcher) retryDelay(attempt int) time.Duration {
+	delay := d.retryBase
+	for i := 1; i < attempt && delay < maxRetryDelay; i++ {
+		delay *= 2
+	}
+	if delay > maxRetryDelay {
+		return maxRetryDelay
+	}
+	return delay
 }
 
 // finalize 用独立超时写数据库。执行 context 此时可能已经超时，

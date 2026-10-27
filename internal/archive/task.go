@@ -187,7 +187,8 @@ func NewTaskFactory(
 			_ model.Task,
 			report queue.ProgressFunc,
 		) (string, error) {
-			return job.resume(ctx, record, state, store, report)
+			result, err := job.resume(ctx, record, state, store, report)
+			return result, classifyRunError(err)
 		}), nil
 	})
 }

@@ -40,6 +40,19 @@ func startTestDispatcher(
 	interval time.Duration,
 ) *Dispatcher {
 	t.Helper()
+	return startTestDispatcherWithRetry(t, service, q, runner, interval, 50*time.Millisecond)
+}
+
+// startTestDispatcherWithRetry 允许测试指定退避基数。需要观察 retry_wait
+// 的测试用更长的基数，避免状态在断言之前就到期。
+func startTestDispatcherWithRetry(
+	t *testing.T,
+	service *Service,
+	q *queue.Queue,
+	runner Runner,
+	interval, retryBase time.Duration,
+) *Dispatcher {
+	t.Helper()
 
 	dispatcher, err := NewDispatcher(DispatcherOptions{
 		Service:      service,
@@ -47,6 +60,7 @@ func startTestDispatcher(
 		Runner:       runner,
 		ScanInterval: interval,
 		BatchSize:    10,
+		RetryBase:    retryBase,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -509,5 +523,169 @@ func TestDispatcherRunsDueRetryWait(t *testing.T) {
 	}
 	if finished.LastError != "" {
 		t.Fatalf("completed task kept last_error %q", finished.LastError)
+	}
+}
+
+// TestDispatcherRetriesMarkedTemporaryFailure 验证带 task.Retryable 标记的
+// 失败会进入 retry_wait：next_run_at 已经写好，worker 立即释放；到期后
+// 用新的 attempts 再执行并成功。
+func TestDispatcherRetriesMarkedTemporaryFailure(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	owner := createOwner(t, db, "retryable")
+	t.Cleanup(func() { cleanupOwners(t, db, owner.ID) })
+
+	service := NewService(db).WithMaxPending(100)
+	q := newTaskTestQueue(t, 1, 4)
+
+	var attempts atomic.Int32
+	firstFailed := make(chan struct{})
+	runner := RunnerFunc(func(
+		ctx context.Context,
+		record model.Task,
+		report queue.ProgressFunc,
+	) (string, error) {
+		if attempts.Add(1) == 1 {
+			close(firstFailed)
+			return "", Retryable(errors.New("temporary database failure"))
+		}
+		return "result-file", nil
+	})
+	startTestDispatcherWithRetry(t, service, q, runner, 10*time.Millisecond, time.Second)
+
+	submitted, err := service.Submit(ctx, CreateParams{
+		Type: "fake_echo", OwnerID: owner.ID, Phase: "prepare",
+		MaxAttempts: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-firstFailed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("task never started")
+	}
+
+	waiting := waitTask(t, service, owner.ID, submitted.ID, func(record model.Task) bool {
+		return record.Status == model.TaskStatusRetryWait
+	})
+	if waiting.Attempts != 1 {
+		t.Fatalf("retry_wait attempts = %d, want 1", waiting.Attempts)
+	}
+	if !waiting.NextRunAt.After(time.Now()) {
+		t.Fatalf("retry_wait next_run_at = %s, want a future time", waiting.NextRunAt)
+	}
+	if waiting.LastError == "" {
+		t.Fatal("retry_wait task has no error")
+	}
+
+	finished := waitTask(t, service, owner.ID, submitted.ID, func(record model.Task) bool {
+		return record.Status == model.TaskStatusCompleted
+	})
+	if finished.Attempts != 2 {
+		t.Fatalf("completed attempts = %d, want 2", finished.Attempts)
+	}
+	if finished.ResultFileID == nil || *finished.ResultFileID != "result-file" {
+		t.Fatalf("completed result = %v", finished.ResultFileID)
+	}
+}
+
+// TestDispatcherFailsWhenRetriesExhausted 验证临时错误也受 max_attempts
+// 约束：最后一次执行失败后必须明确 failed，不能永远停在 retry_wait。
+func TestDispatcherFailsWhenRetriesExhausted(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	owner := createOwner(t, db, "retry-exhausted")
+	t.Cleanup(func() { cleanupOwners(t, db, owner.ID) })
+
+	service := NewService(db).WithMaxPending(100)
+	q := newTaskTestQueue(t, 1, 4)
+	runner := RunnerFunc(func(
+		ctx context.Context,
+		record model.Task,
+		report queue.ProgressFunc,
+	) (string, error) {
+		return "", Retryable(errors.New("still down"))
+	})
+	startTestDispatcher(t, service, q, runner, 10*time.Millisecond)
+
+	submitted, err := service.Submit(ctx, CreateParams{
+		Type: "fake_echo", OwnerID: owner.ID, Phase: "prepare",
+		MaxAttempts: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	failed := waitTask(t, service, owner.ID, submitted.ID, func(record model.Task) bool {
+		return record.Status == model.TaskStatusFailed
+	})
+	if failed.Attempts != 1 {
+		t.Fatalf("failed attempts = %d, want 1", failed.Attempts)
+	}
+	if failed.LastError == "" {
+		t.Fatal("failed task has no error")
+	}
+}
+
+// TestDispatcherTimeoutBecomesRetryWait 验证执行超时不会把可恢复业务
+// 直接判死：worker 返回后写 retry_wait，下一次调度继续。
+func TestDispatcherTimeoutBecomesRetryWait(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	owner := createOwner(t, db, "timeout-retry")
+	t.Cleanup(func() { cleanupOwners(t, db, owner.ID) })
+
+	q, err := queue.New(queue.Options{
+		Workers: 1, Capacity: 4, Timeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(q.Shutdown)
+
+	service := NewService(db).WithMaxPending(100)
+	runner := RunnerFunc(func(
+		ctx context.Context,
+		record model.Task,
+		report queue.ProgressFunc,
+	) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	startTestDispatcher(t, service, q, runner, 10*time.Millisecond)
+
+	submitted, err := service.Submit(ctx, CreateParams{
+		Type: "fake_echo", OwnerID: owner.ID, Phase: "prepare",
+		MaxAttempts: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waiting := waitTask(t, service, owner.ID, submitted.ID, func(record model.Task) bool {
+		return record.Status == model.TaskStatusRetryWait
+	})
+	if waiting.Attempts != 1 {
+		t.Fatalf("timeout attempts = %d, want 1", waiting.Attempts)
+	}
+	if waiting.LastError == "" {
+		t.Fatal("timeout task has no error")
+	}
+}
+
+// TestRetryDelayIsCappedBackoff 验证退避按执行次数增长并有上限。
+func TestRetryDelayIsCappedBackoff(t *testing.T) {
+	dispatcher := &Dispatcher{retryBase: 10 * time.Second}
+	for attempt, want := range map[int]time.Duration{
+		1:  10 * time.Second,
+		2:  20 * time.Second,
+		3:  40 * time.Second,
+		4:  time.Minute,
+		10: time.Minute,
+	} {
+		if got := dispatcher.retryDelay(attempt); got != want {
+			t.Fatalf("retryDelay(%d) = %s, want %s", attempt, got, want)
+		}
 	}
 }
