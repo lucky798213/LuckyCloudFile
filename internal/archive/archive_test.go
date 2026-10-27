@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -26,22 +27,48 @@ type fakeSource struct {
 	reader  io.ReadCloser // 非空时直接使用，用于模拟阻塞读取。
 }
 
+type fakeSession struct {
+	owner    int
+	parentID string
+	name     string
+	expected int64
+	status   string
+	resultID string
+}
+
 type fakeService struct {
 	mu      sync.Mutex
 	sources map[string]fakeSource
 	closed  map[string]int
-	uploads [][]byte
 
-	uploadErr    error
+	// 模拟上传会话：session ID → 状态。
+	sessions    map[string]*fakeSession
+	nextSession int
+	uploads     [][]byte // UploadSessionContent 收到的 ZIP 内容
+
+	createErr   error
+	contentErr  error
+	completeErr error
+	cancelErr   error
+
 	uploadOwner  int
 	uploadParent string
 	uploadName   string
+	uploadedSize int64
+	cancels      int
+
+	// 测试观察点：完成/取消发生时关闭对应 channel。
+	completed    chan struct{}
+	canceled     chan struct{}
+	completeOnce sync.Once
+	cancelOnce   sync.Once
 }
 
 func newFakeService(sources map[string]fakeSource) *fakeService {
 	return &fakeService{
-		sources: sources,
-		closed:  make(map[string]int),
+		sources:  sources,
+		closed:   make(map[string]int),
+		sessions: make(map[string]*fakeSession),
 	}
 }
 
@@ -60,24 +87,131 @@ func (f *fakeService) Open(_ context.Context, ownerID int, id string) (file.File
 		&fakeReader{service: f, id: id, data: src.data, readErr: src.readErr}, nil
 }
 
-func (f *fakeService) Upload(_ context.Context, ownerID int, parentID, name string, r io.Reader) (file.File, error) {
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return file.File{}, err
+func (f *fakeService) CreateUploadSession(_ context.Context, ownerID int, parentID, name string, size int64) (file.UploadSessionInfo, error) {
+	if f.createErr != nil {
+		return file.UploadSessionInfo{}, f.createErr
+	}
+	if size < 0 {
+		return file.UploadSessionInfo{}, file.ErrInvalidSize
+	}
+	if size > file.MaxUploadBytes {
+		return file.UploadSessionInfo{}, file.ErrTooLarge
 	}
 
 	f.mu.Lock()
-	f.uploads = append(f.uploads, data)
+	defer f.mu.Unlock()
+	f.nextSession++
+	id := fmt.Sprintf("session-%d", f.nextSession)
+	session := &fakeSession{
+		owner:    ownerID,
+		parentID: parentID,
+		name:     name,
+		expected: size,
+		status:   "pending",
+	}
+	f.sessions[id] = session
 	f.uploadOwner = ownerID
 	f.uploadParent = parentID
 	f.uploadName = name
-	uploadErr := f.uploadErr
-	f.mu.Unlock()
+	f.uploadedSize = size
+	return f.sessionInfo(id, session), nil
+}
 
-	if uploadErr != nil {
-		return file.File{}, uploadErr
+func (f *fakeService) UploadSessionContent(_ context.Context, ownerID int, sessionID string, r io.Reader) (file.UploadSessionInfo, error) {
+	if f.contentErr != nil {
+		return file.UploadSessionInfo{}, f.contentErr
 	}
-	return file.File{ID: "result-file", Name: name, Size: int64(len(data))}, nil
+
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return file.UploadSessionInfo{}, err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	session, ok := f.sessions[sessionID]
+	if !ok || session.owner != ownerID {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionNotFound
+	}
+	if session.status != "pending" {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionConflict
+	}
+	if int64(len(data)) != session.expected {
+		return file.UploadSessionInfo{}, file.ErrUploadSizeMismatch
+	}
+
+	session.status = "ready"
+	f.uploads = append(f.uploads, data)
+	return f.sessionInfo(sessionID, session), nil
+}
+
+func (f *fakeService) CompleteUploadSession(_ context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error) {
+	if f.completeErr != nil {
+		return file.UploadSessionInfo{}, f.completeErr
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	session, ok := f.sessions[sessionID]
+	if !ok || session.owner != ownerID {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionNotFound
+	}
+	if session.status == "completed" {
+		return f.sessionInfo(sessionID, session), nil
+	}
+	if session.status != "ready" {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionNotCompletable
+	}
+
+	session.status = "completed"
+	session.resultID = "result-file"
+	f.completeOnce.Do(func() {
+		if f.completed != nil {
+			close(f.completed)
+		}
+	})
+	return f.sessionInfo(sessionID, session), nil
+}
+
+func (f *fakeService) CancelUploadSession(_ context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error) {
+	if f.cancelErr != nil {
+		return file.UploadSessionInfo{}, f.cancelErr
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	session, ok := f.sessions[sessionID]
+	if !ok || session.owner != ownerID {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionNotFound
+	}
+	if session.status == "completed" {
+		return file.UploadSessionInfo{}, file.ErrUploadSessionCompleted
+	}
+
+	session.status = "canceled"
+	f.cancels++
+	f.cancelOnce.Do(func() {
+		if f.canceled != nil {
+			close(f.canceled)
+		}
+	})
+	return f.sessionInfo(sessionID, session), nil
+}
+
+// sessionInfo 是调用方持有 f.mu 时使用的小helper。
+func (f *fakeService) sessionInfo(id string, session *fakeSession) file.UploadSessionInfo {
+	info := file.UploadSessionInfo{
+		ID:           id,
+		ParentID:     session.parentID,
+		Name:         session.name,
+		ExpectedSize: session.expected,
+		Status:       session.status,
+	}
+	if session.resultID != "" {
+		result := session.resultID
+		info.ResultFileID = &result
+	}
+	return info
 }
 
 func (f *fakeService) closeCount(id string) int {
@@ -90,6 +224,21 @@ func (f *fakeService) uploadCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.uploads)
+}
+
+func (f *fakeService) sessionStatus(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if session, ok := f.sessions[id]; ok {
+		return session.status
+	}
+	return ""
+}
+
+func (f *fakeService) cancelCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cancels
 }
 
 type fakeReader struct {
@@ -175,7 +324,17 @@ func TestRunBuildsAndPublishesZip(t *testing.T) {
 
 	files.mu.Lock()
 	archiveFile := files.uploads[0]
+	uploadedSize := files.uploadedSize
 	files.mu.Unlock()
+	if uploadedSize != int64(len(archiveFile)) {
+		t.Fatalf("session expected size = %d, zip size = %d", uploadedSize, len(archiveFile))
+	}
+	if got := files.sessionStatus("session-1"); got != "completed" {
+		t.Fatalf("session status = %q, want completed", got)
+	}
+	if files.cancelCount() != 0 {
+		t.Fatal("successful publish must not cancel the session")
+	}
 
 	zr, err := zip.NewReader(bytes.NewReader(archiveFile), int64(len(archiveFile)))
 	if err != nil {
@@ -459,6 +618,20 @@ func TestNewRejectsInvalidInput(t *testing.T) {
 			},
 			want: ErrDuplicateFile,
 		},
+		{
+			name: "empty file ID",
+			job: func() (*Job, error) {
+				return New(files, 1, []string{""}, "parent", "bundle.zip", Options{})
+			},
+			want: ErrInvalidFileID,
+		},
+		{
+			name: "invalid result name",
+			job: func() (*Job, error) {
+				return New(files, 1, []string{"file-a"}, "parent", "../bundle.zip", Options{})
+			},
+			want: ErrInvalidName,
+		},
 	}
 
 	for _, tc := range cases {
@@ -509,14 +682,143 @@ func TestRunFailsWhenPublishFailsAndCleansUp(t *testing.T) {
 	files := newFakeService(map[string]fakeSource{
 		"file-a": {owner: 1, name: "a.txt", data: []byte("hello")},
 	})
-	files.uploadErr = publishErr
+	files.completeErr = publishErr
 	job, dir := newTestJob(t, files, []string{"file-a"}, Options{})
 
 	if _, err := job.Run(context.Background()); !errors.Is(err, publishErr) {
 		t.Fatalf("want publish error, got %v", err)
 	}
+	if files.cancelCount() != 1 {
+		t.Fatalf("cancel calls = %d, want 1", files.cancelCount())
+	}
+	if got := files.sessionStatus("session-1"); got != "canceled" {
+		t.Fatalf("session status = %q, want canceled", got)
+	}
 	if n := files.closeCount("file-a"); n != 1 {
 		t.Fatalf("source closed %d times, want 1", n)
+	}
+	assertDirEmpty(t, dir)
+}
+
+func TestRunCancelsSessionWhenContentUploadFails(t *testing.T) {
+	contentErr := errors.New("write failed")
+	files := newFakeService(map[string]fakeSource{
+		"file-a": {owner: 1, name: "a.txt", data: []byte("hello")},
+	})
+	files.contentErr = contentErr
+	job, dir := newTestJob(t, files, []string{"file-a"}, Options{})
+
+	if _, err := job.Run(context.Background()); !errors.Is(err, contentErr) {
+		t.Fatalf("want content error, got %v", err)
+	}
+	if files.cancelCount() != 1 {
+		t.Fatalf("cancel calls = %d, want 1", files.cancelCount())
+	}
+	if got := files.sessionStatus("session-1"); got != "canceled" {
+		t.Fatalf("session status = %q, want canceled", got)
+	}
+	assertDirEmpty(t, dir)
+}
+
+func TestRunReportsProgress(t *testing.T) {
+	files := newFakeService(map[string]fakeSource{
+		"file-a": {owner: 1, name: "a.txt", data: []byte("a")},
+		"file-b": {owner: 1, name: "b.txt", data: []byte("b")},
+	})
+	job, _ := newTestJob(t, files, []string{"file-a", "file-b"}, Options{})
+
+	var got []queue.Progress
+	if _, err := job.RunWithProgress(context.Background(), func(p queue.Progress) {
+		got = append(got, p)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []queue.Progress{
+		{Stage: "compressing", Processed: 0, Total: 2},
+		{Stage: "compressing", Processed: 1, Total: 2},
+		{Stage: "compressing", Processed: 2, Total: 2},
+		{Stage: "publishing", Processed: 2, Total: 2},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("progress updates = %d, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("progress[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestQueueMarksCompletedOnlyAfterPublish(t *testing.T) {
+	files := newFakeService(map[string]fakeSource{
+		"file-a": {owner: 1, name: "a.txt", data: []byte("hello")},
+	})
+	files.completed = make(chan struct{})
+	job, dir := newTestJob(t, files, []string{"file-a"}, Options{})
+
+	q, err := queue.New(1, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(q.Shutdown)
+
+	id, err := q.Submit(1, job)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-files.completed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("archive did not publish")
+	}
+
+	q.Shutdown()
+
+	task, err := q.Get(1, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != queue.Completed || task.Result != "result-file" {
+		t.Fatalf("published task must be completed with result file: %+v", task)
+	}
+	assertDirEmpty(t, dir)
+}
+
+func TestQueueFailsWhenPublishFails(t *testing.T) {
+	files := newFakeService(map[string]fakeSource{
+		"file-a": {owner: 1, name: "a.txt", data: []byte("hello")},
+	})
+	files.completeErr = errors.New("publish failed")
+	files.canceled = make(chan struct{})
+	job, dir := newTestJob(t, files, []string{"file-a"}, Options{})
+
+	q, err := queue.New(1, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(q.Shutdown)
+
+	id, err := q.Submit(1, job)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-files.canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("failed publish did not cancel the session")
+	}
+
+	q.Shutdown()
+
+	task, err := q.Get(1, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != queue.Failed || task.Result != "" {
+		t.Fatalf("failed publish must not be completed: %+v", task)
 	}
 	assertDirEmpty(t, dir)
 }

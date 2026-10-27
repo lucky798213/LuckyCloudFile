@@ -54,6 +54,23 @@ type Job interface {
 	Run(ctx context.Context) (result string, err error)
 }
 
+// Progress 是一次可选的阶段/进度更新。
+// Processed 只用于展示，不代表任务已经成功。
+type Progress struct {
+	Stage     string
+	Processed int
+	Total     int
+}
+
+// ProgressFunc 接收任务执行过程中的进度更新。
+type ProgressFunc func(Progress)
+
+// ProgressReporter 是 Job 的可选能力。实现了它的任务会通过 report
+// 汇报阶段和已处理数量；worker 仍然同步等待 RunWithProgress 返回。
+type ProgressReporter interface {
+	RunWithProgress(ctx context.Context, report ProgressFunc) (string, error)
+}
+
 // JobFunc 方便用普通函数构造假任务。
 type JobFunc func(context.Context) (string, error)
 
@@ -63,11 +80,14 @@ func (f JobFunc) Run(ctx context.Context) (string, error) {
 
 // Snapshot 是查询返回的值，不包含待执行的业务对象。
 type Snapshot struct {
-	ID      string
-	OwnerID int
-	Status  Status
-	Result  string
-	Error   string
+	ID        string
+	OwnerID   int
+	Status    Status
+	Stage     string
+	Processed int
+	Total     int
+	Result    string
+	Error     string
 }
 
 // item 只在排队和执行期间保留 Job。
@@ -139,6 +159,7 @@ func (q *Queue) Submit(ownerID int, job Job) (string, error) {
 		ID:      id,
 		OwnerID: ownerID,
 		Status:  Queued,
+		Stage:   string(Queued),
 	}
 
 	select {
@@ -179,7 +200,7 @@ func (q *Queue) worker() {
 
 		// 执行 context 来自队列生命周期，而不是某个 HTTP 请求。
 		ctx, cancel := context.WithTimeout(q.ctx, q.timeout)
-		result, err := run(ctx, task.job)
+		result, err := q.execute(ctx, task.id, task.job)
 		cancel()
 
 		// 返回 nil 就是成功。任务应自己响应 ctx：放弃时返回 ctx.Err()。
@@ -208,12 +229,14 @@ func (q *Queue) start(id string) bool {
 
 	task := q.tasks[id]
 	task.Status = Running
+	task.Stage = string(Running)
 	q.tasks[id] = task
 	return true
 }
 
-// run 在单个任务边界内 recover，panic 不会让整个 worker 退出。
-func run(ctx context.Context, job Job) (result string, err error) {
+// execute 在单个任务边界内 recover，panic 不会让整个 worker 退出。
+// 实现了 ProgressReporter 的任务会收到进度回调。
+func (q *Queue) execute(ctx context.Context, id string, job Job) (result string, err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			result = ""
@@ -221,7 +244,27 @@ func run(ctx context.Context, job Job) (result string, err error) {
 		}
 	}()
 
+	if reporter, ok := job.(ProgressReporter); ok {
+		return reporter.RunWithProgress(ctx, func(p Progress) {
+			q.report(id, p)
+		})
+	}
 	return job.Run(ctx)
+}
+
+// report 只在任务仍在执行时记录进度，避免终态被迟到的回调覆盖。
+func (q *Queue) report(id string, p Progress) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	task, ok := q.tasks[id]
+	if !ok || task.Status != Running {
+		return
+	}
+	task.Stage = p.Stage
+	task.Processed = p.Processed
+	task.Total = p.Total
+	q.tasks[id] = task
 }
 
 func (q *Queue) update(id string, status Status, result string, err error) {
@@ -230,6 +273,7 @@ func (q *Queue) update(id string, status Status, result string, err error) {
 
 	task := q.tasks[id]
 	task.Status = status
+	task.Stage = string(status)
 	task.Result = result
 	task.Error = ""
 	if err != nil {

@@ -45,11 +45,34 @@ type fileService interface {
 	CancelUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error)
 }
 
-// NewRouter 创建并配置好路由。
+// NewRouter 创建不带 ZIP 任务接口的路由。
 //
-// logger、fileService 和 authService 都从参数传进来，而不是在包里自己创建：
-// 这样整个程序共用同一套对象，测试时也能换成假的实现。
+// 任务接口需要任务队列，所以由 NewRouterWithTasks 注册。
+// 保留这个构造函数是为了让只关心文件接口的测试和调用方不用准备队列。
 func NewRouter(logger *slog.Logger, fileService fileService, authService authService) *gin.Engine {
+	return newRouter(logger, fileService, authService, nil)
+}
+
+// NewRouterWithTasks 在文件接口之外注册 ZIP 异步任务接口。
+func NewRouterWithTasks(
+	logger *slog.Logger,
+	fileService fileService,
+	authService authService,
+	tasks taskQueue,
+) *gin.Engine {
+	return newRouter(logger, fileService, authService, tasks)
+}
+
+// newRouter 是实际组装路由的地方。
+//
+// logger、fileService、authService 和 tasks 都从参数传进来，而不是在包里自己创建：
+// 这样整个程序共用同一套对象，测试时也能换成假的实现。
+func newRouter(
+	logger *slog.Logger,
+	fileService fileService,
+	authService authService,
+	tasks taskQueue,
+) *gin.Engine {
 	// gin.New() 创建一个空引擎。
 	// 不用 gin.Default()，是因为它自带日志和 panic 恢复中间件，
 	// 而我们的日志格式要自己控制（JSON、带耗时），所以中间件自己加。
@@ -102,6 +125,13 @@ func NewRouter(logger *slog.Logger, fileService fileService, authService authSer
 	// 取消上传：未完成会话标记 canceled；已过期会话保持 expired，
 	// 两种情况都会在写入停止后清理占位内容。
 	protected.DELETE("/upload-sessions/:id", cancelUploadSession(logger, fileService))
+
+	// ZIP 异步任务：提交只入队并立即返回 task_id；查询读取内存快照。
+	// 没有注入队列时不注册这两条路由，避免 nil 处理函数。
+	if tasks != nil {
+		protected.POST("/archive-tasks", createArchiveTask(logger, fileService, tasks))
+		protected.GET("/tasks/:id", getTask(logger, tasks))
+	}
 
 	// 兜底：没匹配到任何路由时，返回统一的 JSON 错误，而不是 Gin 默认的纯文本 404。
 	r.NoRoute(notFound)

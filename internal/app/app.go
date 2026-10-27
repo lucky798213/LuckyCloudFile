@@ -26,7 +26,15 @@ import (
 	"luckyCloudFile/internal/httpapi"
 	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/pathlock"
+	"luckyCloudFile/internal/queue"
 	"luckyCloudFile/internal/storage"
+)
+
+const (
+	// ZIP 任务队列参数。当前没有配置项，先固定为进程内的有限并发。
+	taskWorkers       = 2
+	taskQueueCapacity = 64
+	taskTimeout       = 10 * time.Minute
 )
 
 // uploadRecoverer 是启动恢复这一步的调用签名。
@@ -91,10 +99,20 @@ func run(
 		WithChunkParallel(cfg.Upload.MaxParallelChunks)
 	authService := auth.NewService(db)
 
+	// 任务队列随应用生命周期创建和关闭。关闭顺序是：
+	// HTTP 先停止接收（serve 内部完成）→ 队列取消执行并等 worker 退出
+	// → database.Close（更早注册的 defer 最后执行）。
+	// 任务可能还在读写数据库，所以队列必须先于数据库关闭。
+	taskQueue, err := queue.New(taskWorkers, taskQueueCapacity, taskTimeout)
+	if err != nil {
+		return fmt.Errorf("initialize task queue: %w", err)
+	}
+	defer taskQueue.Shutdown()
+
 	// 第四步：创建 HTTP Server。它只是一个“配置好的对象”，还没开始监听。
 	// Handler 就是路由表，来自 internal/httpapi。
 	server := &http.Server{
-		Handler: httpapi.NewRouter(logger, fileService, authService),
+		Handler: httpapi.NewRouterWithTasks(logger, fileService, authService, taskQueue),
 		// 读请求头的超时，防止有人只连接不发数据把连接一直占着。
 		ReadHeaderTimeout: 5 * time.Second,
 		// 读整个请求（含上传的文件）最多花 5 分钟。

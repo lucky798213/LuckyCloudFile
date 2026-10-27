@@ -535,3 +535,53 @@ func TestStartAndShutdownRace(t *testing.T) {
 		}
 	}
 }
+
+// progressJob 实现可选的 ProgressReporter，用来验证阶段和计数能出现在快照里。
+type progressJob struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (j *progressJob) Run(ctx context.Context) (string, error) {
+	return j.RunWithProgress(ctx, nil)
+}
+
+func (j *progressJob) RunWithProgress(_ context.Context, report ProgressFunc) (string, error) {
+	report(Progress{Stage: "compressing", Processed: 1, Total: 3})
+	close(j.started)
+	<-j.release
+	report(Progress{Stage: "compressing", Processed: 3, Total: 3})
+	return "file-id", nil
+}
+
+func TestProgressIsVisibleWhileRunning(t *testing.T) {
+	q := newTestQueue(t, 1, 1, time.Minute)
+
+	job := &progressJob{started: make(chan struct{}), release: make(chan struct{})}
+	id, err := q.Submit(1, job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-job.started
+
+	task, err := q.Get(1, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != Running || task.Stage != "compressing" ||
+		task.Processed != 1 || task.Total != 3 {
+		t.Fatalf("unexpected progress while running: %+v", task)
+	}
+
+	close(job.release)
+	q.Shutdown()
+
+	task, err = q.Get(1, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != Completed || task.Stage != "completed" ||
+		task.Processed != 3 || task.Total != 3 || task.Result != "file-id" {
+		t.Fatalf("unexpected final snapshot: %+v", task)
+	}
+}
