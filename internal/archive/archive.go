@@ -24,6 +24,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"luckyCloudFile/internal/failpoint"
 	"luckyCloudFile/internal/file"
 	"luckyCloudFile/internal/queue"
 )
@@ -363,6 +364,9 @@ func (j *Job) publish(
 	if closeErr := src.Close(); closeErr != nil {
 		j.logger.Warn("archive: close temporary reader", "error", closeErr)
 	}
+	// 物理内容已经传完，但完成事务还没提交。在这里强制终止，
+	// 恢复时旧会话已失效，任务必须核对产物后重新发布。
+	failpoint.Hit("archive.publish.content_uploaded")
 
 	completed, err := j.files.CompleteUploadSession(ctx, j.ownerID, session.ID)
 	if err != nil {
@@ -383,6 +387,9 @@ func (j *Job) publish(
 		return "", errors.New("archive: upload session completed without result file")
 	}
 	published = true
+	// 文件、容量结算和 task_results 已经同事务提交，但 tasks 还是 running。
+	// 在这里强制终止，恢复后必须先复用 task_results，不能再次发布。
+	failpoint.Hit("archive.publish.completed")
 	return *completed.ResultFileID, nil
 }
 
@@ -431,6 +438,11 @@ func (j *Job) writeEntries(
 			Processed: i + 1,
 			Total:     total,
 		})
+		if i == 0 {
+			// 已经写入至少一个条目、但 ZIP 还没有 Close/重命名。
+			// 在这里强制终止，恢复后必须重建，不能把 .partial 当结果。
+			failpoint.Hit("archive.compress.partial")
+		}
 	}
 
 	return nil

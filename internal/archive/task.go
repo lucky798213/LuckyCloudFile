@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"luckyCloudFile/internal/failpoint"
 	"luckyCloudFile/internal/file"
 	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/queue"
@@ -244,6 +245,9 @@ func (j *Job) resume(
 			if err := j.saveCheckpoint(ctx, store, record, PhasePublish, state); err != nil {
 				return "", err
 			}
+			// 检查点已经提交：完整 ZIP 的路径、大小和摘要都在数据库里。
+			// 在这里强制终止进程，下一次执行必须核对并复用它，不能重压缩。
+			failpoint.Hit("archive.publish.after_checkpoint")
 			phase = PhasePublish
 
 		case PhasePublish:
@@ -285,6 +289,7 @@ func (j *Job) resume(
 // 快照之后压缩时只认这份身份：来源被改名、移动、删除或换内容时明确失败，
 // 不会按“现在同名的那份文件”继续打出一份不同的 ZIP。
 func (j *Job) prepare(ctx context.Context, dir string, state *TaskState) error {
+	failpoint.Hit("archive.prepare")
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -462,6 +467,9 @@ func (j *Job) finalize(
 	if err := store.SetCleanupPending(ctx, record.ID, record.Attempts, true); err != nil {
 		return fmt.Errorf("archive: persist cleanup responsibility: %w", err)
 	}
+	// 清理责任已经提交、工作目录还在。在这里强制终止，恢复后只能由
+	// 清理任务继续回收，不能因为清理未完成重新发布主结果。
+	failpoint.Hit("archive.finalize.cleanup_pending")
 
 	if err := os.RemoveAll(dir); err != nil {
 		j.logger.Warn("archive: remove task directory", "path", dir, "error", err)

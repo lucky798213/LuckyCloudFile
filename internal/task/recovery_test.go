@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -63,12 +64,43 @@ func TestRecoverRunningConvergesInterruptedTasks(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// 已经在 retry_wait 的任务不属于崩溃遗留：恢复不能提前执行它，
+	// 必须保留原来的 next_run_at 和 attempts。
+	waiting, err := service.Create(ctx, CreateParams{
+		ID: "recover-waiting", Type: "fake_echo", OwnerID: owner.ID,
+		Phase: "compress", StateJSON: `{}`,
+		MaxAttempts: 3, NextRunAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitingStarted, err := service.TryStart(ctx, waiting.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextRunAt := now.Add(10 * time.Minute)
+	if err := service.MarkRetry(
+		ctx, waiting.ID, waitingStarted.Attempts, nextRunAt, errors.New("temporary"),
+	); err != nil {
+		t.Fatal(err)
+	}
+
 	stats, err := service.RecoverRunning(ctx, now.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stats.Completed != 1 || stats.Requeued != 1 || stats.Failed != 1 {
 		t.Fatalf("recovery stats = %+v, want 1/1/1", stats)
+	}
+
+	stillWaiting, err := service.GetOwned(ctx, owner.ID, waiting.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stillWaiting.Status != model.TaskStatusRetryWait ||
+		stillWaiting.Attempts != 1 ||
+		!stillWaiting.NextRunAt.Equal(nextRunAt) {
+		t.Fatalf("retry_wait task changed during recovery: %+v", stillWaiting)
 	}
 
 	completed, err := service.GetOwned(ctx, owner.ID, published.ID)
