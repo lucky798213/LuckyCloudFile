@@ -210,6 +210,16 @@ func (j *Job) resume(
 	if err != nil {
 		return "", err
 	}
+	if store == nil {
+		return "", errors.New("archive: cleanup store is required")
+	}
+
+	// 在创建任何工作目录之前先持久化清理责任。这样发布失败、重试耗尽、
+	// 进程取消等没有走到 finalize 的分支，terminal 之后仍然会被清理任务
+	// 选中；删除成功后再由 finalize 清零。
+	if err := store.SetCleanupPending(ctx, record.ID, record.Attempts, true); err != nil {
+		return "", fmt.Errorf("archive: persist cleanup responsibility: %w", err)
+	}
 
 	phase := record.Phase
 	if phase == "" {

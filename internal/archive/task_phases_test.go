@@ -138,8 +138,9 @@ func TestTaskFactoryRunsPhasesFromRecord(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("task work directory was not cleaned: %v", entries)
 	}
-	if got := checkpoints.cleanupMarked(); !equalBools(got, []bool{true, false}) {
-		t.Fatalf("cleanup responsibility = %v, want [true false]", got)
+	// 责任在进入工作目录前写一次，finalize 删除成功后再清零。
+	if got := checkpoints.cleanupMarked(); !equalBools(got, []bool{true, true, false}) {
+		t.Fatalf("cleanup responsibility = %v, want [true true false]", got)
 	}
 
 	// owner 必须取自记录；来源不属于它时执行失败，且不会发布任何东西。
@@ -591,7 +592,7 @@ func TestTaskFactoryFailsWhenSourceMoved(t *testing.T) {
 //   - 责任写不进去时不能删除目录并静默完成；
 //   - 责任已写、删除失败时任务仍可完成，标记保留给后续清理。
 func TestTaskFactoryPersistsCleanupResponsibility(t *testing.T) {
-	t.Run("persist failure", func(t *testing.T) {
+	t.Run("persist failure prevents work directory", func(t *testing.T) {
 		workDir := t.TempDir()
 		files := newFakeService(map[string]fakeSource{
 			"file-a": {owner: 1, entityID: 71, name: "a.txt", data: []byte("alpha")},
@@ -607,13 +608,14 @@ func TestTaskFactoryPersistsCleanupResponsibility(t *testing.T) {
 		runner := newTaskRunner(t, files, checkpoints, workDir)
 		record := newTaskRecord(t, "task-1", 1, PhasePrepare, state)
 		if _, err := runner.Run(context.Background(), record, nil); err == nil {
-			t.Fatal("finalize succeeded without persisting cleanup responsibility")
+			t.Fatal("execution continued without persisting cleanup responsibility")
 		}
 		if got := checkpoints.cleanupMarked(); !equalBools(got, []bool{true}) {
 			t.Fatalf("cleanup attempts = %v, want [true]", got)
 		}
-		if _, err := os.Stat(filepath.Join(workDir, "task-task-1")); err != nil {
-			t.Fatalf("task directory was removed before responsibility was saved: %v", err)
+		// 责任写不进去时不能创建工作目录，否则这个目录以后没人知道要删。
+		if _, err := os.Stat(filepath.Join(workDir, "task-task-1")); !os.IsNotExist(err) {
+			t.Fatalf("work directory was created before responsibility was saved: %v", err)
 		}
 	})
 
@@ -652,6 +654,67 @@ func TestTaskFactoryPersistsCleanupResponsibility(t *testing.T) {
 			t.Fatalf("task directory should remain for later cleanup: %v", err)
 		}
 	})
+}
+
+// TestTaskFactoryKeepsCleanupAfterPublishFailure 覆盖“ZIP 已生成、发布失败、
+// 没有进入 finalize”的路径：任务会以 failed 结束，但工作目录和清理责任
+// 必须已经留在数据库里，供 cleanup_pending 扫描回收。
+func TestTaskFactoryKeepsCleanupAfterPublishFailure(t *testing.T) {
+	workDir := t.TempDir()
+	files := newFakeService(map[string]fakeSource{
+		"file-a": {owner: 1, entityID: 71, name: "a.txt", data: []byte("alpha")},
+	})
+	// 同名冲突/配额不足都发生在创建发布会话时，属于永久失败。
+	files.createErr = file.ErrAlreadyExists
+	state, err := NewTaskState([]string{"file-a"}, "parent", "bundle.zip", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checkpoints := &recordingCheckpoints{}
+	runner := newTaskRunner(t, files, checkpoints, workDir)
+	record := newTaskRecord(t, "task-1", 1, PhasePrepare, state)
+	_, runErr := runner.Run(context.Background(), record, nil)
+	if !errors.Is(runErr, file.ErrAlreadyExists) {
+		t.Fatalf("publish error = %v, want ErrAlreadyExists", runErr)
+	}
+	if task.IsRetryable(runErr) {
+		t.Fatal("permanent publish failure was marked retryable")
+	}
+	if got := checkpoints.cleanupMarked(); !equalBools(got, []bool{true}) {
+		t.Fatalf("cleanup responsibility = %v, want [true] left behind", got)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "task-task-1", "archive.zip")); err != nil {
+		t.Fatalf("generated ZIP should remain for cleanup: %v", err)
+	}
+}
+
+// TestTaskFactoryKeepsCleanupAfterTransientFailure 覆盖重试前的暂时性失败：
+// 本次执行没有完成，清理责任已经落库，工作目录留给重试或最终清理。
+func TestTaskFactoryKeepsCleanupAfterTransientFailure(t *testing.T) {
+	workDir := t.TempDir()
+	files := newFakeService(map[string]fakeSource{
+		"file-a": {owner: 1, entityID: 71, name: "a.txt", data: []byte("alpha")},
+	})
+	files.createErr = errors.New("storage temporarily unavailable")
+	state, err := NewTaskState([]string{"file-a"}, "parent", "bundle.zip", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checkpoints := &recordingCheckpoints{}
+	runner := newTaskRunner(t, files, checkpoints, workDir)
+	record := newTaskRecord(t, "task-1", 1, PhasePrepare, state)
+	_, runErr := runner.Run(context.Background(), record, nil)
+	if !task.IsRetryable(runErr) {
+		t.Fatalf("transient error = %v, want retryable", runErr)
+	}
+	if got := checkpoints.cleanupMarked(); !equalBools(got, []bool{true}) {
+		t.Fatalf("cleanup responsibility = %v, want [true] left behind", got)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "task-task-1", "archive.zip")); err != nil {
+		t.Fatalf("generated ZIP should remain for retry and cleanup: %v", err)
+	}
 }
 
 func equalBools(got, want []bool) bool {
