@@ -83,6 +83,11 @@ type Task struct {
 
 	// ScanBatchSize 是单次扫描最多取回多少条到期任务。
 	ScanBatchSize int
+
+	// WorkDir 是任务工作目录：可恢复的 ZIP 产物和 .partial 都放在这里。
+	// 相对路径以配置文件所在目录为基准。它不能依赖系统临时目录，
+	// 否则重启或临时目录清理会让 phase=publish 指向的完整产物丢失。
+	WorkDir string
 }
 
 // HTTP 对应 [HTTP]。
@@ -186,6 +191,7 @@ func defaultConfig() Config {
 			MaxPendingTasks:     1000,
 			ScanIntervalSeconds: 5,
 			ScanBatchSize:       50,
+			WorkDir:             "../data-tasks",
 		},
 		Storage:  Storage{LocalRoots: make(map[string]string)},
 		Database: Database{Port: 3306},
@@ -333,6 +339,9 @@ func (c Config) validate() error {
 	if c.Task.ScanBatchSize < 1 || c.Task.ScanBatchSize > 1000 {
 		return fmt.Errorf("Task.ScanBatchSize must be between 1 and 1000")
 	}
+	if strings.TrimSpace(c.Task.WorkDir) == "" {
+		return fmt.Errorf("Task.WorkDir is required")
+	}
 
 	// 存储目录必须写。至于它到底能不能写，要等启动时实际试一下才知道（见 internal/app）。
 	if strings.TrimSpace(c.Storage.LocalRoot) == "" {
@@ -363,7 +372,7 @@ func (c Config) validate() error {
 	return nil
 }
 
-// resolveStoragePath 把存储目录统一成绝对路径。
+// resolveStoragePath 把存储目录和任务工作目录统一成绝对路径。
 //
 // 如果配置文件里写的是相对路径（比如 ../data），就以“配置文件所在的目录”为基准，
 // 而不是以你执行 go run 时所在的目录为基准。
@@ -382,6 +391,12 @@ func (c *Config) resolveStoragePath(configPath string) error {
 		}
 		c.Storage.LocalRoots[key] = resolved
 	}
+
+	workDir, err := resolvePath(configPath, c.Task.WorkDir)
+	if err != nil {
+		return fmt.Errorf("resolve Task.WorkDir: %w", err)
+	}
+	c.Task.WorkDir = workDir
 	return nil
 }
 

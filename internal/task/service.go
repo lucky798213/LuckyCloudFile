@@ -377,6 +377,21 @@ func (s *Service) MarkFailed(ctx context.Context, id string, attempt int, cause 
 	})
 }
 
+// SetCleanupPending 更新“还有临时资源需要清理”的责任标记。
+//
+// 它和 Status 分开：任务可以已经完成任务发布，但工作目录没删掉。
+// 成功清理后也会用 false 把旧标记收回，避免永久留下清理责任。
+func (s *Service) SetCleanupPending(
+	ctx context.Context,
+	id string,
+	attempt int,
+	pending bool,
+) error {
+	return s.updateRunning(ctx, id, attempt, map[string]any{
+		"cleanup_pending": pending,
+	})
+}
+
 // updateRunning 是所有执行期更新的唯一出口。
 //
 // 条件里的 attempts 是本次执行的编号：只有仍然由这一轮执行持有的任务

@@ -72,11 +72,22 @@ var (
 // FileService 是压缩任务需要的最小文件业务接口。
 // 生产实现是 *file.Service，测试可以注入假实现。
 type FileService interface {
-	Open(ctx context.Context, ownerID int, id string) (file.File, io.ReadCloser, error)
+	// 来源不是直接打开就完事：prepare 先记录身份快照，压缩时重新取得保护。
+	SnapshotSources(ctx context.Context, ownerID int, ids []string) ([]file.SourceSnapshot, error)
+	ProtectSources(ctx context.Context, ownerID int, snapshots []file.SourceSnapshot) (file.SourceGuard, error)
+
+	// 目标目录和文件名在 prepare 时校验一次，发布时由会话流程重新核对。
+	ValidateTarget(ctx context.Context, ownerID int, parentID, name string) (string, error)
+
+	// 任务发布会话会绑定 task_id，完成时在同事务内写 task_results。
+	CreateTaskUploadSession(ctx context.Context, ownerID int, parentID, name string, size int64, taskID string) (file.UploadSessionInfo, error)
 	CreateUploadSession(ctx context.Context, ownerID int, parentID, name string, size int64) (file.UploadSessionInfo, error)
 	UploadSessionContent(ctx context.Context, ownerID int, sessionID string, r io.Reader) (file.UploadSessionInfo, error)
 	CompleteUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error)
 	CancelUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error)
+
+	// FindTaskResult 返回已经发布的任务结果；没有时返回 file.ErrNotFound。
+	FindTaskResult(ctx context.Context, ownerID int, taskID string) (string, error)
 }
 
 var _ FileService = (*file.Service)(nil)
@@ -188,6 +199,20 @@ func (j *Job) Run(ctx context.Context) (string, error) {
 // 只有 ZIP writer、文件 Sync/Close、会话上传和完成都成功才返回 nil；
 // 临时 ZIP 在返回前删除。只有 CompleteUploadSession 成功才算任务成功。
 func (j *Job) RunWithProgress(ctx context.Context, report queue.ProgressFunc) (string, error) {
+	// 一次性任务也遵守同一套来源规则：先记录身份，再取得保护后压缩。
+	snapshots, err := j.files.SnapshotSources(ctx, j.ownerID, j.sourceIDs)
+	if err != nil {
+		return "", fmt.Errorf("archive: snapshot sources: %w", err)
+	}
+	if err := validateSourceSnapshots(j.sourceIDs, snapshots); err != nil {
+		return "", err
+	}
+	guard, err := j.files.ProtectSources(ctx, j.ownerID, snapshots)
+	if err != nil {
+		return "", fmt.Errorf("archive: protect sources: %w", err)
+	}
+	defer guard.Release()
+
 	out, err := os.CreateTemp(j.tempDir, "archive-*.zip")
 	if err != nil {
 		return "", fmt.Errorf("archive: create temporary file: %w", err)
@@ -200,7 +225,8 @@ func (j *Job) RunWithProgress(ctx context.Context, report queue.ProgressFunc) (s
 	// 一次性任务无论成功失败都删除临时 ZIP；可恢复任务由 finalize 清理。
 	defer j.removeTemp(path)
 
-	size, _, err := j.writeArchive(ctx, path, report)
+	size, _, err := j.writeArchive(ctx, path, snapshots, guard, report)
+	guard.Release()
 	if err != nil {
 		return "", err
 	}
@@ -210,16 +236,18 @@ func (j *Job) RunWithProgress(ctx context.Context, report queue.ProgressFunc) (s
 		return "", err
 	}
 
-	return j.publish(ctx, path, size, report)
+	return j.publish(ctx, path, size, "", report)
 }
 
 // writeArchive 把一个完整 ZIP 写到 path（覆盖已有内容），返回字节数和 SHA-256。
 //
 // 它只生成产物，不发布；一次性 Run 和可恢复的 compress 阶段共用它。
-// 写入过程中同步计算摘要，最后 Sync + Close，成功返回时文件已经完整。
+// 每个来源都从 guard 逐项打开，条目名和大小必须与快照一致。
 func (j *Job) writeArchive(
 	ctx context.Context,
 	path string,
+	snapshots []file.SourceSnapshot,
+	guard file.SourceGuard,
 	report queue.ProgressFunc,
 ) (int64, string, error) {
 	out, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
@@ -229,7 +257,7 @@ func (j *Job) writeArchive(
 	// 正常路径会显式 Close 并检查错误；这里只兜 panic 跳过的关闭。
 	defer out.Close()
 
-	total := len(j.sourceIDs)
+	total := len(snapshots)
 	j.report(report, queue.Progress{Stage: "compressing", Total: total})
 
 	// 摘要和 limitWriter 看到的是同一批字节：ZIP 条目头、内容和中央目录
@@ -240,7 +268,7 @@ func (j *Job) writeArchive(
 		digest,
 	))
 
-	buildErr := j.writeEntries(ctx, zw, report)
+	buildErr := j.writeEntries(ctx, zw, snapshots, guard, report)
 	// 无论成功失败都关闭 writer 和文件，避免句柄泄漏；
 	// 但失败路径只报告 buildErr，避免用半成品的关闭错误掩盖真实原因。
 	zipErr := zw.Close()
@@ -273,15 +301,32 @@ func (j *Job) writeArchive(
 
 // publish 通过已有上传会话链发布 ZIP：
 //
-//	CreateUploadSession → UploadSessionContent → CompleteUploadSession
+//	CreateTaskUploadSession → UploadSessionContent → CompleteUploadSession
+//
+// taskID 非空时使用绑定任务的上传会话：完成事务会同时写 task_results，
+// 所以重复恢复不会发布第二份逻辑结果。taskID 为空是 P7 的一次性路径。
 //
 // 不直接写存储和 files 表，复用现有配额预留、目标路径锁和失败清理。
 func (j *Job) publish(
 	ctx context.Context,
 	path string,
 	size int64,
+	taskID string,
 	report queue.ProgressFunc,
 ) (string, error) {
+	// 先查结果关联：已经发布过就直接复用，不再压缩、上传或计费。
+	if taskID != "" {
+		existing, err := j.files.FindTaskResult(ctx, j.ownerID, taskID)
+		switch {
+		case err == nil:
+			return existing, nil
+		case errors.Is(err, file.ErrNotFound):
+			// 还没有结果，继续正常发布。
+		default:
+			return "", fmt.Errorf("archive: query task result: %w", err)
+		}
+	}
+
 	total := len(j.sourceIDs)
 	j.report(report, queue.Progress{Stage: "publishing", Processed: total, Total: total})
 
@@ -292,7 +337,14 @@ func (j *Job) publish(
 	// 正常路径后面会显式 Close；panic 时由这里兜底。
 	defer src.Close()
 
-	session, err := j.files.CreateUploadSession(ctx, j.ownerID, j.parentID, j.name, size)
+	var session file.UploadSessionInfo
+	if taskID == "" {
+		session, err = j.files.CreateUploadSession(ctx, j.ownerID, j.parentID, j.name, size)
+	} else {
+		session, err = j.files.CreateTaskUploadSession(
+			ctx, j.ownerID, j.parentID, j.name, size, taskID,
+		)
+	}
 	if err != nil {
 		return "", fmt.Errorf("archive: create upload session: %w", err)
 	}
@@ -314,6 +366,15 @@ func (j *Job) publish(
 
 	completed, err := j.files.CompleteUploadSession(ctx, j.ownerID, session.ID)
 	if err != nil {
+		// 并发/重放可能已经由另一个执行者写入了同一条 task_results：
+		// 本次发布事务已经整体回滚，取消这个多余会话并复用已有结果。
+		if taskID != "" && errors.Is(err, file.ErrTaskResultExists) {
+			existing, findErr := j.files.FindTaskResult(ctx, j.ownerID, taskID)
+			if findErr == nil {
+				return existing, nil
+			}
+			return "", fmt.Errorf("archive: task result exists but cannot be read: %w", findErr)
+		}
 		// 完成结果可能不明确：如果其实已经完成，Cancel 会返回冲突，
 		// 这里只尽力收尾并记录日志，不覆盖原始错误。
 		return "", fmt.Errorf("archive: complete upload session: %w", err)
@@ -344,17 +405,23 @@ func (j *Job) report(report queue.ProgressFunc, p queue.Progress) {
 
 // writeEntries 逐文件写入 ZIP。单个来源交给 writeEntry，
 // 每个来源处理完（包括出错或 panic）都会立即关闭，不在循环里累积句柄。
-func (j *Job) writeEntries(ctx context.Context, zw *zip.Writer, report queue.ProgressFunc) error {
-	seen := make(map[string]struct{}, len(j.sourceIDs))
+func (j *Job) writeEntries(
+	ctx context.Context,
+	zw *zip.Writer,
+	snapshots []file.SourceSnapshot,
+	guard file.SourceGuard,
+	report queue.ProgressFunc,
+) error {
+	seen := make(map[string]struct{}, len(snapshots))
 	remaining := j.maxSourceBytes
-	total := len(j.sourceIDs)
+	total := len(snapshots)
 
-	for i, id := range j.sourceIDs {
+	for i, snapshot := range snapshots {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		n, err := j.writeEntry(ctx, zw, id, remaining, seen)
+		n, err := j.writeEntry(ctx, zw, i, snapshot, guard, remaining, seen)
 		if err != nil {
 			return err
 		}
@@ -369,38 +436,53 @@ func (j *Job) writeEntries(ctx context.Context, zw *zip.Writer, report queue.Pro
 	return nil
 }
 
-// writeEntry 打开并写入一个源文件。
+// writeEntry 在来源保护下打开并写入一个源文件。
+//
+// 打开后再次核对 FileID / 名字 / 大小，复制完再核对实际字节数：
+// 快照之后内容被替换或截断时明确失败，不会把另一份内容写进 ZIP。
 //
 // rc.Close 用 defer 统一收口：正常返回时 Close 错误会变成任务错误，
 // panic 时也一定会关闭句柄。
 func (j *Job) writeEntry(
 	ctx context.Context,
 	zw *zip.Writer,
-	id string,
+	index int,
+	snapshot file.SourceSnapshot,
+	guard file.SourceGuard,
 	remaining int64,
 	seen map[string]struct{},
 ) (n int64, err error) {
-	source, rc, err := j.files.Open(ctx, j.ownerID, id)
+	current, rc, err := guard.Open(ctx, index)
 	if err != nil {
-		return 0, fmt.Errorf("archive: open source %s: %w", id, err)
+		return 0, fmt.Errorf("archive: open source %s: %w", snapshot.FileID, err)
 	}
 	defer func() {
 		if closeErr := rc.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("archive: close source %q: %w", source.Name, closeErr)
+			err = fmt.Errorf("archive: close source %q: %w", current.Name, closeErr)
 		}
 	}()
 
-	if !safeEntryName(source.Name) {
-		return 0, fmt.Errorf("%w: %q", ErrUnsafeName, source.Name)
+	if current.FileID != snapshot.FileID ||
+		current.EntityID != snapshot.EntityID ||
+		current.ParentID != snapshot.ParentID ||
+		current.Name != snapshot.Name ||
+		current.Size != snapshot.Size {
+		return 0, fmt.Errorf(
+			"%w: source %s changed while opening",
+			file.ErrSourceChanged, snapshot.FileID,
+		)
 	}
-	if _, ok := seen[source.Name]; ok {
-		return 0, fmt.Errorf("%w: %q", ErrDuplicateName, source.Name)
+	if !safeEntryName(current.Name) {
+		return 0, fmt.Errorf("%w: %q", ErrUnsafeName, current.Name)
 	}
-	seen[source.Name] = struct{}{}
+	if _, ok := seen[current.Name]; ok {
+		return 0, fmt.Errorf("%w: %q", ErrDuplicateName, current.Name)
+	}
+	seen[current.Name] = struct{}{}
 
-	entry, err := zw.Create(source.Name)
+	entry, err := zw.Create(current.Name)
 	if err != nil {
-		return 0, fmt.Errorf("archive: create entry %q: %w", source.Name, err)
+		return 0, fmt.Errorf("archive: create entry %q: %w", current.Name, err)
 	}
 
 	// 多读 1 字节用于区分“刚好到上限”和“超过上限”。
@@ -409,10 +491,18 @@ func (j *Job) writeEntry(
 		remaining+1,
 	))
 	if err != nil {
-		return 0, fmt.Errorf("archive: copy %q: %w", source.Name, err)
+		return 0, fmt.Errorf("archive: copy %q: %w", current.Name, err)
 	}
 	if n > remaining {
 		return 0, fmt.Errorf("%w: limit is %d bytes", ErrSourceTooLarge, j.maxSourceBytes)
+	}
+	// 实际读到的字节必须等于 prepare 时记录的大小；内容被原地改写时
+	// 即使大小相同，也无法在这里发现，但大小变化一定会被拦住。
+	if n != snapshot.Size {
+		return 0, fmt.Errorf(
+			"%w: source %s read %d bytes, snapshot says %d",
+			file.ErrSourceChanged, snapshot.FileID, n, snapshot.Size,
+		)
 	}
 	return n, nil
 }

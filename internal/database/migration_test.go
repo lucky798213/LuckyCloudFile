@@ -52,7 +52,7 @@ func prepareLegacySchema(t *testing.T, dsn string) {
 
 	statements := []string{
 		"SET FOREIGN_KEY_CHECKS = 0",
-		"DROP TABLE IF EXISTS tasks, upload_sessions, auth_sessions, files, entities, users, storage_policies, schema_migrations",
+		"DROP TABLE IF EXISTS task_results, tasks, upload_sessions, auth_sessions, files, entities, users, storage_policies, schema_migrations",
 		"SET FOREIGN_KEY_CHECKS = 1",
 		`CREATE TABLE users (
 			id BIGINT NOT NULL AUTO_INCREMENT,
@@ -280,7 +280,7 @@ func resetMigrationSchema(t *testing.T, dsn string) {
 	}
 	for _, statement := range []string{
 		"SET FOREIGN_KEY_CHECKS = 0",
-		"DROP TABLE IF EXISTS tasks, upload_sessions, auth_sessions, files, entities, users, storage_policies, schema_migrations",
+		"DROP TABLE IF EXISTS task_results, tasks, upload_sessions, auth_sessions, files, entities, users, storage_policies, schema_migrations",
 		"SET FOREIGN_KEY_CHECKS = 1",
 	} {
 		if _, err := conn.Exec(statement); err != nil {
@@ -546,5 +546,52 @@ func TestTaskTableMigration(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("deleting the owner left %d task(s) behind", count)
+	}
+}
+
+// TestTaskResultMigration 验证任务发布幂等凭据：
+//   - task_results 表由迁移创建，task_id 主键能阻止同一任务写第二条结果；
+//   - upload_sessions 增加可空的 task_id 列，旧会话不需要回填。
+func TestTaskResultMigration(t *testing.T) {
+	dsn := migrationDSN(t)
+	ctx := context.Background()
+	resetMigrationSchema(t, dsn)
+
+	db, err := database.OpenDSN(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close(db)
+
+	if !db.Migrator().HasTable("task_results") {
+		t.Fatal("fresh migration did not create task_results")
+	}
+	if !db.Migrator().HasColumn(&model.UploadSession{}, "TaskID") {
+		t.Fatal("upload_sessions is missing task_id")
+	}
+
+	user, _ := createMigrationUser(t, db)
+	result := model.TaskResult{
+		TaskID:  "migration-task-1",
+		OwnerID: user.ID,
+		FileID:  "file-1",
+	}
+	if err := db.WithContext(ctx).Create(&result).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	var stored model.TaskResult
+	if err := db.WithContext(ctx).
+		First(&stored, "task_id = ?", result.TaskID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.OwnerID != user.ID || stored.FileID != "file-1" || stored.CreatedAt.IsZero() {
+		t.Fatalf("task result fields changed after migration: %+v", stored)
+	}
+
+	// 同一任务第二次发布必须被主键拒绝。
+	duplicate := result
+	if err := db.WithContext(ctx).Create(&duplicate).Error; err == nil {
+		t.Fatal("duplicate task result was accepted")
 	}
 }

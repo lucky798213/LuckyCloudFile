@@ -17,6 +17,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"luckyCloudFile/internal/archive"
 	"luckyCloudFile/internal/auth"
 	"luckyCloudFile/internal/config"
 	"luckyCloudFile/internal/database"
@@ -72,6 +73,8 @@ func TestArchiveTaskEndToEnd(t *testing.T) {
 		Task: config.Task{
 			Workers: 2, QueueCapacity: 8, TimeoutSeconds: 60,
 			RetentionSeconds: 60, MaxTerminalRecords: 64,
+			// 可恢复 ZIP 必须写在配置的任务工作目录，而不是系统临时目录。
+			WorkDir: archiveTempDir,
 		},
 		Storage:  storageCfg,
 		Database: testDatabaseConfig(t),
@@ -168,6 +171,29 @@ func TestArchiveTaskEndToEnd(t *testing.T) {
 	}
 	t.Logf("PASS: task completed with result file %s", task.ResultFileID)
 
+	// 任务表和 task_results 必须一起收敛：phase 是最后一步 finalize，
+	// 结果凭据指向同一个文件，且没有遗留清理责任。
+	var storedTask model.Task
+	if err := db.First(&storedTask, "id = ?", submitted.TaskID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if storedTask.Status != model.TaskStatusCompleted ||
+		storedTask.Phase != archive.PhaseFinalize ||
+		storedTask.CleanupPending ||
+		storedTask.ResultFileID == nil ||
+		*storedTask.ResultFileID != task.ResultFileID {
+		t.Fatalf("stored task did not converge: %+v", storedTask)
+	}
+	var taskResult model.TaskResult
+	if err := db.First(&taskResult, "task_id = ?", submitted.TaskID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if taskResult.OwnerID != user.ID || taskResult.FileID != task.ResultFileID {
+		t.Fatalf("task result = %+v, want owner %d file %s",
+			taskResult, user.ID, task.ResultFileID)
+	}
+	t.Log("PASS: task phase and task_results converged to finalize")
+
 	// 5. 下载 ZIP，校验响应头和字节数。
 	download := e2eRequest(t, client, http.MethodGet, base+"/api/files/"+task.ResultFileID, token, nil, "", http.StatusOK)
 	if got := download.header.Get("Content-Length"); got != strconv.Itoa(len(download.body)) {
@@ -251,6 +277,10 @@ func TestArchiveTaskEndToEnd(t *testing.T) {
 	}
 	if user.RootFileID == nil || session.ParentID != *user.RootFileID {
 		t.Fatalf("archive session parent = %q, want root %v", session.ParentID, user.RootFileID)
+	}
+	// 任务发布会话必须绑定 task_id，完成事务才能和 task_results 一起提交。
+	if session.TaskID == nil || *session.TaskID != submitted.TaskID {
+		t.Fatalf("archive session task = %v, want %s", session.TaskID, submitted.TaskID)
 	}
 
 	var files []model.File
@@ -492,6 +522,9 @@ func cleanupE2EUser(t *testing.T, db *gorm.DB, user *model.User) {
 	}
 	if err := db.Where("owner_id = ?", user.ID).Delete(&model.UploadSession{}).Error; err != nil {
 		t.Logf("cleanup upload sessions for %s: %v", user.Username, err)
+	}
+	if err := db.Where("owner_id = ?", user.ID).Delete(&model.TaskResult{}).Error; err != nil {
+		t.Logf("cleanup task results for %s: %v", user.Username, err)
 	}
 
 	var entityIDs []int64

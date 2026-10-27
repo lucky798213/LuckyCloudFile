@@ -177,6 +177,7 @@ func autoMigrate(db *gorm.DB) error {
 		&model.AuthSession{},
 		&model.UploadSession{},
 		&model.Task{},
+		&model.TaskResult{},
 	)
 }
 

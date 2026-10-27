@@ -276,6 +276,11 @@ type UploadSession struct {
 	// 完成后生成的文件 ID。只有 completed 状态才有值；
 	// 重复确认完成时直接返回它，不再创建新文件。
 	ResultFileID *string `gorm:"type:varchar(255);uniqueIndex"`
+
+	// TaskID 非空表示这个会话是某个可恢复任务创建的发布会话。
+	// 它用于识别“会话创建成功但检查点还没提交”的占位和预留，
+	// 不是“一个任务只能有一个会话”的唯一键：失败的会话可能已经取消。
+	TaskID *string `gorm:"type:varchar(255);index"`
 }
 
 func (UploadSession) TableName() string { return "upload_sessions" }
@@ -340,7 +345,7 @@ type Task struct {
 	NextRunAt time.Time `gorm:"not null;index:idx_tasks_due,priority:2"`
 
 	// 成功发布后的结果文件 ID。失败或尚未发布时为 NULL。
-	// 它是查询用的投影，真正的幂等凭据以后放在独立的结果表里。
+	// 它是查询用的投影；发布幂等的真正凭据是 task_results 行。
 	ResultFileID *string `gorm:"type:varchar(255)"`
 
 	// 最后一次失败或等待重试的原因，只用于查询和排查，不保存堆栈。
@@ -357,3 +362,25 @@ type Task struct {
 }
 
 func (Task) TableName() string { return "tasks" }
+
+// TaskResult 是任务发布结果的幂等凭据。
+//
+// 它在 CompleteUploadSession 的同一个事务里和 File、Entity、容量结算一起
+// 提交：要么“文件已经发布且结果关联存在”，要么两者都不存在。
+//
+// 它刻意不对 files 建外键：用户后来删掉结果文件时，这条凭据仍然保留，
+// 旧任务恢复后只能复用或收敛这个结果，不能重新发布一份新文件。
+type TaskResult struct {
+	// TaskID 是主键：一个任务最多对应一份逻辑结果。
+	TaskID string `gorm:"type:varchar(255);primaryKey"`
+
+	// 结果属于哪个用户，查询时必须同时匹配，避免用别人的任务 ID 探测结果。
+	OwnerID int `gorm:"not null;index"`
+
+	// 发布后的 File ID。它可能已经被用户删除，不能据此重新创建文件。
+	FileID string `gorm:"type:varchar(255);not null;index"`
+
+	CreatedAt time.Time `gorm:"not null;autoCreateTime"`
+}
+
+func (TaskResult) TableName() string { return "task_results" }

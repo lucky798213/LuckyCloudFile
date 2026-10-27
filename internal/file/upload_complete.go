@@ -292,6 +292,25 @@ func (s *Service) CompleteUploadSession(
 			)
 		}
 
+		// 任务发布会话：task_results 必须和 File、Entity、容量结算在同一个
+		// 事务里提交。提交成功后，即使任务检查点还没保存，重启也能查到
+		// 这份结果并收敛，不会再发布第二份文件。
+		if session.TaskID != nil && *session.TaskID != "" {
+			result := model.TaskResult{
+				TaskID:  *session.TaskID,
+				OwnerID: ownerID,
+				FileID:  fileID,
+			}
+			if err := tx.Create(&result).Error; err != nil {
+				if errors.Is(err, gorm.ErrDuplicatedKey) {
+					// 另一个执行者已经发布了结果：整笔新发布回滚，
+					// 交给调用方查询已有结果并取消本次会话。
+					return ErrTaskResultExists
+				}
+				return fmt.Errorf("record task result: %w", err)
+			}
+		}
+
 		session.Status = model.UploadStatusCompleted
 		session.ResultFileID = &fileID
 		session.ReservedBytes = 0

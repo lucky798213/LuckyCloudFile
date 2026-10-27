@@ -93,6 +93,39 @@ func (s *Service) CreateUploadSessionWithMode(
 	size int64,
 	mode string,
 ) (UploadSessionInfo, error) {
+	return s.createUploadSession(
+		ctx, ownerID, parentID, name, size, mode, nil,
+	)
+}
+
+// CreateTaskUploadSession 创建一个绑定任务的整文件发布会话。
+//
+// 它和普通会话使用同一套容量预留、目标路径锁和事务顺序，只是额外把
+// task_id 写进会话。完成时会在同一个发布事务里写 task_results，
+// 让“文件已发布”和“任务结果关联”一起提交。
+func (s *Service) CreateTaskUploadSession(
+	ctx context.Context,
+	ownerID int,
+	parentID, name string,
+	size int64,
+	taskID string,
+) (UploadSessionInfo, error) {
+	if taskID == "" {
+		return UploadSessionInfo{}, errors.New("task ID is required")
+	}
+	return s.createUploadSession(
+		ctx, ownerID, parentID, name, size, model.UploadModeFull, &taskID,
+	)
+}
+
+func (s *Service) createUploadSession(
+	ctx context.Context,
+	ownerID int,
+	parentID, name string,
+	size int64,
+	mode string,
+	taskID *string,
+) (UploadSessionInfo, error) {
 	if mode == "" {
 		mode = model.UploadModeFull
 	}
@@ -158,6 +191,7 @@ func (s *Service) CreateUploadSessionWithMode(
 		ReservedBytes: size,
 		Status:        status,
 		ExpiresAt:     expiresAt,
+		TaskID:        taskID,
 	}
 
 	// 先占住最终目标，再创建会话。锁覆盖整个会话生命周期，直到完成、

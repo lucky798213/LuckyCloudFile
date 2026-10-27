@@ -48,8 +48,14 @@ func TestLoad(t *testing.T) {
 	if cfg.Storage.LocalRoot != filepath.Join(filepath.Dir(path), "data") {
 		t.Fatalf("relative storage path resolved incorrectly: %s", cfg.Storage.LocalRoot)
 	}
+	if cfg.Task.WorkDir != filepath.Join(filepath.Dir(path), "..", "data-tasks") {
+		t.Fatalf("relative task work dir resolved incorrectly: %s", cfg.Task.WorkDir)
+	}
 	if _, err := os.Stat(cfg.Storage.LocalRoot); !os.IsNotExist(err) {
 		t.Fatal("loading configuration must not create storage or connect to services")
+	}
+	if _, err := os.Stat(cfg.Task.WorkDir); !os.IsNotExist(err) {
+		t.Fatal("loading configuration must not create the task work directory")
 	}
 	// 旧配置没有 [Upload] 段：必须保留默认值，不能拒绝启动。
 	if cfg.Upload.MaxParallelChunks != 2 {
@@ -85,7 +91,7 @@ func TestTaskDefaultsMatchQueueDefaults(t *testing.T) {
 
 // TestLoadTaskQueue 验证 [Task] 真正从配置读入，而不是固定常量。
 func TestLoadTaskQueue(t *testing.T) {
-	cfg, err := Load(writeConfig(t, validINI+`
+	path := writeConfig(t, validINI+`
 [Task]
 Workers = 4
 QueueCapacity = 8
@@ -95,7 +101,9 @@ MaxTerminalRecords = 500
 MaxPendingTasks = 200
 ScanIntervalSeconds = 10
 ScanBatchSize = 20
-`))
+WorkDir = ./task-work
+`)
+	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,6 +111,7 @@ ScanBatchSize = 20
 		Workers: 4, QueueCapacity: 8, TimeoutSeconds: 120,
 		RetentionSeconds: 60, MaxTerminalRecords: 500,
 		MaxPendingTasks: 200, ScanIntervalSeconds: 10, ScanBatchSize: 20,
+		WorkDir: filepath.Join(filepath.Dir(path), "task-work"),
 	}
 	if cfg.Task != want {
 		t.Fatalf("Task = %+v, want %+v", cfg.Task, want)
@@ -137,6 +146,20 @@ func TestLoadRejectsInvalidTaskQueue(t *testing.T) {
 				t.Fatalf("wanted error containing %q; got %v", tc.want, err)
 			}
 		})
+	}
+}
+
+// TestValidateRequiresTaskWorkDir 验证没有任务工作目录时启动失败。
+// 可恢复 ZIP 依赖这个目录，不能悄悄退回系统临时目录。
+func TestValidateRequiresTaskWorkDir(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validINI))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Task.WorkDir = "  "
+	err = cfg.validate()
+	if err == nil || !strings.Contains(err.Error(), "Task.WorkDir") {
+		t.Fatalf("wanted Task.WorkDir error; got %v", err)
 	}
 }
 

@@ -20,11 +20,13 @@ import (
 
 // fakeSource 是测试里的一个源文件。
 type fakeSource struct {
-	owner   int
-	name    string
-	data    []byte
-	readErr error
-	reader  io.ReadCloser // 非空时直接使用，用于模拟阻塞读取。
+	owner    int
+	entityID int64
+	parentID string
+	name     string
+	data     []byte
+	readErr  error
+	reader   io.ReadCloser // 非空时直接使用，用于模拟阻塞读取。
 }
 
 type fakeSession struct {
@@ -34,6 +36,12 @@ type fakeSession struct {
 	expected int64
 	status   string
 	resultID string
+	taskID   string
+}
+
+type fakeTaskResult struct {
+	owner  int
+	fileID string
 }
 
 type fakeService struct {
@@ -46,10 +54,16 @@ type fakeService struct {
 	nextSession int
 	uploads     [][]byte // UploadSessionContent 收到的 ZIP 内容
 
-	createErr   error
-	contentErr  error
-	completeErr error
-	cancelErr   error
+	// 任务结果关联：task ID → 已发布文件。
+	taskResults map[string]fakeTaskResult
+
+	createErr    error
+	contentErr   error
+	completeErr  error
+	cancelErr    error
+	validateErr  error
+	protectCalls int
+	releases     int
 
 	uploadOwner  int
 	uploadParent string
@@ -66,9 +80,10 @@ type fakeService struct {
 
 func newFakeService(sources map[string]fakeSource) *fakeService {
 	return &fakeService{
-		sources:  sources,
-		closed:   make(map[string]int),
-		sessions: make(map[string]*fakeSession),
+		sources:     sources,
+		closed:      make(map[string]int),
+		sessions:    make(map[string]*fakeSession),
+		taskResults: make(map[string]fakeTaskResult),
 	}
 }
 
@@ -88,6 +103,25 @@ func (f *fakeService) Open(_ context.Context, ownerID int, id string) (file.File
 }
 
 func (f *fakeService) CreateUploadSession(_ context.Context, ownerID int, parentID, name string, size int64) (file.UploadSessionInfo, error) {
+	return f.createSession(ownerID, parentID, name, size, "")
+}
+
+func (f *fakeService) CreateTaskUploadSession(
+	_ context.Context,
+	ownerID int,
+	parentID, name string,
+	size int64,
+	taskID string,
+) (file.UploadSessionInfo, error) {
+	return f.createSession(ownerID, parentID, name, size, taskID)
+}
+
+func (f *fakeService) createSession(
+	ownerID int,
+	parentID, name string,
+	size int64,
+	taskID string,
+) (file.UploadSessionInfo, error) {
 	if f.createErr != nil {
 		return file.UploadSessionInfo{}, f.createErr
 	}
@@ -108,6 +142,7 @@ func (f *fakeService) CreateUploadSession(_ context.Context, ownerID int, parent
 		name:     name,
 		expected: size,
 		status:   "pending",
+		taskID:   taskID,
 	}
 	f.sessions[id] = session
 	f.uploadOwner = ownerID
@@ -162,9 +197,21 @@ func (f *fakeService) CompleteUploadSession(_ context.Context, ownerID int, sess
 	if session.status != "ready" {
 		return file.UploadSessionInfo{}, file.ErrUploadSessionNotCompletable
 	}
+	// 模拟完成事务里的 task_results 唯一键：已有结果时整笔发布回滚。
+	if session.taskID != "" {
+		if _, ok := f.taskResults[session.taskID]; ok {
+			return file.UploadSessionInfo{}, file.ErrTaskResultExists
+		}
+	}
 
 	session.status = "completed"
 	session.resultID = "result-file"
+	if session.taskID != "" {
+		f.taskResults[session.taskID] = fakeTaskResult{
+			owner:  ownerID,
+			fileID: session.resultID,
+		}
+	}
 	f.completeOnce.Do(func() {
 		if f.completed != nil {
 			close(f.completed)

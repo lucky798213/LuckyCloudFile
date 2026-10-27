@@ -65,6 +65,13 @@ func run(
 	if err := checkStorage(cfg.Storage.LocalRoot); err != nil {
 		return err
 	}
+	// 任务工作目录同样必须在开始调度前可写：phase=publish 依赖这里保存的
+	// 完整 ZIP，不能等到第一个任务执行到一半才发现目录不可用。
+	if cfg.Task.WorkDir != "" {
+		if err := checkStorage(cfg.Task.WorkDir); err != nil {
+			return fmt.Errorf("check task work directory: %w", err)
+		}
+	}
 
 	// 第二步：连接 MySQL。连不上就在这里失败，而不是等第一个请求才报错。
 	// database.Open 还会自动建表（P2 先用 AutoMigrate）。
@@ -106,7 +113,7 @@ func run(
 		archive.NewTaskFactory(
 			fileService,
 			taskService,
-			archive.Options{Logger: logger},
+			archive.Options{Logger: logger, WorkDir: cfg.Task.WorkDir},
 		),
 	); err != nil {
 		return fmt.Errorf("register archive task factory: %w", err)
