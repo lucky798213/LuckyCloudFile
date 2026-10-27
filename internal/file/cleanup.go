@@ -125,8 +125,9 @@ func (s *Service) CleanupPending(ctx context.Context, batchSize int) (CleanupRes
 
 // CleanupLoop 立即扫描一次，之后每隔 interval 再扫描一次，直到 ctx 被取消。
 //
-// app 在服务启动后调用它，所以“启动时扫描一次”和“运行期间定时扫描”
-// 都由这一个循环覆盖。
+// 这是 P7 的进程内循环，保留给直接调用和旧测试；应用启动现在改为确保一条
+// storage_cleanup_v1 持久化任务，由任务调度器调用 CleanupPending，
+// 这样清理失败和重启后的责任都记录在数据库里。
 func (s *Service) CleanupLoop(ctx context.Context, interval time.Duration, batchSize int) {
 	if interval <= 0 {
 		interval = DefaultCleanupInterval
