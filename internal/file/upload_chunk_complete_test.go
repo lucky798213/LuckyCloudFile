@@ -301,16 +301,19 @@ func TestChunkedCompleteRetriesAfterFinalizeFailure(t *testing.T) {
 		}
 	}
 
-	// 失败只回退状态，不删除分片或容量。
+	// 失败只影响本次收尾，不删除分片或容量；状态保持 receiving，
+	// 下一次 /complete 会重新核对账本并继续。
 	if got, ok := svc.chunks.received(info.ID); !ok || got != total {
 		t.Fatalf("ledger after finalize failure = (%d, %v), want (%d, true)", got, ok, total)
 	}
 	failed, entity := loadUploadSessionAndEntity(t, env, info.ID)
-	if failed.Status != model.UploadStatusPending || failed.ResultFileID != nil {
+	if failed.Status != model.UploadStatusReceiving || failed.ResultFileID != nil {
 		t.Fatalf("session after finalize failure = %+v", failed)
 	}
+	// 进度在收尾之前已经同步到账本累计值；Finalize 失败只影响 ready，
+	// 占位实体仍然是 uploading/0，还没有被发布。
 	if entity.Status != model.EntityStatusUploading ||
-		entity.RefCount != 0 || entity.Size >= total {
+		entity.RefCount != 0 || entity.Size != total {
 		t.Fatalf("entity after finalize failure = %+v", entity)
 	}
 	user := reloadUser(t, env, env.ownerA.ID)
@@ -441,10 +444,10 @@ func TestChunkedCompleteEmptySessionWithoutLedger(t *testing.T) {
 	}
 }
 
-// TestChunkedChunkRetryRecoversStuckReceiving 覆盖失败回退时的数据库错误：
-// receiving → pending 的更新失败后会话会卡在 receiving；只要确认没有活跃写入，
-// 下一次分片请求应当核对并恢复成 pending，而不是永远 409。
-func TestChunkedChunkRetryRecoversStuckReceiving(t *testing.T) {
+// TestChunkedChunkRetryWhileReceiving 验证 receiving 是正常状态：
+// 某个分片失败后会话保持 receiving；没有活跃写入时，下一次请求直接继续
+// 写入即可，不需要先把状态“恢复”成 pending。
+func TestChunkedChunkRetryWhileReceiving(t *testing.T) {
 	env := newTestEnv(t)
 	ctx := context.Background()
 	total := UploadChunkSize
@@ -457,49 +460,28 @@ func TestChunkedChunkRetryRecoversStuckReceiving(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 第一次 UPDATE 是 pending → receiving 的抢占，第二次是失败回退。
-	// 让第二次失败，构造“请求退出但数据库仍是 receiving”的状态。
-	const callbackName = "test:fail_chunk_revert_once"
-	updates := 0
-	if err := env.db.Callback().Update().Before("gorm:update").Register(
-		callbackName,
-		func(tx *gorm.DB) {
-			if tx.Statement.Schema == nil ||
-				tx.Statement.Schema.Table != (model.UploadSession{}).TableName() {
-				return
-			}
-			updates++
-			if updates == 2 {
-				_ = tx.AddError(errors.New("forced chunk revert failure"))
-			}
-		},
-	); err != nil {
-		t.Fatal(err)
-	}
 	broken := &readThenError{data: bytes.Repeat([]byte("x"), 1024)}
 	if _, err := env.service.UploadSessionChunk(
 		ctx, env.ownerA.ID, info.ID, 0, broken,
 	); err == nil {
 		t.Fatal("chunk with interrupted read succeeded")
 	}
-	if err := env.db.Callback().Update().Remove(callbackName); err != nil {
-		t.Fatal(err)
-	}
 
+	// 失败不退回 pending：receiving 就是正常的分片写入状态。
 	stuck := reloadSession(t, env, info.ID)
 	if stuck.Status != model.UploadStatusReceiving || stuck.ActualSize != 0 {
-		t.Fatalf("session after failed revert = %+v, want receiving/0", stuck)
+		t.Fatalf("session after read error = %+v, want receiving/0", stuck)
 	}
 	if got, ok := env.service.chunks.received(info.ID); !ok || got != 0 {
-		t.Fatalf("ledger after failed revert = (%d, %v)", got, ok)
+		t.Fatalf("ledger after read error = (%d, %v)", got, ok)
 	}
 
-	// 没有活跃写入，重传同一片时必须先恢复成 pending 再正常写入。
+	// 没有活跃写入，重传同一片直接写入。
 	progress, err := env.service.UploadSessionChunk(
 		ctx, env.ownerA.ID, info.ID, 0, bytes.NewReader(data),
 	)
 	if err != nil {
-		t.Fatalf("retry chunk after stuck receiving: %v", err)
+		t.Fatalf("retry chunk while receiving: %v", err)
 	}
 	if progress.Status != model.UploadStatusReady || progress.ActualSize != total {
 		t.Fatalf("retry progress = %+v", progress)
@@ -564,8 +546,8 @@ func TestChunkedConfirmedChunkMismatchIsConflict(t *testing.T) {
 	if got, ok := env.service.chunks.received(info.ID); !ok || got != int64(len(chunks[0])) {
 		t.Fatalf("ledger changed by conflicting retries: (%d, %v)", got, ok)
 	}
-	if got := reloadSession(t, env, info.ID).Status; got != model.UploadStatusPending {
-		t.Fatalf("session status after conflicting retries = %q, want pending", got)
+	if got := reloadSession(t, env, info.ID).Status; got != model.UploadStatusReceiving {
+		t.Fatalf("session status after conflicting retries = %q, want receiving", got)
 	}
 
 	// 继续上传其余分片，最终内容必须仍然是原始顺序。
@@ -658,8 +640,8 @@ func TestChunkedRetryAfterPartialWriteFailure(t *testing.T) {
 		t.Fatalf("ledger after partial write = (%d, %v), want (%d, true)",
 			got, ok, len(chunks[0]))
 	}
-	if got := reloadSession(t, env, info.ID).Status; got != model.UploadStatusPending {
-		t.Fatalf("status after partial write = %q, want pending", got)
+	if got := reloadSession(t, env, info.ID).Status; got != model.UploadStatusReceiving {
+		t.Fatalf("status after partial write = %q, want receiving", got)
 	}
 
 	// 只重传第 1 片，再补第 2 片。

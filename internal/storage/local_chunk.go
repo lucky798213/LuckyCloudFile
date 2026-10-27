@@ -143,8 +143,10 @@ func (l *Local) WriteChunkAt(
 		return fmt.Errorf("write chunk at %q: negative offset %d", key, offset)
 	}
 
-	l.chunkMu.Lock()
-	defer l.chunkMu.Unlock()
+	// 读锁表示“共享进入”，不是说文件操作本身是只读：
+	// 不同请求可以同时 WriteAt 不同偏移，Prepare/Finalize/Remove 仍然独占。
+	l.chunkMu.RLock()
+	defer l.chunkMu.RUnlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}

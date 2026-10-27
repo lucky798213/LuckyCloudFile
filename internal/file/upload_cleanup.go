@@ -54,6 +54,10 @@ func (s *Service) handoffTerminatedSession(
 		// 不应该被一个传输请求拖住。活跃登记表就是“写入是否已退出”的依据。
 		return nil
 	}
+	// 终态清理结束后不再需要保留取消时的 stopping 标记。
+	// 如果这里之后又出现了活跃请求，forget 会核对并跳过（由那次请求
+	// 退出时再次 handoff）。
+	defer s.uploads.forget(sessionID)
 
 	handoffCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), orphanCleanupTimeout)
 	defer cancel()

@@ -115,7 +115,7 @@ func TestChunkedUploadSessionUploadsAndCompletes(t *testing.T) {
 			t.Fatalf("chunk %d: actual_size = %d, want %d",
 				index, progress.ActualSize, want)
 		}
-		wantStatus := model.UploadStatusPending
+		wantStatus := model.UploadStatusReceiving
 		if index == len(chunks)-1 {
 			wantStatus = model.UploadStatusReady
 		}
@@ -367,7 +367,7 @@ func TestChunkedUploadAcceptsAnyOrderAndDeduplicates(t *testing.T) {
 		t.Fatalf("upload out-of-order chunk 1: %v", err)
 	}
 	if progress.ActualSize != UploadChunkSize ||
-		progress.Status != model.UploadStatusPending {
+		progress.Status != model.UploadStatusReceiving {
 		t.Fatalf("progress after chunk 1 = %+v", progress)
 	}
 
@@ -379,7 +379,7 @@ func TestChunkedUploadAcceptsAnyOrderAndDeduplicates(t *testing.T) {
 		t.Fatalf("idempotent retry of chunk 1: %v", err)
 	}
 	if again.ActualSize != UploadChunkSize ||
-		again.Status != model.UploadStatusPending {
+		again.Status != model.UploadStatusReceiving {
 		t.Fatalf("progress after idempotent retry = %+v", again)
 	}
 
@@ -549,7 +549,8 @@ func TestChunkedUploadReadyReplayIsIdempotent(t *testing.T) {
 }
 
 // TestChunkedUploadReadErrorDoesNotRecordChunk 验证读取中途失败时：
-// 不写盘、不登记 receipt、会话回到 pending，之后可以正常重试。
+// 不写盘、不登记 receipt、会话保持 receiving（分片模式下这是正常状态），
+// 之后可以正常重试同一片。
 func TestChunkedUploadReadErrorDoesNotRecordChunk(t *testing.T) {
 	env := newTestEnv(t)
 	ctx := context.Background()
@@ -570,7 +571,7 @@ func TestChunkedUploadReadErrorDoesNotRecordChunk(t *testing.T) {
 	}
 
 	session := reloadSession(t, env, info.ID)
-	if session.Status != model.UploadStatusPending || session.ActualSize != 0 {
+	if session.Status != model.UploadStatusReceiving || session.ActualSize != 0 {
 		t.Fatalf("session after read error = %+v", session)
 	}
 	if received, ok := env.service.chunks.received(info.ID); !ok || received != 0 {

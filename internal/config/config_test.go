@@ -47,6 +47,60 @@ func TestLoad(t *testing.T) {
 	if _, err := os.Stat(cfg.Storage.LocalRoot); !os.IsNotExist(err) {
 		t.Fatal("loading configuration must not create storage or connect to services")
 	}
+	// 旧配置没有 [Upload] 段：必须保留默认值，不能拒绝启动。
+	if cfg.Upload.MaxParallelChunks != 2 {
+		t.Fatalf("default MaxParallelChunks = %d, want 2", cfg.Upload.MaxParallelChunks)
+	}
+}
+
+// TestLoadUploadParallel 验证 [Upload] MaxParallelChunks 真正从配置读入，
+// 并且允许范围内的 1、2、8 都能启动。
+func TestLoadUploadParallel(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  int
+	}{
+		{"1", 1},
+		{"2", 2},
+		{"8", 8},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			cfg, err := Load(writeConfig(
+				t, validINI+"\n[Upload]\nMaxParallelChunks = "+tc.value+"\n",
+			))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Upload.MaxParallelChunks != tc.want {
+				t.Fatalf("MaxParallelChunks = %d, want %d",
+					cfg.Upload.MaxParallelChunks, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadRejectsInvalidUploadParallel 验证显式写入 0、负数、超范围和
+// 非整数时启动失败，而不是悄悄回退到默认值。
+func TestLoadRejectsInvalidUploadParallel(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"zero", "0", "Upload.MaxParallelChunks"},
+		{"negative", "-1", "Upload.MaxParallelChunks"},
+		{"too large", "9", "Upload.MaxParallelChunks"},
+		{"not integer", "nope", "parse [Upload]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(
+				t, validINI+"\n[Upload]\nMaxParallelChunks = "+tc.value+"\n",
+			))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("wanted error containing %q; got %v", tc.want, err)
+			}
+		})
+	}
 }
 
 func TestLoadRejectsInvalidConfiguration(t *testing.T) {

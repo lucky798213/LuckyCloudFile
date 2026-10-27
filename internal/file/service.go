@@ -152,6 +152,17 @@ func (s *Service) WithLogger(logger *slog.Logger) *Service {
 	return s
 }
 
+// WithChunkParallel 设置单个分片会话的并行度上限，返回自身方便链式调用。
+//
+// 第一版默认 2；非正数保持默认值。必须在服务开始处理请求之前调用，
+// 运行期间修改会与正在登记的请求竞争。
+func (s *Service) WithChunkParallel(n int) *Service {
+	if n > 0 {
+		s.uploads.maxParallel = n
+	}
+	return s
+}
+
 // Upload 把 r 的内容存成 ownerID 用户 parentID 目录下的文件。
 //
 // ownerID 只能来自登录会话，不能来自请求体或 URL。

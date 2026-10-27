@@ -25,10 +25,12 @@ var ErrTooLarge = errors.New("content too large")
 type Local struct {
 	root string
 
-	// chunkMu 串行化分片文件的初始化、写入和发布。
-	// 每个写分片的请求都会打开、写、关闭自己的文件句柄，不跨请求保留；
-	// 这个锁只保证 FinalizeChunks 不会和 WriteChunkAt 同时进行。
-	chunkMu sync.Mutex
+	// chunkMu 保护分片文件的初始化、写入、发布和删除。
+	//
+	// 不同偏移的 WriteChunkAt 可以同时持有读锁：每个请求打开、写、关闭
+	// 自己的文件句柄，不跨请求保留，写入互不影响。PrepareChunks /
+	// FinalizeChunks / Remove 需要独占，不能和任何写入同时进行。
+	chunkMu sync.RWMutex
 }
 
 // Local 必须满足 Store 接口。接口签名一旦对不上，编译时就会失败，
@@ -232,6 +234,14 @@ func (l *Local) Open(ctx context.Context, key string) (io.ReadCloser, error) {
 // 这里同时删两者，任何一个删除失败都会返回错误，让清理逻辑保留记录并重试。
 // 两个都不存在时返回 fs.ErrNotExist，和原来“删除不存在的对象”的约定一致。
 func (l *Local) Remove(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// 删除分片临时对象必须和写入、发布互斥：否则可能删掉另一个请求
+	// 刚写好但还没登记的区间，或者和 FinalizeChunks 的 Rename 交错。
+	l.chunkMu.Lock()
+	defer l.chunkMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}

@@ -264,8 +264,9 @@ func (s *Service) CompleteUploadSession(
 		return nil
 	})
 	if err == nil {
-		// 会话已经发布，分片账本不再需要。
+		// 会话已经发布，分片账本和运行状态都不再需要。
 		s.chunks.remove(sessionID)
+		s.uploads.forget(sessionID)
 		return completed, nil
 	}
 
@@ -274,6 +275,7 @@ func (s *Service) CompleteUploadSession(
 	verified, verifyErr := s.verifyCompletedUploadSession(ctx, ownerID, sessionID)
 	if verifyErr == nil && verified != nil {
 		s.chunks.remove(sessionID)
+		s.uploads.forget(sessionID)
 		return *verified, nil
 	}
 	if verifyErr != nil {

@@ -80,7 +80,10 @@ func run(
 	if err != nil {
 		return fmt.Errorf("initialize storage: %w", err)
 	}
-	fileService := file.NewService(db, stores).WithLogger(logger)
+	// 分片并行度是每个会话的上限，来自 [Upload] MaxParallelChunks。
+	fileService := file.NewService(db, stores).
+		WithLogger(logger).
+		WithChunkParallel(cfg.Upload.MaxParallelChunks)
 	authService := auth.NewService(db)
 
 	// 第四步：创建 HTTP Server。它只是一个“配置好的对象”，还没开始监听。

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -18,25 +17,25 @@ import (
 
 // UploadSessionChunk 接收 chunked 会话的一个分片。
 //
-// 分片可以乱序到达，但同一编号只接受一份内容：
-// 账本按 index 记录已经成功的片，重复编号再次到达时比较大小和 SHA-256，
-// 一致就幂等返回，不一致就按冲突拒绝。分片进度跨请求保留在 Service 的
-// 内存账本里，和“当前有没有请求在写”的 uploadController 完全分开。
+// 分片可以乱序到达，同一个会话允许多个不同编号并行处理。同一编号只接受
+// 一份内容：账本按 index 记录已经成功的片，重复编号再次到达时比较大小和
+// SHA-256，一致就幂等返回，不一致就按冲突拒绝。
 //
 // 一次请求的顺序：
-//  1. 查会话，确认属于当前用户、是 chunked、未失效且状态允许；
-//  2. 找到占位实体和创建时选定的存储位置；
-//  3. 登记活跃写入，把 pending 抢占成 receiving，防止并发写同一会话；
-//  4. 计算这一片的偏移和准确长度；
-//  5. 最多读取“本片长度 + 1”字节，检查少传、多传和读取中断；
+//  1. 轻量校验：会话属于当前用户、是 chunked、未失效且状态允许；
+//  2. 计算这一片的偏移和准确长度（纯计算，不碰磁盘）；
+//  3. beginChunk：原子地占用编号和并行名额；同一编号、超上限、收尾中
+//     都在读取请求体之前被拒绝；
+//  4. 重新查会话状态，挡住预检查之后的取消/过期；
+//  5. 读取请求体（最多“本片长度 + 1”字节），检查少传、多传和读取中断；
 //  6. 服务端计算 SHA-256，检查账本里是不是已经收过这个编号；
-//  7. 首次写入：首次 Prepare 临时文件，然后 WriteAt 到指定偏移；
-//  8. 写入成功后才登记 receipt、累计有效字节数；
-//  9. 所有片到齐后 Finalize 临时文件，再把进度写回数据库；
-//  10. 注销活跃请求，必要时移交终态清理。
+//  7. 首次编号才写盘：Prepare 临时文件，然后 WriteAt 到指定偏移；
+//  8. 写入成功后才登记 receipt；
+//  9. 同步累计进度（保持 receiving，不在这里自动 Finalize）；
+//  10. end：释放编号和名额；
+//  11. 所有片到齐时再取得收尾门禁，重新核对整个账本，收尾成 ready。
 //
-// 读取和校验都在内存里完成，最多 1 MiB + 1 字节，不把整个文件读进来，
-// 也不会在长度或摘要不合法时修改目标文件。
+// 第 11 步必须在 end 之后：否则最后一片会等待自己退出，形成自等待死锁。
 func (s *Service) UploadSessionChunk(
 	ctx context.Context,
 	ownerID int,
@@ -56,40 +55,35 @@ func (s *Service) UploadSessionChunk(
 		return UploadSessionInfo{}, ErrUploadModeMismatch
 	}
 	switch session.Status {
-	case model.UploadStatusReady:
-		// 所有分片已经收齐，但还没有正式完成：允许客户端重传同一片。
-		// 这是一条只读的幂等路径，不写盘、不抢占 receiving、不改状态。
-		return s.replayReadyUploadChunk(ctx, session, index, r)
-	case model.UploadStatusPending:
-		// 正常的分片写入路径。
-	case model.UploadStatusReceiving:
-		// 正常写入期间状态就是 receiving。但如果上一次失败回退 pending 时
-		// 数据库出错，会话会卡在 receiving：此时没有活跃写入，却一直 409。
-		// 先尝试核对恢复，拿不到空闲门禁说明确实还有请求在写。
-		recovered, err := s.recoverReceivingUploadSession(ctx, ownerID, sessionID)
-		if err != nil {
-			return UploadSessionInfo{}, err
-		}
-		if !recovered {
-			return UploadSessionInfo{}, ErrUploadSessionConflict
-		}
-		// 恢复后重新读取：通常是 pending；也可能刚被并发完成推进到 ready。
-		session, err = s.findOwnedUploadSession(ctx, ownerID, sessionID)
-		if err != nil {
-			return UploadSessionInfo{}, err
-		}
-		if isUploadSessionInvalid(*session) {
-			return UploadSessionInfo{}, ErrUploadSessionExpired
-		}
-		switch session.Status {
-		case model.UploadStatusPending:
-		case model.UploadStatusReady:
-			return s.replayReadyUploadChunk(ctx, session, index, r)
-		default:
-			return UploadSessionInfo{}, ErrUploadSessionConflict
-		}
+	case model.UploadStatusPending,
+		model.UploadStatusReceiving,
+		model.UploadStatusReady:
+		// 三种状态都可以进入下面的登记流程：
+		//   - pending：第一片会把它推进成 receiving；
+		//   - receiving：正常的分片写入状态，允许多个编号同时处理；
+		//   - ready：所有片已收齐，走只读幂等重放。
 	default:
 		return UploadSessionInfo{}, ErrUploadSessionConflict
+	}
+
+	// 片数、偏移和本片长度全部由纯计算函数给出。放在占名额之前，
+	// 非法编号不会占用并行名额，也不会读取请求体。
+	offset, chunkBytes, err := upload.ChunkAt(
+		session.ExpectedSize, session.ChunkSize, index,
+	)
+	if err != nil {
+		if errors.Is(err, upload.ErrChunkIndexOutOfRange) {
+			return UploadSessionInfo{}, ErrInvalidChunkIndex
+		}
+		return UploadSessionInfo{}, fmt.Errorf(
+			"compute upload chunk geometry for session %s: %w", session.ID, err,
+		)
+	}
+	if chunkBytes <= 0 || chunkBytes > MaxUploadBytes {
+		return UploadSessionInfo{}, fmt.Errorf(
+			"upload session %s has invalid chunk length %d",
+			session.ID, chunkBytes,
+		)
 	}
 
 	var entity model.Entity
@@ -120,8 +114,8 @@ func (s *Service) UploadSessionChunk(
 		)
 	}
 
-	// 和整文件上传一样：先登记活跃写入，再抢占数据库状态。
-	uploadCtx, endUpload, err := s.uploads.begin(ctx, sessionID)
+	// 名额必须在读取请求体之前取得：超上限的请求不读 body，直接 409。
+	uploadCtx, endUpload, err := s.uploads.beginChunk(ctx, sessionID, index)
 	if err != nil {
 		return UploadSessionInfo{}, err
 	}
@@ -135,40 +129,52 @@ func (s *Service) UploadSessionChunk(
 		}
 	}()
 
-	claimed, err := s.claimUploadSession(uploadCtx, ownerID, sessionID)
+	// 预检查之后会话可能已经被取消/过期，或者被另一个完成请求推进到 ready。
+	// 拿到名额后必须重新读一次，不能相信旧快照。
+	current, err := s.findOwnedUploadSession(uploadCtx, ownerID, sessionID)
 	if err != nil {
 		return UploadSessionInfo{}, err
 	}
-	if !claimed {
-		current, findErr := s.findOwnedUploadSession(ctx, ownerID, sessionID)
-		if findErr == nil && isUploadSessionInvalid(*current) {
-			return UploadSessionInfo{}, ErrUploadSessionExpired
+	if isUploadSessionInvalid(*current) {
+		return UploadSessionInfo{}, ErrUploadSessionExpired
+	}
+	switch current.Status {
+	case model.UploadStatusPending:
+		// 第一片把 pending 推进成 receiving。并发的第二片可能在这里看到
+		// 抢占失败：重新读一次，只要已经是 receiving 就继续（receiving
+		// 是正常状态，不是“需要恢复的卡死状态”）。
+		claimed, claimErr := s.claimUploadSession(uploadCtx, ownerID, sessionID)
+		if claimErr != nil {
+			return UploadSessionInfo{}, claimErr
 		}
+		if !claimed {
+			current, err = s.findOwnedUploadSession(uploadCtx, ownerID, sessionID)
+			if err != nil {
+				return UploadSessionInfo{}, err
+			}
+			if isUploadSessionInvalid(*current) {
+				return UploadSessionInfo{}, ErrUploadSessionExpired
+			}
+			switch current.Status {
+			case model.UploadStatusReceiving:
+				// 另一个分片已经抢先把会话推进成 receiving，正常继续。
+			case model.UploadStatusReady:
+				// 所有片已经收齐，走只读幂等重放。
+				return s.replayReadyUploadChunk(uploadCtx, current, index, r)
+			default:
+				return UploadSessionInfo{}, ErrUploadSessionConflict
+			}
+		}
+	case model.UploadStatusReceiving:
+		// 正常的分片写入路径：允许多个编号同时处于 receiving。
+	case model.UploadStatusReady:
+		// 所有分片已经收齐，但还没有正式完成：允许客户端重传同一片。
+		// 这是一条只读的幂等路径，不写盘、不改状态。
+		return s.replayReadyUploadChunk(uploadCtx, current, index, r)
+	default:
 		return UploadSessionInfo{}, ErrUploadSessionConflict
 	}
-
-	// 片数、偏移和本片长度全部由纯计算函数给出。
-	offset, chunkBytes, err := upload.ChunkAt(
-		session.ExpectedSize, session.ChunkSize, index,
-	)
-	if err != nil {
-		cause := fmt.Errorf(
-			"compute upload chunk geometry for session %s: %w", session.ID, err,
-		)
-		if errors.Is(err, upload.ErrChunkIndexOutOfRange) {
-			cause = ErrInvalidChunkIndex
-		}
-		return UploadSessionInfo{}, s.failUploadChunk(ctx, ownerID, sessionID, cause)
-	}
-	if chunkBytes <= 0 || chunkBytes > MaxUploadBytes {
-		return UploadSessionInfo{}, s.failUploadChunk(
-			ctx, ownerID, sessionID,
-			fmt.Errorf(
-				"upload session %s has invalid chunk length %d",
-				session.ID, chunkBytes,
-			),
-		)
-	}
+	session = current
 
 	// 账本正常在创建会话时建立；如果是手工插入的旧数据，只在 DB 进度为 0
 	// 时补一个空账本。DB 已经有进度却没有账本说明状态不一致，不能继续。
@@ -185,7 +191,11 @@ func (s *Service) UploadSessionChunk(
 	}
 
 	// 有界读取：多读 1 个字节用于区分“刚好一片”和“多传”。
-	data, err := io.ReadAll(io.LimitReader(r, chunkBytes+1))
+	// 每次 Read 前检查取消信号；已经进入内核的阻塞读仍然要靠 HTTP 读超时
+	// 或连接关闭来唤醒。
+	data, err := io.ReadAll(io.LimitReader(
+		&chunkContextReader{ctx: uploadCtx, r: r}, chunkBytes+1,
+	))
 	if err != nil {
 		return UploadSessionInfo{}, s.failUploadChunk(
 			ctx, ownerID, sessionID,
@@ -211,10 +221,18 @@ func (s *Service) UploadSessionChunk(
 				ctx, ownerID, sessionID, ErrUploadSessionConflict,
 			)
 		}
-		return s.finishUploadChunk(
-			ctx, uploadCtx, ownerID, session, chunkStore,
-			entity.StorageKey, received,
-		)
+
+		// 上一次进度落库可能失败。重试已经确认的编号时顺手把进度对齐，
+		// 但绝不删除 receipt，也不重新写盘。
+		info, syncErr := s.syncChunkProgress(uploadCtx, ownerID, sessionID)
+		if syncErr != nil {
+			return UploadSessionInfo{}, syncErr
+		}
+		endUpload()
+		if info.ActualSize < info.ExpectedSize {
+			return info, nil
+		}
+		return s.finishUploadChunk(ctx, ownerID, sessionID)
 	}
 
 	// 未确认编号：长度必须正好等于这一片应该收到的字节数，否则 400。
@@ -230,7 +248,7 @@ func (s *Service) UploadSessionChunk(
 	}
 
 	// 第一次写入前才准备临时文件。PrepareChunks 是幂等的，
-	// 初始化重试不会清空已经写过的分片。
+	// 两个并行的“第一片”同时准备也不会清空对方已经写过的分片。
 	if received == 0 {
 		if err := chunkStore.PrepareChunks(
 			uploadCtx, entity.StorageKey, session.ExpectedSize,
@@ -253,79 +271,30 @@ func (s *Service) UploadSessionChunk(
 
 	// 写入成功后才登记；登记失败说明同编号已经被别的请求抢先确认，
 	// 不能把这次写入重复计入进度。
-	received, recorded := s.chunks.record(sessionID, index, receipt)
-	if !recorded {
+	if _, recorded := s.chunks.record(sessionID, index, receipt); !recorded {
 		return UploadSessionInfo{}, s.failUploadChunk(
 			ctx, ownerID, sessionID, ErrUploadSessionConflict,
 		)
 	}
 
-	return s.finishUploadChunk(
-		ctx, uploadCtx, ownerID, session, chunkStore,
-		entity.StorageKey, received,
-	)
-}
-
-// recoverReceivingUploadSession 处理“数据库仍是 receiving，但没有任何活跃写入”。
-//
-// 正常失败回退会把 receiving 改回 pending；如果那次数据库更新失败，会话就会
-// 卡在 receiving，之后所有分片都返回 409。这里在空闲门禁下核对并恢复：
-// 只有确认内存里没有活跃写入/收尾时，才按条件把 receiving 改回 pending。
-//
-// 拿不到门禁说明还有请求在写，或者有收尾正在进行，返回 (false, nil)，
-// 调用方按冲突处理。恢复条件带 expires_at，过期会话不会被重新放行。
-func (s *Service) recoverReceivingUploadSession(
-	ctx context.Context,
-	ownerID int,
-	sessionID string,
-) (bool, error) {
-	release, ok := s.uploads.beginIdleGate(sessionID)
-	if !ok {
-		return false, nil
-	}
-	defer func() {
-		release()
-		// 恢复期间会话可能被并发取消/过期。终态会话的 handoff 会因为
-		// 门禁把这里当成“仍活跃”而跳过，释放后再补一次；正常 pending 是空操作。
-		if handoffErr := s.handoffTerminatedSession(ctx, ownerID, sessionID); handoffErr != nil {
-			s.logger.Warn("terminated upload session cleanup deferred",
-				"session_id", sessionID,
-				"error", handoffErr,
-			)
-		}
-	}()
-
-	// 恢复本身不应该因为客户端断开而半途而废：否则会话会一直卡在 receiving。
-	recoverCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx), orphanCleanupTimeout,
-	)
-	defer cancel()
-
-	result := s.db.WithContext(recoverCtx).
-		Model(&model.UploadSession{}).
-		Where("id = ? AND owner_id = ? AND status = ? AND expires_at > ?",
-			sessionID, ownerID, model.UploadStatusReceiving, time.Now()).
-		UpdateColumn("status", model.UploadStatusPending)
-	if result.Error != nil {
-		return false, fmt.Errorf("recover receiving upload session: %w", result.Error)
-	}
-	if result.RowsAffected == 1 {
-		return true, nil
-	}
-
-	// 条件更新没命中：可能已经被别人改回 pending，也可能刚好过期。
-	current, err := s.findOwnedUploadSession(recoverCtx, ownerID, sessionID)
+	info, err := s.syncChunkProgress(uploadCtx, ownerID, sessionID)
 	if err != nil {
-		return false, err
+		return UploadSessionInfo{}, err
 	}
-	if isUploadSessionInvalid(*current) {
-		return false, ErrUploadSessionExpired
+
+	// 分片的读取、写盘、登记和进度同步都结束了，先释放编号和名额。
+	endUpload()
+
+	// 全部收齐才尝试收尾。这里用原始 ctx：endUpload 已经取消 uploadCtx。
+	if info.ActualSize < info.ExpectedSize {
+		return info, nil
 	}
-	return current.Status == model.UploadStatusPending, nil
+	return s.finishUploadChunk(ctx, ownerID, sessionID)
 }
 
 // replayReadyUploadChunk 处理“所有分片已经收齐、但还没有正式完成”时的重复分片。
 //
+// 调用方已经取得该编号的活跃名额，所以同一编号的重放不会并发写盘。
 // 这是成功响应丢失后的正常重试：内容必须和账本里的 receipt 完全一致。
 // 一致就返回当前 ready 进度；长度或摘要不一致返回冲突。整条路径只读，
 // 不 Prepare、不 WriteAt、不抢占 receiving，也不会把 ready 退回 pending。
@@ -358,7 +327,9 @@ func (s *Service) replayReadyUploadChunk(
 		)
 	}
 
-	data, err := io.ReadAll(io.LimitReader(r, chunkBytes+1))
+	data, err := io.ReadAll(io.LimitReader(
+		&chunkContextReader{ctx: ctx, r: r}, chunkBytes+1,
+	))
 	if err != nil {
 		return UploadSessionInfo{}, fmt.Errorf("read replayed upload chunk: %w", err)
 	}
@@ -384,102 +355,94 @@ func (s *Service) replayReadyUploadChunk(
 	return toUploadSessionInfo(*session), nil
 }
 
-// finishUploadChunk 在所有有效分片都写完后收尾。
+// finishUploadChunk 在所有分片都登记完之后尝试把会话推进到 ready。
 //
-// 只有账本累计字节数等于声明大小时才 Finalize 临时文件，并让会话变成 ready。
-// 所有分片乱序到达也没关系：每片都写在自己的准确区间，收齐后临时文件就是
-// 完整内容。Finalize 是幂等的，重复编号的幂等重试可以安全地再调用一次。
+// 调用方必须已经执行 endUpload：当前请求不能再算作在途写入，否则这里
+// 等待 drained 时会等待自己。
 //
-// 这里只是尽早收尾；确认完成接口还会在发布前重新核对账本并再次 Finalize，
-// 所以最后一片收尾失败时，客户端再次调用 /complete 仍然可以继续。
+// 取得门禁后重新核对整个账本，而不是相信调用方手里的旧累计值；并发完成
+// 请求会在门禁上排队，最终都读到同一个 ready/completed 状态。
 func (s *Service) finishUploadChunk(
 	ctx context.Context,
-	uploadCtx context.Context,
 	ownerID int,
-	session *model.UploadSession,
-	chunkStore storage.ChunkStore,
-	storageKey string,
-	received int64,
+	sessionID string,
 ) (UploadSessionInfo, error) {
-	if received > session.ExpectedSize {
-		return UploadSessionInfo{}, s.failUploadChunk(
-			ctx, ownerID, session.ID,
-			fmt.Errorf(
-				"upload session %s received %d bytes, exceeds expected %d",
-				session.ID, received, session.ExpectedSize,
-			),
-		)
-	}
-
-	if received == session.ExpectedSize {
-		if err := chunkStore.FinalizeChunks(
-			uploadCtx, storageKey, session.ExpectedSize,
-		); err != nil {
-			return UploadSessionInfo{}, s.failUploadChunk(
-				ctx, ownerID, session.ID,
-				fmt.Errorf("finalize upload chunks: %w", err),
-			)
-		}
-	}
-
-	info, err := s.finalizeUploadChunk(ctx, ownerID, session, received)
+	release, err := s.uploads.beginFinalize(ctx, sessionID)
 	if err != nil {
-		return UploadSessionInfo{}, s.failUploadChunk(ctx, ownerID, session.ID, err)
+		return UploadSessionInfo{}, err
 	}
-	return info, nil
+	defer release()
+
+	// 重新核对每个编号、Finalize 临时文件、把会话推进到 ready。
+	// 已经 completed 时这里是空操作，下面的查询会返回原结果。
+	if err := s.prepareChunkedCompletion(ctx, ownerID, sessionID); err != nil {
+		return UploadSessionInfo{}, err
+	}
+
+	current, err := s.findOwnedUploadSession(ctx, ownerID, sessionID)
+	if err != nil {
+		return UploadSessionInfo{}, err
+	}
+	return toUploadSessionInfo(*current), nil
 }
 
-// finalizeUploadChunk 在一个短事务里推进会话进度。
+// syncChunkProgress 把账本里的最新累计进度同步到数据库。
 //
-// received 是账本里所有不重复分片的累计字节数，不接受客户端传的任何
-// 偏移或总大小。所有片到齐后会话变成 ready，后续仍然由确认完成接口
-// 发布正式 File。
-func (s *Service) finalizeUploadChunk(
+// 关键点：
+//   - 先取得本会话的 progressMu，再读取账本最新值；这样两个并行分片不会
+//     用“请求开始时的旧 received”倒序覆盖数据库进度；
+//   - 数据库事务按 User → Session → Entity 的固定顺序加锁，和完成、取消、
+//     过期保持一致；
+//   - 只保持 receiving，不在这里自动 Finalize；收尾由 finishUploadChunk
+//     在 end 之后统一做。
+//
+// 落库失败不会删除已经成功的 receipt；下一次同编号重试或 /complete 会
+// 重新对齐进度。
+func (s *Service) syncChunkProgress(
 	ctx context.Context,
 	ownerID int,
-	session *model.UploadSession,
-	received int64,
+	sessionID string,
 ) (UploadSessionInfo, error) {
-	// 账本只能单调增长；DB 里的旧进度不能比它更靠前，否则状态已经不一致。
-	if received < session.ActualSize || received > session.ExpectedSize {
+	unlock := s.uploads.lockChunkProgress(sessionID)
+	defer unlock()
+
+	received, ok := s.chunks.received(sessionID)
+	if !ok {
 		return UploadSessionInfo{}, fmt.Errorf(
-			"upload session %s has inconsistent chunk progress: received=%d actual=%d expected=%d",
-			session.ID, received, session.ActualSize, session.ExpectedSize,
+			"chunk ledger missing for upload session %s", sessionID,
 		)
 	}
 
-	status := model.UploadStatusPending
-	if received == session.ExpectedSize {
-		status = model.UploadStatusReady
-	}
-
+	var info UploadSessionInfo
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// actual_size 作为条件：即使有意外并发，也不能把进度覆盖回旧值。
-		updated := tx.Model(&model.UploadSession{}).
-			Where(
-				"id = ? AND owner_id = ? AND status = ? AND expires_at > ? AND actual_size = ?",
-				session.ID, ownerID, model.UploadStatusReceiving, time.Now(), session.ActualSize,
-			).
-			UpdateColumns(map[string]any{
-				"actual_size": received,
-				"status":      status,
-			})
-		if updated.Error != nil {
-			return fmt.Errorf("update upload chunk progress: %w", updated.Error)
+		session, err := lockUserAndUploadSession(ctx, tx, ownerID, sessionID)
+		if err != nil {
+			return err
 		}
-		if updated.RowsAffected != 1 {
-			var current model.UploadSession
-			if err := tx.Where("id = ? AND owner_id = ?", session.ID, ownerID).
-				First(&current).Error; err == nil && isUploadSessionInvalid(current) {
-				return ErrUploadSessionExpired
-			}
+		if isUploadSessionInvalid(*session) {
+			return ErrUploadSessionExpired
+		}
+		if session.Mode != model.UploadModeChunked {
+			return ErrUploadModeMismatch
+		}
+		switch session.Status {
+		case model.UploadStatusCompleted:
+			return ErrUploadSessionConflict
+		case model.UploadStatusCanceled, model.UploadStatusExpired:
 			return ErrUploadSessionConflict
 		}
 
-		// 锁住占位实体再更新大小；只剩最后一片时它会变成声明大小，
-		// 确认完成接口会再核对一次。
+		// 账本只能单调增长；DB 里的旧进度不能比它更靠前，否则状态已经不一致。
+		if received < session.ActualSize || received > session.ExpectedSize {
+			return fmt.Errorf(
+				"upload session %s has inconsistent chunk progress: received=%d actual=%d expected=%d",
+				session.ID, received, session.ActualSize, session.ExpectedSize,
+			)
+		}
+
+		// 锁住占位实体再更新大小，和完成、取消保持同一加锁顺序。
 		var entity model.Entity
-		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND status = ? AND ref_count = 0",
 				session.EntityID, model.EntityStatusUploading).
 			First(&entity).Error
@@ -496,52 +459,61 @@ func (s *Service) finalizeUploadChunk(
 				return fmt.Errorf("update upload placeholder entity: %w", err)
 			}
 		}
+
+		// 第一片到达时把 pending 推进成 receiving；之后一直保持 receiving。
+		// 不在这里写成 ready：ready 必须等所有编号都核对通过后再由收尾推进。
+		status := session.Status
+		if status == model.UploadStatusPending {
+			status = model.UploadStatusReceiving
+		}
+		if session.ActualSize != received || session.Status != status {
+			if err := tx.Model(&model.UploadSession{}).
+				Where("id = ? AND owner_id = ?", session.ID, ownerID).
+				UpdateColumns(map[string]any{
+					"actual_size": received,
+					"status":      status,
+				}).Error; err != nil {
+				return fmt.Errorf("update upload chunk progress: %w", err)
+			}
+		}
+
+		info = toUploadSessionInfo(*session)
+		info.ActualSize = received
+		info.Status = status
 		return nil
 	})
 	if err != nil {
 		return UploadSessionInfo{}, err
 	}
-
-	info := toUploadSessionInfo(*session)
-	info.ActualSize = received
-	info.Status = status
 	return info, nil
 }
 
-// failUploadChunk 把 receiving 放回 pending，允许客户端重试同一片。
+// chunkContextReader 在每次 Read 前检查取消信号。
 //
-// 它刻意不删除存储内容：已经确认的分片必须保留，未确认的写入也不会
-// 计入账本。客户端用同一编号重试时会覆盖同一段区间；只有真正写入成功
-// 并登记 receipt 之后，字节数才会被累计。
+// 它只能保证“两次 Read 之间”能及时停止；一次已经进入内核的阻塞读
+// 仍然要靠 HTTP 读超时或连接关闭来唤醒。
+type chunkContextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r *chunkContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
+}
+
+// failUploadChunk 返回本次分片请求的错误。
+//
+// 分片模式下 receiving 是正常状态：一个分片失败不能让整个会话退回 pending，
+// 否则会踩到其他并行分片的状态。失败只表示这一片没有登记；已经成功写入的
+// receipt 必须保留，客户端用同一编号重试时会覆盖同一段区间。
 func (s *Service) failUploadChunk(
 	ctx context.Context,
 	ownerID int,
 	sessionID string,
 	cause error,
 ) error {
-	revertCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx), orphanCleanupTimeout,
-	)
-	defer cancel()
-
-	result := s.db.WithContext(revertCtx).
-		Model(&model.UploadSession{}).
-		Where("id = ? AND owner_id = ? AND status = ?",
-			sessionID, ownerID, model.UploadStatusReceiving).
-		UpdateColumn("status", model.UploadStatusPending)
-	if result.Error != nil {
-		s.logger.Warn("upload chunk failed and session revert failed",
-			"session_id", sessionID,
-			"error", cause,
-			"revert_error", result.Error,
-		)
-		return fmt.Errorf("upload chunk failed (%v); revert session: %w", cause, result.Error)
-	}
-	if result.RowsAffected != 1 {
-		s.logger.Warn("upload chunk failed but session was no longer receiving",
-			"session_id", sessionID,
-			"error", cause,
-		)
-	}
 	return cause
 }

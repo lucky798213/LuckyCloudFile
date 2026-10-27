@@ -25,6 +25,7 @@ import (
 //
 //	[System]   → Config.System
 //	[HTTP]     → Config.HTTP
+//	[Upload]   → Config.Upload
 //	[Storage]  → Config.Storage
 //	[Database] → Config.Database
 //
@@ -33,6 +34,7 @@ import (
 type Config struct {
 	System   System
 	HTTP     HTTP
+	Upload   Upload
 	Storage  Storage
 	Database Database
 }
@@ -40,6 +42,13 @@ type Config struct {
 // System 对应 [System]。
 type System struct {
 	LogLevel string // 日志级别：debug / info / warn / error
+}
+
+// Upload 对应 [Upload]。
+type Upload struct {
+	// MaxParallelChunks 是单个分片会话同时处理多少个分片请求。
+	// 它限制的是“每个会话”，不是整个进程：多个会话各自都可以达到这个上限。
+	MaxParallelChunks int
 }
 
 // HTTP 对应 [HTTP]。
@@ -129,8 +138,10 @@ func Load(path string) (Config, error) {
 // 配置文件里没写的项就保持这里的值，所以配置文件可以只写想改的那几项。
 func defaultConfig() Config {
 	return Config{
-		System:   System{LogLevel: "info"},
-		HTTP:     HTTP{ShutdownTimeoutSeconds: 5},
+		System: System{LogLevel: "info"},
+		HTTP:   HTTP{ShutdownTimeoutSeconds: 5},
+		// 没有 [Upload] 段的旧配置也使用这个默认值。
+		Upload:   Upload{MaxParallelChunks: 2},
 		Storage:  Storage{LocalRoots: make(map[string]string)},
 		Database: Database{Port: 3306},
 	}
@@ -142,7 +153,7 @@ func defaultConfig() Config {
 // 配置文件里的值都是字符串，而 Port 是 int，它负责把 "3306" 转成 3306，
 // 转不了（比如写成 "nope"）就返回错误。
 //
-// 这里四个 Section 分开写，而不是用一个循环加反射：
+// 这里五个 Section 分开写，而不是用一个循环加反射：
 // 段数很少，分开写时“配置文件的哪一段 → 哪个结构体”一眼就能对上。
 func mapSections(file *ini.File, cfg *Config) error {
 	if err := file.Section("System").StrictMapTo(&cfg.System); err != nil {
@@ -150,6 +161,9 @@ func mapSections(file *ini.File, cfg *Config) error {
 	}
 	if err := file.Section("HTTP").StrictMapTo(&cfg.HTTP); err != nil {
 		return fmt.Errorf("parse [HTTP]: %w", err)
+	}
+	if err := file.Section("Upload").StrictMapTo(&cfg.Upload); err != nil {
+		return fmt.Errorf("parse [Upload]: %w", err)
 	}
 	if err := file.Section("Storage").StrictMapTo(&cfg.Storage); err != nil {
 		return fmt.Errorf("parse [Storage]: %w", err)
@@ -235,6 +249,12 @@ func (c Config) validate() error {
 	// 关闭超时太短会来不及处理完正在进行的请求，太长又会让退出很慢。
 	if c.HTTP.ShutdownTimeoutSeconds < 1 || c.HTTP.ShutdownTimeoutSeconds > 300 {
 		return fmt.Errorf("HTTP.ShutdownTimeoutSeconds must be between 1 and 300")
+	}
+
+	// 每个分片会话的并行度只允许 1～8。上限既有内存考虑，也避免单个
+	// 会话把进程的连接和锁争用占满。旧配置没有这一段时使用默认值 2。
+	if c.Upload.MaxParallelChunks < 1 || c.Upload.MaxParallelChunks > 8 {
+		return fmt.Errorf("Upload.MaxParallelChunks must be between 1 and 8")
 	}
 
 	// 存储目录必须写。至于它到底能不能写，要等启动时实际试一下才知道（见 internal/app）。

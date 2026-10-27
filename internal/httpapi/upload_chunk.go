@@ -14,11 +14,13 @@ import (
 
 // uploadSessionChunk 处理 PUT /api/upload-sessions/:id/chunks/:index。
 //
-// :index 从 0 开始，必须严格按顺序上传。请求体就是这一片的原始字节，
-// 长度由服务端根据会话大小和固定分片大小算出来，客户端不能自己声明。
+// :index 从 0 开始，可以乱序上传；服务端按会话限制并行度，同一编号只能有
+// 一个请求在处理。请求体就是这一片的原始字节，长度由服务端根据会话大小和
+// 固定分片大小算出来，客户端不能自己声明。
 //
 // 成功返回 200 和会话最新进度；最后一片完成后 status 是 ready，
-// 仍然需要调用确认完成接口才会出现在用户目录里。
+// 仍然需要调用确认完成接口才会出现在用户目录里。并发度超限、同一编号重复
+// 或正在收尾时返回 409，客户端应等待在途请求结束后重试。
 func uploadSessionChunk(logger *slog.Logger, svc fileService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ownerID, ok := currentUserID(c)
