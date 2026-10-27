@@ -203,6 +203,35 @@ func TestArchiveCrashRecovery(t *testing.T) {
 		}
 	})
 
+	t.Run("publish conflict failure cleans work directory", func(t *testing.T) {
+		h := newCrashHarness(t)
+		// 先占住目标名字，发布会话创建阶段会返回 ErrAlreadyExists。
+		if _, err := h.fileService.Upload(
+			context.Background(), h.user.ID, "", "bundle.zip",
+			bytes.NewReader([]byte("existing bundle")),
+		); err != nil {
+			t.Fatal(err)
+		}
+		taskID := h.newTask(t)
+
+		app := h.start(t, "")
+		h.waitFailed(t, app, taskID, true)
+
+		if _, err := os.Stat(filepath.Join(h.workDir, "task-"+taskID)); !os.IsNotExist(err) {
+			t.Fatalf("failed task work directory was not cleaned: %v", err)
+		}
+		if results := h.taskResults(t, taskID); len(results) != 0 {
+			t.Fatalf("failed task published %d result(s)", len(results))
+		}
+		stored := h.task(t, taskID)
+		if stored.ResultFileID != nil {
+			t.Fatalf("failed task has result file %v", stored.ResultFileID)
+		}
+		if got := h.countFiles(t); got != int64(len(h.sourceIDs)+1) {
+			t.Fatalf("file rows = %d, want sources + existing target", got)
+		}
+	})
+
 	t.Run("completed task is not executed again", func(t *testing.T) {
 		h := newCrashHarness(t)
 		taskID := h.newTask(t)
@@ -519,6 +548,40 @@ func (h *crashHarness) waitCompleted(
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("task %s did not complete in time\n%s", taskID, app.log())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func (h *crashHarness) waitFailed(
+	t *testing.T,
+	app *crashApp,
+	taskID string,
+	waitCleanup bool,
+) model.Task {
+	t.Helper()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		var record model.Task
+		err := h.db.First(&record, "id = ?", taskID).Error
+		if err == nil {
+			if record.Status == model.TaskStatusCompleted {
+				t.Fatalf("task %s completed unexpectedly", taskID)
+			}
+			if record.Status == model.TaskStatusFailed &&
+				(!waitCleanup || !record.CleanupPending) {
+				return record
+			}
+		}
+		select {
+		case <-app.done:
+			t.Fatalf("crash helper exited before task failed: %v\n%s",
+				app.waitErr, app.log())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("task %s did not fail in time\n%s", taskID, app.log())
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
