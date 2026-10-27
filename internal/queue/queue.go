@@ -2,6 +2,20 @@
 //
 // 队列只负责调用任务、限制并发和记录结果，不认识文件、ZIP 等业务概念。
 // channel 保存"要执行什么"，map 保存"执行到哪了"，任务出队后记录不会消失。
+//
+// 生命周期：New 创建队列自己的 context，每个任务从它派生出带超时的 context。
+// 因此任务使用的 context 不来自任何 HTTP 请求。Shutdown 停止接收、取消执行、
+// 等待所有 worker 退出。接入应用时必须按下面的顺序收尾：
+//
+//	停止接收新请求（http.Server.Shutdown）
+//	→ queue.Shutdown()（取消任务并等待清理）
+//	→ database.Close()
+//
+// 顺序不能反：任务可能还在读写数据库。
+//
+// 注意：context 超时/取消是协作式的，不会强制杀死 goroutine。worker 会一直等
+// Job.Run 返回才领取下一项，否则实际并发会超过 worker 数。因此不响应 context
+// 的任务会让 Shutdown 一直等待。
 package queue
 
 import (
@@ -9,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"luckyCloudFile/internal/idgen"
 )
@@ -31,6 +46,10 @@ var (
 
 // Job 是业务与队列的边界。
 // result 暂时用字符串；以后 ZIP 任务可以返回结果文件 ID。
+//
+// Run 必须响应 ctx 的取消和超时，并在返回前完成自己的清理。
+// 返回 nil 表示成功；放弃执行时应返回 ctx.Err()。队列不会用 deadline
+// 推断失败：只要 Run 返回 nil，即使已经超时也记为成功。
 type Job interface {
 	Run(ctx context.Context) (result string, err error)
 }
@@ -59,23 +78,33 @@ type item struct {
 
 // Queue 是一个固定 worker 数的任务队列。
 type Queue struct {
-	mu     sync.RWMutex
-	jobs   chan item
-	tasks  map[string]Snapshot
-	closed bool
-	wg     sync.WaitGroup
+	mu      sync.RWMutex
+	jobs    chan item
+	tasks   map[string]Snapshot
+	closed  bool
+	ctx     context.Context
+	cancel  context.CancelFunc
+	timeout time.Duration
+	wg      sync.WaitGroup
 }
 
 // New 创建队列并启动 workers 个 worker。
-// capacity 只限制等待队列，不包含正在执行的任务。
-func New(workers, capacity int) (*Queue, error) {
+// capacity 只限制等待队列，不包含正在执行的任务；timeout 是单个任务的执行上限。
+func New(workers, capacity int, timeout time.Duration) (*Queue, error) {
 	if workers <= 0 || capacity <= 0 {
 		return nil, errors.New("workers and capacity must be positive")
 	}
+	if timeout <= 0 {
+		return nil, errors.New("timeout must be positive")
+	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	q := &Queue{
-		jobs:  make(chan item, capacity),
-		tasks: make(map[string]Snapshot),
+		jobs:    make(chan item, capacity),
+		tasks:   make(map[string]Snapshot),
+		ctx:     ctx,
+		cancel:  cancel,
+		timeout: timeout,
 	}
 
 	q.wg.Add(workers)
@@ -87,6 +116,7 @@ func New(workers, capacity int) (*Queue, error) {
 }
 
 // Submit 登记任务并放入等待队列，返回任务 ID。
+// 任务的执行 context 由队列生命周期和 timeout 生成，调用方不需要传。
 func (q *Queue) Submit(ownerID int, job Job) (string, error) {
 	if job == nil {
 		return "", errors.New("job is required")
@@ -140,11 +170,20 @@ func (q *Queue) worker() {
 
 	// channel 关闭后，仍会消费完已经缓冲的任务。
 	for task := range q.jobs {
-		q.update(task.id, Running, "", nil)
+		// 任务开始（queued→running）与关闭判断在同一把锁内完成。
+		// Shutdown 先拿到锁时这里返回 false，任务不会被执行。
+		if !q.start(task.id) {
+			q.update(task.id, Failed, "", context.Canceled)
+			continue
+		}
 
-		// 同步执行：当前任务返回之前，不领取下一项。
-		result, err := run(context.Background(), task.job)
+		// 执行 context 来自队列生命周期，而不是某个 HTTP 请求。
+		ctx, cancel := context.WithTimeout(q.ctx, q.timeout)
+		result, err := run(ctx, task.job)
+		cancel()
 
+		// 返回 nil 就是成功。任务应自己响应 ctx：放弃时返回 ctx.Err()。
+		// 不能在事后仅凭 deadline 已到就把成功改成失败，否则已经发布的结果会被丢弃。
 		if err != nil {
 			q.update(task.id, Failed, "", err)
 			continue
@@ -152,6 +191,25 @@ func (q *Queue) worker() {
 
 		q.update(task.id, Completed, result, nil)
 	}
+}
+
+// start 是任务开始的唯一边界：在同一把锁内检查关闭并完成 queued→running。
+//
+// Shutdown 也在同一把锁内设置 closed 并取消，因此只有两种顺序：
+//   - start 先拿到锁：任务算已开始，Shutdown 随后取消它的 context；
+//   - Shutdown 先拿到锁：start 返回 false，任务不会执行。
+func (q *Queue) start(id string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.closed {
+		return false
+	}
+
+	task := q.tasks[id]
+	task.Status = Running
+	q.tasks[id] = task
+	return true
 }
 
 // run 在单个任务边界内 recover，panic 不会让整个 worker 退出。
@@ -180,12 +238,16 @@ func (q *Queue) update(id string, status Status, result string, err error) {
 	q.tasks[id] = task
 }
 
-// Shutdown 停止接收，排空已接收任务，等待所有 worker 退出。
-// 只能由应用生命周期调用，不应在 Job 内调用。
+// Shutdown 停止接收，取消正在执行和排队中的任务，等待所有 worker 退出。
+// 已开始的任务会收到 ctx 取消，但 worker 必须等它真正返回（完成清理）才退出。
+// 可以重复调用；只能由应用生命周期调用，不应在 Job 内调用。
 func (q *Queue) Shutdown() {
 	q.mu.Lock()
 	if !q.closed {
+		// closed 与 start 共用同一把锁：关闭之后不再允许 queued→running。
 		q.closed = true
+		q.cancel()
+		// 再关闭 channel，让 worker 排空缓冲后退出。
 		close(q.jobs)
 	}
 	q.mu.Unlock()
