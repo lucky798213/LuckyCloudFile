@@ -10,18 +10,32 @@ import (
 func mustCreate(t *testing.T, m *Manager, req Request) Lease {
 	t.Helper()
 
-	lease, err := m.Create(req)
-	if err != nil {
-		t.Fatalf("Create(%+v) error = %v", req, err)
+	leases := mustCreateBatch(t, m, req)
+	if len(leases) != 1 {
+		t.Fatalf("Create(%+v) returned %d leases, want 1", req, len(leases))
 	}
-	return lease
+	return leases[0]
+}
+
+func mustCreateBatch(t *testing.T, m *Manager, requests ...Request) []Lease {
+	t.Helper()
+
+	leases, err := m.Create(requests...)
+	if err != nil {
+		t.Fatalf("Create(%+v) error = %v", requests, err)
+	}
+	return leases
 }
 
 func mustConflict(t *testing.T, m *Manager, req Request) {
 	t.Helper()
 
-	if _, err := m.Create(req); !errors.Is(err, ErrConflict) {
+	leases, err := m.Create(req)
+	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("Create(%+v) error = %v, want ErrConflict", req, err)
+	}
+	if len(leases) != 0 {
+		t.Fatalf("conflicting Create(%+v) returned %d leases, want 0", req, len(leases))
 	}
 }
 
@@ -92,13 +106,13 @@ func TestCreateTable(t *testing.T) {
 			m := NewManager()
 			held := mustCreate(t, m, tt.held)
 
-			lease, err := m.Create(tt.request)
+			leases, err := m.Create(tt.request)
 			if tt.conflict {
 				if !errors.Is(err, ErrConflict) {
 					t.Fatalf("Create() error = %v, want ErrConflict", err)
 				}
-				if lease.Token != "" {
-					t.Fatalf("conflicting Create() returned token %q", lease.Token)
+				if len(leases) != 0 {
+					t.Fatalf("conflicting Create() returned %d leases, want 0", len(leases))
 				}
 
 				// 冲突申请不能留下锁：释放已有锁后，同一申请应当成功。
@@ -115,6 +129,10 @@ func TestCreateTable(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Create() error = %v, want success", err)
 			}
+			if len(leases) != 1 {
+				t.Fatalf("Create() returned %d leases, want 1", len(leases))
+			}
+			lease := leases[0]
 			if lease.Token == "" {
 				t.Fatal("Create() returned an empty token")
 			}
@@ -310,6 +328,193 @@ func TestExpiredLockAllowsCreate(t *testing.T) {
 	}
 }
 
+// TestCreateBatchAtomicOnExistingConflict 验证批量申请失败时不留半套锁：
+// 先占用目标，批量申请源和目标失败，源路径仍然可以单独申请。
+func TestCreateBatchAtomicOnExistingConflict(t *testing.T) {
+	m := NewManager()
+	user := Namespace(1)
+	source := Request{Namespace: user, Path: "/docs/report.txt", Scope: Node}
+	target := Request{Namespace: user, Path: "/archive/report.txt", Scope: Node}
+
+	targetLease := mustCreate(t, m, target)
+
+	leases, err := m.Create(source, target)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("batch Create() error = %v, want ErrConflict", err)
+	}
+	if len(leases) != 0 {
+		t.Fatalf("failed batch returned %d leases, want 0", len(leases))
+	}
+
+	// 目标仍然被占用，但源没有留下任何锁，所以可以单独申请。
+	sourceLease := mustCreate(t, m, source)
+
+	if err := m.Unlock(sourceLease.Token); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Unlock(targetLease.Token); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCreateBatchSuccess(t *testing.T) {
+	m := NewManager()
+	user := Namespace(1)
+	source := Request{Namespace: user, Path: "/docs/report.txt", Scope: Node}
+	target := Request{Namespace: user, Path: "/archive/report.txt", Scope: Node}
+
+	leases := mustCreateBatch(t, m, source, target)
+	if len(leases) != 2 {
+		t.Fatalf("batch Create() returned %d leases, want 2", len(leases))
+	}
+	if leases[0].Request.Path != source.Path || leases[1].Request.Path != target.Path {
+		t.Fatalf("batch leases are out of order: %+v", leases)
+	}
+
+	mustConflict(t, m, source)
+	mustConflict(t, m, target)
+
+	for _, lease := range leases {
+		if err := m.Unlock(lease.Token); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	again := mustCreateBatch(t, m, source, target)
+	for _, lease := range again {
+		if err := m.Unlock(lease.Token); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestCreateBatchMergesDuplicatePath(t *testing.T) {
+	m := NewManager()
+	user := Namespace(1)
+
+	leases := mustCreateBatch(t, m,
+		Request{Namespace: user, Path: "/docs/a.txt", Scope: Node},
+		Request{Namespace: user, Path: "/docs/a.txt/", Scope: Subtree},
+		Request{Namespace: user, Path: "//docs//a.txt", Scope: Node},
+	)
+	if len(leases) != 1 {
+		t.Fatalf("batch Create() returned %d leases, want 1 merged lease", len(leases))
+	}
+	lease := leases[0]
+	if lease.Request.Path != "/docs/a.txt" {
+		t.Fatalf("merged path = %q, want /docs/a.txt", lease.Request.Path)
+	}
+	if lease.Request.Scope != Subtree {
+		t.Fatalf("merged scope = %s, want subtree", lease.Request.Scope)
+	}
+
+	// 合并为子树锁后，后代也被覆盖。
+	mustConflict(t, m, Request{Namespace: user, Path: "/docs/a.txt/child", Scope: Node})
+	if err := m.Unlock(lease.Token); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCreateBatchKeepsNamespacesSeparate(t *testing.T) {
+	m := NewManager()
+
+	leases := mustCreateBatch(t, m,
+		Request{Namespace: Namespace(1), Path: "/docs", Scope: Subtree},
+		Request{Namespace: Namespace(2), Path: "/docs", Scope: Subtree},
+	)
+	if len(leases) != 2 {
+		t.Fatalf("batch Create() returned %d leases, want 2", len(leases))
+	}
+
+	for _, lease := range leases {
+		if err := m.Unlock(lease.Token); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestCreateBatchRejectsInternalOverlap(t *testing.T) {
+	m := NewManager()
+	user := Namespace(1)
+	node := Request{Namespace: user, Path: "/docs/a.txt", Scope: Node}
+	subtree := Request{Namespace: user, Path: "/docs", Scope: Subtree}
+
+	leases, err := m.Create(subtree, node)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("batch Create() error = %v, want ErrConflict", err)
+	}
+	if len(leases) != 0 {
+		t.Fatalf("overlapping batch returned %d leases, want 0", len(leases))
+	}
+
+	// 两个申请都没有被写入：分别单独申请都能成功。
+	nodeLease := mustCreate(t, m, node)
+	if err := m.Unlock(nodeLease.Token); err != nil {
+		t.Fatal(err)
+	}
+	subtreeLease := mustCreate(t, m, subtree)
+	if err := m.Unlock(subtreeLease.Token); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCreateBatchAtomicOnInvalidRequest(t *testing.T) {
+	m := NewManager()
+	user := Namespace(1)
+	valid := Request{Namespace: user, Path: "/docs/report.txt", Scope: Node}
+	invalid := Request{Namespace: user, Path: "archive/report.txt", Scope: Node}
+
+	leases, err := m.Create(valid, invalid)
+	if !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("batch Create() error = %v, want ErrInvalidPath", err)
+	}
+	if len(leases) != 0 {
+		t.Fatalf("invalid batch returned %d leases, want 0", len(leases))
+	}
+
+	lease := mustCreate(t, m, valid)
+	if err := m.Unlock(lease.Token); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCreateBatchMergesExpiry(t *testing.T) {
+	now := time.Date(2026, 10, 27, 9, 0, 0, 0, time.UTC)
+	m := NewManager()
+	m.now = func() time.Time { return now }
+	user := Namespace(1)
+	later := now.Add(time.Hour)
+
+	leases := mustCreateBatch(t, m,
+		Request{
+			Namespace: user,
+			Path:      "/docs/a.txt",
+			Scope:     Node,
+			ExpiresAt: now.Add(time.Minute),
+		},
+		Request{
+			Namespace: user,
+			Path:      "/docs/a.txt",
+			Scope:     Subtree,
+			ExpiresAt: later,
+		},
+	)
+	if len(leases) != 1 {
+		t.Fatalf("batch Create() returned %d leases, want 1", len(leases))
+	}
+	if !leases[0].Request.ExpiresAt.Equal(later) {
+		t.Fatalf("merged expiry = %s, want %s", leases[0].Request.ExpiresAt, later)
+	}
+
+	now = later.Add(-time.Minute)
+	mustConflict(t, m, Request{Namespace: user, Path: "/docs/a.txt/child", Scope: Node})
+
+	now = later.Add(time.Minute)
+	if err := m.Unlock(leases[0].Token); !errors.Is(err, ErrNoSuchLock) {
+		t.Fatalf("Unlock(expired token) error = %v, want ErrNoSuchLock", err)
+	}
+}
+
 func TestConcurrentCreateOnlyOneWins(t *testing.T) {
 	m := NewManager()
 	req := Request{
@@ -322,7 +527,7 @@ func TestConcurrentCreateOnlyOneWins(t *testing.T) {
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	var leases []Lease
+	var acquired []Lease
 
 	for range goroutines {
 		wg.Add(1)
@@ -330,7 +535,7 @@ func TestConcurrentCreateOnlyOneWins(t *testing.T) {
 			defer wg.Done()
 			<-start
 
-			lease, err := m.Create(req)
+			leases, err := m.Create(req)
 			if err != nil {
 				if !errors.Is(err, ErrConflict) {
 					t.Errorf("Create() error = %v, want nil or ErrConflict", err)
@@ -338,18 +543,18 @@ func TestConcurrentCreateOnlyOneWins(t *testing.T) {
 				return
 			}
 			mu.Lock()
-			leases = append(leases, lease)
+			acquired = append(acquired, leases...)
 			mu.Unlock()
 		}()
 	}
 	close(start)
 	wg.Wait()
 
-	if len(leases) != 1 {
-		t.Fatalf("%d goroutines acquired the same lock, want 1", len(leases))
+	if len(acquired) != 1 {
+		t.Fatalf("%d goroutines acquired the same lock, want 1", len(acquired))
 	}
 
-	if err := m.Unlock(leases[0].Token); err != nil {
+	if err := m.Unlock(acquired[0].Token); err != nil {
 		t.Fatal(err)
 	}
 	again := mustCreate(t, m, req)
