@@ -121,13 +121,6 @@ func run(
 	// MaxPendingTasks 限制数据库里的未终态积压，不随内存队列上限浮动。
 	taskService := task.NewService(db).WithMaxPending(cfg.Task.MaxPendingTasks)
 
-	// 清理任务需要一个内部所有者来满足 tasks.owner_id 外键。这个账号
-	// 没有可用配额，密码随机且从不输出，不能登录或上传。
-	cleanupOwner, err := cleanup.EnsureOwner(ctx, db)
-	if err != nil {
-		return fmt.Errorf("initialize cleanup owner: %w", err)
-	}
-
 	// 任务类型注册表：type → 重建工厂。工厂依赖在这里注入一次；恢复时
 	// 只读取 tasks 记录里的 owner、phase 和 state_json，没有旧 Job 指针。
 	taskFactories := task.NewRegistry()
@@ -207,26 +200,36 @@ func run(
 	// 清理不再由进程内的定时循环直接执行，而是确保 tasks 表里有一条
 	// storage_cleanup_v1 任务。同一个 tick 只复用未终态记录，不会无限创建；
 	// 清理失败由任务自身的 retry_wait 和下一次周期触发继续重试。
-	cleanupScheduler, err := cleanup.NewScheduler(
-		taskService, cleanupOwner.ID, cleanup.DefaultInterval, logger,
-	)
+	//
+	// 清理任务需要一个真实 owner 来满足外键。这里复用数据库里第一个账号，
+	// 不在启动时创建系统账号；还没有任何用户时也没有用户数据需要清理，
+	// 跳过触发器即可。
+	cleanupOwnerID, hasCleanupOwner, err := cleanup.OwnerID(ctx, db)
 	if err != nil {
-		return fmt.Errorf("initialize cleanup scheduler: %w", err)
+		return fmt.Errorf("resolve cleanup task owner: %w", err)
 	}
-	if _, err := cleanupScheduler.Ensure(ctx); err != nil {
-		return fmt.Errorf("schedule cleanup task: %w", err)
+	if hasCleanupOwner {
+		cleanupScheduler, err := cleanup.NewScheduler(
+			taskService, cleanupOwnerID, cleanup.DefaultInterval, logger,
+		)
+		if err != nil {
+			return fmt.Errorf("initialize cleanup scheduler: %w", err)
+		}
+		if _, err := cleanupScheduler.Ensure(ctx); err != nil {
+			return fmt.Errorf("schedule cleanup task: %w", err)
+		}
+		cleanupCtx, stopCleanup := context.WithCancel(ctx)
+		cleanupDone := make(chan struct{})
+		go func() {
+			defer close(cleanupDone)
+			cleanupScheduler.Run(cleanupCtx)
+		}()
+		// 先停止触发器，再让调度器和队列收尾，最后关闭数据库。
+		defer func() {
+			stopCleanup()
+			<-cleanupDone
+		}()
 	}
-	cleanupCtx, stopCleanup := context.WithCancel(ctx)
-	cleanupDone := make(chan struct{})
-	go func() {
-		defer close(cleanupDone)
-		cleanupScheduler.Run(cleanupCtx)
-	}()
-	// 先停止触发器，再让调度器和队列收尾，最后关闭数据库。
-	defer func() {
-		stopCleanup()
-		<-cleanupDone
-	}()
 
 	// 第四步：创建 HTTP Server。它只是一个“配置好的对象”，还没开始监听。
 	// Handler 就是路由表，来自 internal/httpapi。
