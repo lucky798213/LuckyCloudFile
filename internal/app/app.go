@@ -101,6 +101,19 @@ func run(
 		WithChunkParallel(cfg.Upload.MaxParallelChunks)
 	authService := auth.NewService(db)
 
+	// 作废上一次进程留下的未完成上传会话。
+	//
+	// 这一步必须同步执行，而且必须在处理遗留任务、开始调度和接受 HTTP
+	// 请求之前完成：旧进程已经退出，旧会话不能再上传或发布。单个会话的
+	// expires_at 可能还在未来，所以不能只靠后面的到期扫描。
+	//
+	// 失败必须终止启动，不能只记日志继续：那样会有一部分旧会话仍然可用。
+	// 这里只切断数据库里的资格；磁盘、Entity、Session 都交给清理任务继续
+	// 回收，启动不必等物理删除完成。
+	if err := recoverUploads(ctx, fileService, file.DefaultRecoveryBatchSize); err != nil {
+		return fmt.Errorf("invalidate unfinished upload sessions: %w", err)
+	}
+
 	// 任务服务负责持久化事实：提交先做准入并落库，成功后才唤醒调度器。
 	// MaxPendingTasks 限制数据库里的未终态积压，不随内存队列上限浮动。
 	taskService := task.NewService(db).WithMaxPending(cfg.Task.MaxPendingTasks)
@@ -117,6 +130,22 @@ func run(
 		),
 	); err != nil {
 		return fmt.Errorf("register archive task factory: %w", err)
+	}
+
+	// 处理上一次进程留下的 running 任务。此时还没有启动调度器，也没有
+	// 开始接受 HTTP 请求，所以数据库里的 running 记录不可能仍由本进程持有。
+	// 恢复先核对 task_results：结果已经发布就补写 completed，绝不重跑发布；
+	// 没有结果才保留 phase/state 放回 queued，或者在上限用完后明确失败。
+	recovered, err := taskService.RecoverRunning(ctx, time.Now())
+	if err != nil {
+		return fmt.Errorf("recover interrupted tasks: %w", err)
+	}
+	if recovered.Completed > 0 || recovered.Requeued > 0 || recovered.Failed > 0 {
+		logger.Info("recovered interrupted tasks",
+			"completed", recovered.Completed,
+			"requeued", recovered.Requeued,
+			"failed", recovered.Failed,
+		)
 	}
 
 	// 任务队列随应用生命周期创建和关闭。关闭顺序是：
@@ -179,20 +208,7 @@ func run(
 	}
 	defer listener.Close()
 
-	// 第六步：作废上一次进程留下的未完成上传会话。
-	//
-	// 这一步必须同步执行，而且必须在开始接受 HTTP 请求之前完成：
-	// 旧进程已经退出，旧会话不能再上传或发布。单个会话的 expires_at 可能
-	// 还在未来，所以不能只靠后面的到期扫描。
-	//
-	// 失败必须终止启动，不能只记日志继续：那样会有一部分旧会话仍然可用。
-	// 这里只切断数据库里的资格；磁盘、Entity、Session 都交给下面
-	// CleanupLoop 里的现有恢复扫描继续回收，启动不必等物理删除完成。
-	if err := recoverUploads(ctx, fileService, file.DefaultRecoveryBatchSize); err != nil {
-		return fmt.Errorf("invalidate unfinished upload sessions: %w", err)
-	}
-
-	// 第七步：开始后台物理清理。
+	// 第六步：开始后台物理清理。
 	// 先立即扫描一次（补上上次进程崩溃留下的 pending_delete），之后定时扫描。
 	// 它只在监听和旧会话作废都成功后才启动；Run 返回时一定先取消并等它退出，
 	// 不留下孤儿 goroutine。
@@ -203,7 +219,7 @@ func run(
 		fileService.CleanupLoop(cleanupCtx, file.DefaultCleanupInterval, file.DefaultCleanupBatchSize)
 	}()
 
-	// 第八步：旧上传会话已经作废，现在才开始调度数据库里遗留的任务。
+	// 第七步：旧上传会话已经作废，现在才开始调度数据库里遗留的任务。
 	//
 	// 顺序很重要：调度器启动时会立即扫描一次，若它更早启动，重启前的
 	// queued 任务可能在旧会话还没失效时就开始执行。HTTP 也还没开始接收

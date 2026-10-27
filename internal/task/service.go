@@ -281,6 +281,143 @@ func (s *Service) ListDue(ctx context.Context, now time.Time, limit int) ([]mode
 	return tasks, nil
 }
 
+// RecoveryResult 是启动恢复遗留 running 任务的统计。
+type RecoveryResult struct {
+	Completed int64 // 结果已经发布，直接补写 completed
+	Requeued  int64 // 保留 phase/state，重新排队
+	Failed    int64 // 次数已经用完，明确失败
+}
+
+// RecoverRunning 收敛上一次进程留下的 running 任务。
+//
+// 它必须在开始调度之前、且只有一个应用实例时调用：此时数据库里的
+// running 记录不可能仍由本进程持有，只可能是上一个进程崩溃或正常退出
+// 前没来得及写终态。多实例部署需要额外的租约/围栏，本阶段不做。
+//
+// 顺序是“先核对结果，再决定是否重跑”：
+//   - task_results 已有记录：结果已经发布，不能再执行业务，直接补写
+//     completed 和结果投影，并保留清理责任；
+//   - 没有结果且次数没用完：保留最后已提交的 phase/state，放回 queued；
+//   - 没有结果且次数已经用完：明确 failed，不绕过上限。
+//
+// attempts 不在恢复时增加或清零：每次取得执行资格才加一，崩溃恢复
+// 同样受 max_attempts 约束。
+func (s *Service) RecoverRunning(ctx context.Context, now time.Time) (RecoveryResult, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	var result RecoveryResult
+	var cursor string
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+
+		var tasks []model.Task
+		err := s.db.WithContext(ctx).
+			Where("status = ? AND id > ?", model.TaskStatusRunning, cursor).
+			Order("id ASC").
+			Limit(DefaultListLimit).
+			Find(&tasks).Error
+		if err != nil {
+			return result, fmt.Errorf("query interrupted running tasks: %w", err)
+		}
+		if len(tasks) == 0 {
+			return result, nil
+		}
+
+		for _, record := range tasks {
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
+			cursor = record.ID
+			if err := s.recoverRunningTask(ctx, record, now, &result); err != nil {
+				return result, err
+			}
+		}
+	}
+}
+
+// recoverRunningTask 收敛一条 running 记录。更新条件仍带 attempt 围栏，
+// 避免覆盖恢复期间被别的执行者改过的行。
+func (s *Service) recoverRunningTask(
+	ctx context.Context,
+	record model.Task,
+	now time.Time,
+	result *RecoveryResult,
+) error {
+	var published model.TaskResult
+	err := s.db.WithContext(ctx).
+		Where("task_id = ? AND owner_id = ?", record.ID, record.OwnerID).
+		First(&published).Error
+	switch {
+	case err == nil:
+		// 文件已经发布：只补终态和清理责任，绝不再次执行发布业务。
+		updated := s.db.WithContext(ctx).
+			Model(&model.Task{}).
+			Where("id = ? AND status = ? AND attempts = ?",
+				record.ID, model.TaskStatusRunning, record.Attempts).
+			Updates(map[string]any{
+				"status":          model.TaskStatusCompleted,
+				"result_file_id":  published.FileID,
+				"finished_at":     now,
+				"last_error":      "",
+				"cleanup_pending": true,
+				"updated_at":      now,
+			})
+		if updated.Error != nil {
+			return fmt.Errorf("complete recovered task %q: %w", record.ID, updated.Error)
+		}
+		if updated.RowsAffected == 1 {
+			result.Completed++
+		}
+		return nil
+	case !errors.Is(err, gorm.ErrRecordNotFound):
+		return fmt.Errorf("query task result of %q: %w", record.ID, err)
+	}
+
+	if record.Attempts >= record.MaxAttempts {
+		updated := s.db.WithContext(ctx).
+			Model(&model.Task{}).
+			Where("id = ? AND status = ? AND attempts = ?",
+				record.ID, model.TaskStatusRunning, record.Attempts).
+			Updates(map[string]any{
+				"status":      model.TaskStatusFailed,
+				"finished_at": now,
+				"last_error":  "task interrupted after reaching the attempt limit",
+				"updated_at":  now,
+			})
+		if updated.Error != nil {
+			return fmt.Errorf("fail exhausted task %q: %w", record.ID, updated.Error)
+		}
+		if updated.RowsAffected == 1 {
+			result.Failed++
+		}
+		return nil
+	}
+
+	// 保留最后已提交的 phase / state_json / attempts，只把调度状态放回
+	// queued；扫描器会按 next_run_at 重新发现它。
+	updated := s.db.WithContext(ctx).
+		Model(&model.Task{}).
+		Where("id = ? AND status = ? AND attempts = ?",
+			record.ID, model.TaskStatusRunning, record.Attempts).
+		Updates(map[string]any{
+			"status":      model.TaskStatusQueued,
+			"next_run_at": now,
+			"updated_at":  now,
+		})
+	if updated.Error != nil {
+		return fmt.Errorf("requeue interrupted task %q: %w", record.ID, updated.Error)
+	}
+	if updated.RowsAffected == 1 {
+		result.Requeued++
+	}
+	return nil
+}
+
 // TryStart 尝试把任务从 queued / retry_wait 推进到 running。
 //
 // attempts + 1 和状态切换在同一个条件 UPDATE 里完成，只有 RowsAffected=1

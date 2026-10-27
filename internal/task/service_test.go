@@ -66,6 +66,9 @@ func cleanupOwners(t *testing.T, db *gorm.DB, ownerIDs ...int) {
 		if err := db.Where("owner_id = ?", ownerID).Delete(&model.Task{}).Error; err != nil {
 			t.Errorf("cleanup tasks of owner %d: %v", ownerID, err)
 		}
+		if err := db.Where("owner_id = ?", ownerID).Delete(&model.TaskResult{}).Error; err != nil {
+			t.Errorf("cleanup task results of owner %d: %v", ownerID, err)
+		}
 		if err := db.Delete(&model.User{}, ownerID).Error; err != nil {
 			t.Errorf("cleanup owner %d: %v", ownerID, err)
 		}
