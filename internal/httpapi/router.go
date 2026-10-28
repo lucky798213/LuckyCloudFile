@@ -44,6 +44,7 @@ type fileService interface {
 	CompleteUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error)
 	CancelUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error)
 	InstantUpload(ctx context.Context, ownerID int, parentID, name string, size int64, sha256, idempotencyKey string) (file.InstantUploadResult, error)
+	OwnedFile(ctx context.Context, ownerID int, id string) (file.File, error)
 }
 
 // NewRouter 创建不带 ZIP 任务接口的路由。
@@ -138,6 +139,9 @@ func newRouter(
 	if tasks != nil {
 		protected.POST("/archive-tasks", createArchiveTask(logger, tasks))
 		protected.GET("/tasks/:id", getTask(logger, tasks, snapshots))
+		// 内容校验任务：只落库，由独立 worker 领取执行。
+		// API 进程的本地调度器不领取这一类型。
+		protected.POST("/content-verify-tasks", createContentVerifyTask(logger, fileService, tasks))
 	}
 
 	// 兜底：没匹配到任何路由时，返回统一的 JSON 错误，而不是 Gin 默认的纯文本 404。

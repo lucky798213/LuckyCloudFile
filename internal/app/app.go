@@ -183,9 +183,13 @@ func run(
 	// 调度器按数据库里的原 taskID 入队，不经过 queue.Submit，因此恢复或
 	// 重复扫描不会生成第二个任务 ID。提交通知丢失时，周期扫描会兜底。
 	taskDispatcher, err := task.NewDispatcher(task.DispatcherOptions{
-		Service:      taskService,
-		Queue:        taskQueue,
-		Runner:       taskFactories,
+		Service: taskService,
+		Queue:   taskQueue,
+		Runner:  taskFactories,
+		// 只有 API 进程注册的任务类型才由本地调度器执行。
+		// 内容校验任务由独立 worker 领取；如果不过滤，API 会先领走它，
+		// 再因为找不到执行器而把它判成永久失败。
+		Types:        []string{archive.TaskType, cleanup.TaskType},
 		ScanInterval: time.Duration(cfg.Task.ScanIntervalSeconds) * time.Second,
 		BatchSize:    cfg.Task.ScanBatchSize,
 		Logger:       logger,

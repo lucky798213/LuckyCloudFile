@@ -10,15 +10,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"luckyCloudFile/internal/archive"
+	"luckyCloudFile/internal/file"
 	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/queue"
 	"luckyCloudFile/internal/task"
+	"luckyCloudFile/internal/verify"
 )
 
 // taskService 是任务接口需要的最小持久化能力。
@@ -52,14 +57,21 @@ type archiveTaskResponse struct {
 }
 
 // taskStatusResponse 是 GET /api/tasks/:id 的响应。
+//
+// worker_id / attempt / lease_until 让多实例调度可见：同一任务被接管后
+// attempts 会增加、worker_id 会换成新实例；result 是成功后的业务投影。
 type taskStatusResponse struct {
-	TaskID         string `json:"task_id"`
-	Status         string `json:"status"`
-	Stage          string `json:"stage"`
-	ProcessedFiles int    `json:"processed_files"`
-	TotalFiles     int    `json:"total_files"`
-	Error          string `json:"error,omitempty"`
-	ResultFileID   string `json:"result_file_id"`
+	TaskID         string     `json:"task_id"`
+	Status         string     `json:"status"`
+	Stage          string     `json:"stage"`
+	ProcessedFiles int        `json:"processed_files"`
+	TotalFiles     int        `json:"total_files"`
+	Error          string     `json:"error,omitempty"`
+	ResultFileID   string     `json:"result_file_id"`
+	WorkerID       string     `json:"worker_id,omitempty"`
+	Attempt        int        `json:"attempt"`
+	LeaseUntil     *time.Time `json:"lease_until,omitempty"`
+	Result         any        `json:"result,omitempty"`
 }
 
 // createArchiveTask 处理 POST /api/archive-tasks。
@@ -155,6 +167,153 @@ func isArchiveInputError(err error) bool {
 		errors.Is(err, archive.ErrInvalidName)
 }
 
+const (
+	// maxContentVerifyFiles 限制一次提交多少个文件，避免一个请求
+	// 无上限地创建任务。
+	maxContentVerifyFiles = 100
+
+	// contentVerifyPhase 是内容校验任务的初始阶段：领取后读取并校验内容。
+	contentVerifyPhase = "verify"
+)
+
+// contentVerifyRequest 是 POST /api/content-verify-tasks 的请求体。
+type contentVerifyRequest struct {
+	FileIDs []string `json:"file_ids"`
+}
+
+// contentVerifyResponse 是提交成功后的响应：每个文件一条任务。
+type contentVerifyResponse struct {
+	TaskIDs []string `json:"task_ids"`
+}
+
+// createContentVerifyTask 处理 POST /api/content-verify-tasks。
+//
+// 它只创建任务，不读内容：真正的校验由独立 worker 领取执行。任务类型
+// 因此不会被 API 进程的本地调度器领取（见 DispatcherOptions.Types）。
+//
+// 提交前确认每个文件都属于当前用户且是普通文件。文件在校验期间被删除
+// 仍然可能发生，那种情况由 worker 收敛为“目标已删除/不可校验”。
+func createContentVerifyTask(
+	logger *slog.Logger,
+	files fileService,
+	tasks taskService,
+) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ownerID, ok := currentUserID(c)
+		if !ok {
+			respondInternalError(c, logger, "create content verify task: missing authenticated user")
+			return
+		}
+
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxArchiveTaskBodyBytes)
+
+		var request contentVerifyRequest
+		if err := c.ShouldBindJSON(&request); err != nil ||
+			len(request.FileIDs) == 0 || len(request.FileIDs) > maxContentVerifyFiles {
+			c.JSON(http.StatusBadRequest, ErrorResponse{
+				Code: "invalid_request",
+				Message: fmt.Sprintf(
+					`request body must be JSON like {"file_ids":["..."]} with 1-%d files`,
+					maxContentVerifyFiles,
+				),
+			})
+			return
+		}
+
+		// 去重：同一个文件重复提交没有意义，只会产生两条等价任务。
+		seen := make(map[string]struct{}, len(request.FileIDs))
+		fileIDs := make([]string, 0, len(request.FileIDs))
+		for _, id := range request.FileIDs {
+			id = strings.TrimSpace(id)
+			if id == "" {
+				c.JSON(http.StatusBadRequest, ErrorResponse{
+					Code:    "invalid_request",
+					Message: "file id must not be empty",
+				})
+				return
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			fileIDs = append(fileIDs, id)
+		}
+
+		for _, id := range fileIDs {
+			record, err := files.OwnedFile(c.Request.Context(), ownerID, id)
+			switch {
+			case errors.Is(err, file.ErrNotFound):
+				c.JSON(http.StatusNotFound, ErrorResponse{
+					Code:    "file_not_found",
+					Message: "file not found",
+				})
+				return
+			case err != nil:
+				logger.Error("lookup file for content verification", "file_id", id, "error", err)
+				c.JSON(http.StatusInternalServerError, ErrorResponse{
+					Code:    "internal_error",
+					Message: "internal server error",
+				})
+				return
+			case record.Kind != model.KindFile:
+				c.JSON(http.StatusBadRequest, ErrorResponse{
+					Code:    "invalid_request",
+					Message: "only files can be verified",
+				})
+				return
+			}
+		}
+
+		taskIDs := make([]string, 0, len(fileIDs))
+		for _, id := range fileIDs {
+			state, err := verify.NewState(id)
+			if err != nil {
+				logger.Error("build content verify state", "file_id", id, "error", err)
+				c.JSON(http.StatusInternalServerError, ErrorResponse{
+					Code:    "internal_error",
+					Message: "internal server error",
+				})
+				return
+			}
+			stateJSON, err := json.Marshal(state)
+			if err != nil {
+				logger.Error("encode content verify state", "file_id", id, "error", err)
+				c.JSON(http.StatusInternalServerError, ErrorResponse{
+					Code:    "internal_error",
+					Message: "internal server error",
+				})
+				return
+			}
+
+			submitted, err := tasks.Submit(c.Request.Context(), task.CreateParams{
+				Type:         verify.TaskType,
+				OwnerID:      ownerID,
+				Phase:        contentVerifyPhase,
+				StateVersion: verify.StateVersion,
+				StateJSON:    string(stateJSON),
+			})
+			switch {
+			case errors.Is(err, task.ErrTooManyPending):
+				c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+					Code:    "task_limit",
+					Message: "too many unfinished tasks, try again later",
+				})
+				return
+			case err != nil:
+				logger.Error("submit content verify task", "file_id", id, "error", err)
+				c.JSON(http.StatusInternalServerError, ErrorResponse{
+					Code:    "internal_error",
+					Message: "internal server error",
+				})
+				return
+			}
+			taskIDs = append(taskIDs, submitted.ID)
+		}
+
+		c.JSON(http.StatusAccepted, contentVerifyResponse{TaskIDs: taskIDs})
+	}
+}
+
 // getTask 处理 GET /api/tasks/:id。
 // 非本人任务和不存在任务统一 404，避免泄露任务是否存在。
 func getTask(
@@ -236,5 +395,23 @@ func taskStatusFromRecord(record *model.Task, snapshot queue.Snapshot) taskStatu
 		TotalFiles:     snapshot.Total,
 		Error:          record.LastError,
 		ResultFileID:   resultFileID,
+		WorkerID:       record.WorkerID,
+		Attempt:        record.Attempts,
+		LeaseUntil:     record.LeaseUntil,
+		Result:         taskResultOf(record),
 	}
+}
+
+// taskResultOf 把落库的结果投影还原成 JSON 对象。
+//
+// 兼容非 JSON 的历史值：解析失败时原样返回字符串，而不是让整个查询失败。
+func taskResultOf(record *model.Task) any {
+	if record.ResultJSON == "" {
+		return nil
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(record.ResultJSON), &decoded); err != nil {
+		return record.ResultJSON
+	}
+	return decoded
 }

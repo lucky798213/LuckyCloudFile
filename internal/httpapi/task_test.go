@@ -12,11 +12,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"luckyCloudFile/internal/archive"
 	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/queue"
 	"luckyCloudFile/internal/task"
+	"luckyCloudFile/internal/verify"
 )
 
 // fakeTaskService 模拟 task.Service 的持久化接口：
@@ -360,5 +362,136 @@ func TestGetTask(t *testing.T) {
 			t.Fatalf("%s: status = %d, want 404: %s", id, recorder.Code, recorder.Body.String())
 		}
 		assertErrorCode(t, recorder, "task_not_found")
+	}
+}
+
+func TestCreateContentVerifyTasks(t *testing.T) {
+	ctx := context.Background()
+	files := newFakeFileService()
+	tasks := newFakeTaskService()
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	router := NewRouterWithTasks(
+		logger, files, newFakeAuthService(), tasks, newFakeTaskSnapshots(),
+	)
+
+	uploaded, err := files.Upload(ctx, testUserAID, "", "legacy.bin", strings.NewReader("payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := files.CreateDirectory(ctx, testUserAID, "", "folder")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name       string
+		body       string
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:       "accepted",
+			body:       fmt.Sprintf(`{"file_ids":["%s"]}`, uploaded.ID),
+			wantStatus: http.StatusAccepted,
+		},
+		{
+			name:       "empty file ids",
+			body:       `{"file_ids":[]}`,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "invalid_request",
+		},
+		{
+			name:       "missing file",
+			body:       `{"file_ids":["missing"]}`,
+			wantStatus: http.StatusNotFound,
+			wantCode:   "file_not_found",
+		},
+		{
+			name:       "directory",
+			body:       fmt.Sprintf(`{"file_ids":["%s"]}`, directory.ID),
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "invalid_request",
+		},
+		{
+			name:       "pending limit",
+			body:       fmt.Sprintf(`{"file_ids":["%s"]}`, uploaded.ID),
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "task_limit",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tasks.mu.Lock()
+			tasks.submitErr = nil
+			if c.name == "pending limit" {
+				tasks.submitErr = task.ErrTooManyPending
+			}
+			tasks.mu.Unlock()
+
+			recorder := httptest.NewRecorder()
+			req := taskRequest(http.MethodPost, "/api/content-verify-tasks", c.body, testTokenA)
+			router.ServeHTTP(recorder, req)
+
+			if recorder.Code != c.wantStatus {
+				t.Fatalf("status = %d, want %d: %s",
+					recorder.Code, c.wantStatus, recorder.Body.String())
+			}
+			if c.wantCode != "" {
+				assertErrorCode(t, recorder, c.wantCode)
+			}
+		})
+	}
+
+	// 成功提交时每个文件一条任务，类型和状态参数都必须正确。
+	tasks.mu.Lock()
+	submitted := append([]task.CreateParams(nil), tasks.submitted...)
+	tasks.mu.Unlock()
+	if len(submitted) != 1 {
+		t.Fatalf("submitted %d tasks, want 1", len(submitted))
+	}
+	if submitted[0].Type != verify.TaskType ||
+		submitted[0].OwnerID != testUserAID ||
+		submitted[0].StateVersion != verify.StateVersion ||
+		!strings.Contains(submitted[0].StateJSON, uploaded.ID) {
+		t.Fatalf("submitted task params = %+v", submitted[0])
+	}
+}
+
+func TestGetTaskExposesWorkerAttemptAndResult(t *testing.T) {
+	tasks := newFakeTaskService()
+	snapshots := newFakeTaskSnapshots()
+	lease := time.Now().Add(time.Minute)
+	tasks.setTask(model.Task{
+		ID:         "task-lease",
+		OwnerID:    testUserAID,
+		Status:     model.TaskStatusRunning,
+		Phase:      "verify",
+		WorkerID:   "worker-a",
+		Attempts:   2,
+		LeaseUntil: &lease,
+		ResultJSON: `{"sha256":"abc","size":7}`,
+	})
+
+	router := newTaskRouter(t, tasks, snapshots)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, taskRequest(
+		http.MethodGet, "/api/tasks/task-lease", "", testTokenA,
+	))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var record taskStatusResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.WorkerID != "worker-a" || record.Attempt != 2 ||
+		record.LeaseUntil == nil || !record.LeaseUntil.Equal(lease) {
+		t.Fatalf("worker fields = %+v", record)
+	}
+	result, ok := record.Result.(map[string]any)
+	if !ok || result["sha256"] != "abc" {
+		t.Fatalf("result = %#v", record.Result)
 	}
 }

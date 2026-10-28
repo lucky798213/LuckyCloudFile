@@ -219,6 +219,17 @@ func (f *fakeFileService) Open(ctx context.Context, ownerID int, id string) (fil
 	return record, io.NopCloser(bytes.NewReader(f.contents[id])), nil
 }
 
+func (f *fakeFileService) OwnedFile(ctx context.Context, ownerID int, id string) (file.File, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	record, ok := f.records[id]
+	if !ok || f.owners[id] != ownerID {
+		return file.File{}, file.ErrNotFound
+	}
+	return record, nil
+}
+
 func (f *fakeFileService) Delete(ctx context.Context, ownerID int, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
