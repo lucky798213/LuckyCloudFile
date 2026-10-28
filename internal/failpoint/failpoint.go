@@ -33,3 +33,23 @@ func Hit(name string) {
 		time.Sleep(time.Hour)
 	}
 }
+
+// Sleep 在 CLOUDREVE_FAILPOINT 等于 name 时睡眠 d。
+//
+// 它用于演示租约接管：让一个 worker 在提交结果之前停住，外部再暂停
+// （SIGSTOP）或杀掉（SIGKILL）这个进程。正常启动不设置变量，不影响运行。
+//
+// CLOUDREVE_FAILPOINT_DELAY 可以覆盖时长（例如 "30s"），让演示配合
+// 更短的租约。和 Hit 不同，Sleep 会自己醒来，所以恢复后的旧 worker
+// 仍会尝试提交结果，可以用它验证“旧结果被拒绝”。
+func Sleep(name string, d time.Duration) {
+	if os.Getenv("CLOUDREVE_FAILPOINT") != name {
+		return
+	}
+	if raw := os.Getenv("CLOUDREVE_FAILPOINT_DELAY"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			d = parsed
+		}
+	}
+	time.Sleep(d)
+}
