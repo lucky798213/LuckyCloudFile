@@ -43,6 +43,7 @@ type fileService interface {
 	UploadSessionChunk(ctx context.Context, ownerID int, sessionID string, index int, r io.Reader) (file.UploadSessionInfo, error)
 	CompleteUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error)
 	CancelUploadSession(ctx context.Context, ownerID int, sessionID string) (file.UploadSessionInfo, error)
+	InstantUpload(ctx context.Context, ownerID int, parentID, name string, size int64, sha256, idempotencyKey string) (file.InstantUploadResult, error)
 }
 
 // NewRouter 创建不带 ZIP 任务接口的路由。
@@ -105,6 +106,8 @@ func newRouter(
 	// 文件上传：请求体是 multipart/form-data，文件放在 file 字段里；
 	// parent_id 是查询参数，不传表示当前用户的根目录。
 	protected.POST("/files", uploadFile(logger, fileService))
+	// 秒传：只提交元数据，命中已有内容时直接创建 File，不上传字节。
+	protected.POST("/files/instant-upload", instantUpload(logger, fileService))
 	// 目录列表：GET /api/files?parent_id=...&page=1&page_size=20
 	protected.GET("/files", listFiles(logger, fileService))
 	// 文件下载和删除：:id 是上传时返回的服务端 ID，且必须属于当前用户。

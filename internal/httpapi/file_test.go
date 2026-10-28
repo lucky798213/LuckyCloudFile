@@ -48,6 +48,11 @@ type fakeFileService struct {
 	// roots 是“用户根目录”的 ID → 用户 ID。假实现不把根目录放进 records，
 	// 只用来验证根目录不能被改名。
 	roots map[string]int
+
+	// 秒传接口的假响应，供 HTTP 层测试直接指定命中或错误。
+	instantResult *file.InstantUploadResult
+	instantErr    error
+	instantKey    string
 }
 
 func newFakeFileService() *fakeFileService {
@@ -609,6 +614,26 @@ func (f *fakeFileService) CancelUploadSession(ctx context.Context, ownerID int, 
 	session.content = nil
 	f.sessions[sessionID] = session
 	return session.info, nil
+}
+
+func (f *fakeFileService) InstantUpload(
+	ctx context.Context,
+	ownerID int,
+	parentID, name string,
+	size int64,
+	sha256, idempotencyKey string,
+) (file.InstantUploadResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.instantKey = idempotencyKey
+	if f.instantErr != nil {
+		return file.InstantUploadResult{}, f.instantErr
+	}
+	if f.instantResult != nil {
+		return *f.instantResult, nil
+	}
+	return file.InstantUploadResult{}, nil
 }
 
 func (f *fakeFileService) stored(id string) ([]byte, bool) {
