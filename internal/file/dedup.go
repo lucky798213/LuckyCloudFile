@@ -22,6 +22,9 @@ const contentPublishAttempts = 3
 var errContentKeyRace = errors.New("content key was created concurrently")
 
 // lookupContentKey 在当前用户、当前策略作用域内查找内容映射。
+//
+// 使用锁定读而不是普通快照读：发布事务可能在这笔事务建立快照之后、
+// 取得用户行锁之前提交了映射，锁定读能等待并读到最新提交结果。
 func lookupContentKey(
 	tx *gorm.DB,
 	ownerID, policyID int,
@@ -29,7 +32,7 @@ func lookupContentKey(
 	size int64,
 ) (*model.ContentKey, error) {
 	var key model.ContentKey
-	err := tx.Where(
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
 		"owner_id = ? AND storage_policy_id = ? AND sha256 = ? AND size = ?",
 		ownerID, policyID, digest, size,
 	).First(&key).Error

@@ -52,7 +52,7 @@ func prepareLegacySchema(t *testing.T, dsn string) {
 
 	statements := []string{
 		"SET FOREIGN_KEY_CHECKS = 0",
-		"DROP TABLE IF EXISTS task_results, tasks, upload_sessions, auth_sessions, files, entities, users, storage_policies, schema_migrations",
+		"DROP TABLE IF EXISTS instant_upload_requests, content_keys, task_results, tasks, upload_sessions, auth_sessions, files, entities, users, storage_policies, schema_migrations",
 		"SET FOREIGN_KEY_CHECKS = 1",
 		`CREATE TABLE users (
 			id BIGINT NOT NULL AUTO_INCREMENT,
@@ -280,7 +280,7 @@ func resetMigrationSchema(t *testing.T, dsn string) {
 	}
 	for _, statement := range []string{
 		"SET FOREIGN_KEY_CHECKS = 0",
-		"DROP TABLE IF EXISTS task_results, tasks, upload_sessions, auth_sessions, files, entities, users, storage_policies, schema_migrations",
+		"DROP TABLE IF EXISTS instant_upload_requests, content_keys, task_results, tasks, upload_sessions, auth_sessions, files, entities, users, storage_policies, schema_migrations",
 		"SET FOREIGN_KEY_CHECKS = 1",
 	} {
 		if _, err := conn.Exec(statement); err != nil {
