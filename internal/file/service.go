@@ -6,6 +6,7 @@ package file
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -247,16 +248,19 @@ func (s *Service) Upload(ctx context.Context, ownerID int, parentID, name string
 	targetParentID := target.Ancestors[len(target.Ancestors)-1].ID
 
 	// 先落盘。写入失败时数据库还没动过，直接返回即可。
-	size, err := store.Save(ctx, storageKey, r, MaxUploadBytes)
+	// TeeReader 让摘要和内容写入共用同一次读取，不额外占用内存。
+	hasher := sha256.New()
+	size, err := store.Save(ctx, storageKey, io.TeeReader(r, hasher), MaxUploadBytes)
 	if err != nil {
 		if errors.Is(err, storage.ErrTooLarge) {
 			return File{}, ErrTooLarge
 		}
 		return File{}, err
 	}
+	digest := sumSHA256(hasher)
 
 	// 再写数据库。失败就删除已写入的内容，保证两边一致。
-	if err := s.saveRecords(ctx, ownerID, targetParentID, fileID, storageKey, policyID, name, size, target); err != nil {
+	if err := s.saveRecords(ctx, ownerID, targetParentID, fileID, storageKey, policyID, name, size, digest, target); err != nil {
 		// 补偿删除不能复用请求的 ctx：客户端断开或超时后 ctx 已经被取消，
 		// Remove 会立刻返回取消错误，内容就永远留在存储里了。
 		// 用 WithoutCancel 保留值但去掉取消/超时，再套一个独立的有限超时。
@@ -324,7 +328,7 @@ func (s *Service) uploadStore(ctx context.Context, ownerID int) (int, storage.St
 // 再用一条受条件约束的 UPDATE 把实际大小加进 used_bytes。容量不足时
 // 整个事务回滚，调用方会删除已经落盘的内容（见 Upload 的补偿删除）。
 // 加锁顺序和所有容量事务一致：User → Entity → File。
-func (s *Service) saveRecords(ctx context.Context, ownerID int, parentID, fileID, storageKey string, policyID int, name string, size int64, target pathSnapshot) error {
+func (s *Service) saveRecords(ctx context.Context, ownerID int, parentID, fileID, storageKey string, policyID int, name string, size int64, digest string, target pathSnapshot) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := verifyPathSnapshotWith(ctx, tx, target); err != nil {
 			return err
@@ -344,6 +348,7 @@ func (s *Service) saveRecords(ctx context.Context, ownerID int, parentID, fileID
 		entity := model.Entity{
 			StorageKey:      storageKey,
 			Size:            size,
+			ContentSHA256:   &digest,
 			StoragePolicyID: policyID,
 			RefCount:        1,
 			// 新内容一定可以被引用。以后做去重、复用现有 Entity 时，

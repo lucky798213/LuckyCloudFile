@@ -2,6 +2,7 @@ package file
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -135,7 +136,16 @@ func (s *Service) UploadSessionContent(
 
 	// 按声明大小读取，最多多读 1 个字节来发现“多传”。
 	// 使用登记时创建的子 context：取消接口会让它停止读取。
-	actualSize, err := store.Save(uploadCtx, entity.StorageKey, r, session.ExpectedSize)
+	//
+	// 摘要和写入共用同一次读取：TeeReader 把经过的字节同时交给 hasher，
+	// 不需要再把整个文件读进内存。只有 Save 成功且长度正确，摘要才会落库。
+	hasher := sha256.New()
+	actualSize, err := store.Save(
+		uploadCtx,
+		entity.StorageKey,
+		io.TeeReader(r, hasher),
+		session.ExpectedSize,
+	)
 	if err != nil {
 		if errors.Is(err, storage.ErrTooLarge) {
 			err = ErrUploadSizeMismatch
@@ -150,7 +160,8 @@ func (s *Service) UploadSessionContent(
 		)
 	}
 
-	info, err := s.markUploadSessionReady(ctx, ownerID, session, actualSize)
+	digest := sumSHA256(hasher)
+	info, err := s.markUploadSessionReady(ctx, ownerID, session, actualSize, digest)
 	if err == nil {
 		return info, nil
 	}
@@ -222,7 +233,7 @@ func (s *Service) claimUploadSession(ctx context.Context, ownerID int, sessionID
 }
 
 // markUploadSessionReady 在一个短事务里完成收尾：
-// Session 变成 ready、ActualSize 记录实际大小、Entity.Size 同步更新。
+// Session 变成 ready、ActualSize 记录实际大小、Entity.Size 和可信摘要同步更新。
 //
 // Entity 仍然是 uploading / ref_count=0：正式发布留给确认完成接口。
 func (s *Service) markUploadSessionReady(
@@ -230,6 +241,7 @@ func (s *Service) markUploadSessionReady(
 	ownerID int,
 	session *model.UploadSession,
 	actualSize int64,
+	digest string,
 ) (UploadSessionInfo, error) {
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		updated := tx.Model(&model.UploadSession{}).
@@ -265,10 +277,17 @@ func (s *Service) markUploadSessionReady(
 			}
 			return fmt.Errorf("lock upload placeholder entity: %w", err)
 		}
-		if entity.Size != actualSize {
+		// 大小和摘要必须一起对齐；重复收尾时即使值没变也直接跳过，
+		// 避免把 MySQL 的“0 行受影响”误判成失败。
+		if entity.Size != actualSize ||
+			entity.ContentSHA256 == nil ||
+			*entity.ContentSHA256 != digest {
 			if err := tx.Model(&model.Entity{}).
 				Where("id = ?", entity.ID).
-				UpdateColumn("size", actualSize).Error; err != nil {
+				UpdateColumns(map[string]any{
+					"size":           actualSize,
+					"content_sha256": digest,
+				}).Error; err != nil {
 				return fmt.Errorf("update upload placeholder entity: %w", err)
 			}
 		}

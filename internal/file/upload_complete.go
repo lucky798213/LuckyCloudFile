@@ -441,7 +441,20 @@ func (s *Service) prepareChunkedCompletion(
 		}
 	}
 
-	return s.markChunkedUploadReady(ctx, ownerID, session, entity.ID)
+	// 分片摘要不能拼成整文件摘要：合并完成后按文件顺序重新读一遍内容。
+	// 第一次收尾就把摘要写进 Entity，后续重试直接复用，不再多读对象。
+	digest := ""
+	if entity.ContentSHA256 != nil {
+		digest = *entity.ContentSHA256
+	}
+	if digest == "" {
+		digest, err = hashStoredContent(ctx, store, entity.StorageKey, session.ExpectedSize)
+		if err != nil {
+			return fmt.Errorf("hash finalized chunk content: %w", err)
+		}
+	}
+
+	return s.markChunkedUploadReady(ctx, ownerID, session, entity.ID, digest)
 }
 
 // verifyChunkProgress 用账本确认内容完整：编号必须恰好覆盖 [0, chunkCount)，
@@ -508,6 +521,7 @@ func (s *Service) markChunkedUploadReady(
 	ownerID int,
 	session *model.UploadSession,
 	entityID int64,
+	digest string,
 ) error {
 	now := time.Now()
 
@@ -543,10 +557,15 @@ func (s *Service) markChunkedUploadReady(
 			}
 			return fmt.Errorf("lock upload placeholder entity: %w", err)
 		}
-		if entity.Size != current.ExpectedSize {
+		if entity.Size != current.ExpectedSize ||
+			entity.ContentSHA256 == nil ||
+			*entity.ContentSHA256 != digest {
 			if err := tx.Model(&model.Entity{}).
 				Where("id = ?", entity.ID).
-				UpdateColumn("size", current.ExpectedSize).Error; err != nil {
+				UpdateColumns(map[string]any{
+					"size":           current.ExpectedSize,
+					"content_sha256": digest,
+				}).Error; err != nil {
 				return fmt.Errorf("update upload placeholder entity: %w", err)
 			}
 		}
