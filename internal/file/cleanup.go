@@ -259,6 +259,14 @@ func (s *Service) prepareCleanup(ctx context.Context, entityID int64) (int, stri
 // 即使这一行在磁盘删除期间被改动，也不会误删仍可能被引用的内容。
 // RowsAffected == 0 表示别的扫描已经删掉了，按成功处理。
 func (s *Service) deleteCleanedEntity(ctx context.Context, entityID int64) error {
+	// 内容映射和 Entity 一起收尾。Delete 在最后一个引用消失时已经删过；
+	// 这里再删一次是幂等的，也能清掉崩溃或人工修复留下的悬空映射。
+	if err := s.db.WithContext(ctx).
+		Where("entity_id = ?", entityID).
+		Delete(&model.ContentKey{}).Error; err != nil {
+		return fmt.Errorf("delete content key of cleaned entity %d: %w", entityID, err)
+	}
+
 	result := s.db.WithContext(ctx).
 		Where("id = ? AND status = ? AND ref_count = 0", entityID, model.EntityStatusPendingDelete).
 		Where("NOT EXISTS (SELECT 1 FROM files WHERE files.entity_id = ?)", entityID).

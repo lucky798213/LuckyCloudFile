@@ -329,53 +329,89 @@ func (s *Service) uploadStore(ctx context.Context, ownerID int) (int, storage.St
 // 整个事务回滚，调用方会删除已经落盘的内容（见 Upload 的补偿删除）。
 // 加锁顺序和所有容量事务一致：User → Entity → File。
 func (s *Service) saveRecords(ctx context.Context, ownerID int, parentID, fileID, storageKey string, policyID int, name string, size int64, digest string, target pathSnapshot) error {
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := verifyPathSnapshotWith(ctx, tx, target); err != nil {
-			return err
-		}
-		if _, err := quota.LockUser(tx, ownerID); err != nil {
-			return err
-		}
-		if _, err := queryDirectory(ctx, tx, ownerID, parentID); err != nil {
-			return err
-		}
+	var leftoverID int64
+	var err error
 
-		// 用实际写入的大小计费，不信任客户端声明的任何值。
-		if err := quota.Consume(tx, ownerID, size); err != nil {
-			return err
-		}
-
-		entity := model.Entity{
-			StorageKey:      storageKey,
-			Size:            size,
-			ContentSHA256:   &digest,
-			StoragePolicyID: policyID,
-			RefCount:        1,
-			// 新内容一定可以被引用。以后做去重、复用现有 Entity 时，
-			// 必须先锁住 Entity 并确认它仍是 active，pending_delete 不允许再加引用。
-			Status: model.EntityStatusActive,
-		}
-		// Create 会把自增 ID 回填到 entity.ID，下面 File 要用。
-		if err := tx.Create(&entity).Error; err != nil {
-			return fmt.Errorf("create entity: %w", err)
-		}
-
-		record := model.File{
-			ID:       fileID,
-			Name:     name,
-			Kind:     model.KindFile,
-			ParentID: &parentID,
-			EntityID: &entity.ID,
-			OwnerID:  ownerID,
-		}
-		if err := tx.Create(&record).Error; err != nil {
-			if errors.Is(err, gorm.ErrDuplicatedKey) {
-				return ErrAlreadyExists
+	for attempt := 0; attempt < contentPublishAttempts; attempt++ {
+		leftoverID = 0
+		err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := verifyPathSnapshotWith(ctx, tx, target); err != nil {
+				return err
 			}
-			return fmt.Errorf("create file: %w", err)
+			if _, err := quota.LockUser(tx, ownerID); err != nil {
+				return err
+			}
+			if _, err := queryDirectory(ctx, tx, ownerID, parentID); err != nil {
+				return err
+			}
+
+			// 用实际写入的大小计费，不信任客户端声明的任何值。
+			// 无论复用已有内容还是登记新内容，逻辑文件都只计一份大小。
+			if err := quota.Consume(tx, ownerID, size); err != nil {
+				return err
+			}
+
+			// 先尝试复用同一用户、同一策略下已经登记过的内容。
+			// 命中时本次写入的物理对象就是多余的，登记成 pending_delete
+			// 交给现有 GC；事务提交后再立即尝试删一次。
+			reused, err := reuseExistingContent(
+				tx, ownerID, parentID, fileID, name, policyID, digest, size,
+			)
+			if err != nil {
+				return err
+			}
+			if reused {
+				leftoverID, err = insertDiscardableEntity(
+					tx, storageKey, size, policyID, digest,
+				)
+				return err
+			}
+
+			entity := model.Entity{
+				StorageKey:      storageKey,
+				Size:            size,
+				ContentSHA256:   &digest,
+				StoragePolicyID: policyID,
+				RefCount:        1,
+				// 新内容一定可以被引用。以后做去重、复用现有 Entity 时，
+				// 必须先锁住 Entity 并确认它仍是 active，pending_delete 不允许再加引用。
+				Status: model.EntityStatusActive,
+			}
+			// Create 会把自增 ID 回填到 entity.ID，下面 File 要用。
+			if err := tx.Create(&entity).Error; err != nil {
+				return fmt.Errorf("create entity: %w", err)
+			}
+
+			record := model.File{
+				ID:       fileID,
+				Name:     name,
+				Kind:     model.KindFile,
+				ParentID: &parentID,
+				EntityID: &entity.ID,
+				OwnerID:  ownerID,
+			}
+			if err := tx.Create(&record).Error; err != nil {
+				if errors.Is(err, gorm.ErrDuplicatedKey) {
+					return ErrAlreadyExists
+				}
+				return fmt.Errorf("create file: %w", err)
+			}
+
+			// File 已经占住这个实体，最后再登记内容映射。
+			// 唯一键冲突说明另一个事务先提交了映射：整笔事务回滚后重试，
+			// 重试时会读到获胜实体并走复用路径。
+			return insertContentKey(tx, ownerID, policyID, digest, size, entity.ID)
+		})
+		if !errors.Is(err, errContentKeyRace) {
+			break
 		}
-		return nil
-	})
+	}
+	if err != nil {
+		return err
+	}
+
+	s.cleanPublishedLeftover(ctx, leftoverID)
+	return nil
 }
 
 // Copy 在 parentID（为空表示根目录）下创建 id 文件的一份副本，副本名为 name。
@@ -1062,7 +1098,16 @@ func (s *Service) Delete(ctx context.Context, ownerID int, id string) error {
 				return nil
 			}
 
-			// 最后一个引用也删掉了。这里不删 Entity，只标记 pending_delete，
+			// 最后一个引用也删掉了。先撤掉内容映射，再标记 pending_delete：
+			// 映射只能指向可引用的 active 内容，不能留给下一次上传去解析
+			// 一份正在等待物理删除的对象。
+			if err := tx.WithContext(ctx).
+				Where("entity_id = ?", entity.ID).
+				Delete(&model.ContentKey{}).Error; err != nil {
+				return fmt.Errorf("delete content key of entity %d: %w", entity.ID, err)
+			}
+
+			// 这里不删 Entity，只标记 pending_delete，
 			// 交给 cleanup.go 在事务提交后删物理对象；这样两个崩溃点都能收敛。
 			marked := tx.WithContext(ctx).
 				Model(&model.Entity{}).

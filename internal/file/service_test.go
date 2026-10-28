@@ -191,7 +191,7 @@ func clearTables(t *testing.T, db *gorm.DB) {
 		if err := conn.Exec("SET FOREIGN_KEY_CHECKS = 0").Error; err != nil {
 			return err
 		}
-		for _, table := range []string{"task_results", "upload_sessions", "auth_sessions", "files", "entities", "users"} {
+		for _, table := range []string{"instant_upload_requests", "content_keys", "task_results", "upload_sessions", "auth_sessions", "files", "entities", "users"} {
 			if err := conn.Exec("DELETE FROM " + table).Error; err != nil {
 				_ = conn.Exec("SET FOREIGN_KEY_CHECKS = 1").Error
 				return err

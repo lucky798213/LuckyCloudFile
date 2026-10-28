@@ -126,201 +126,260 @@ func (s *Service) CompleteUploadSession(
 	}
 
 	var (
-		completed UploadSessionInfo
-		fileID    string
+		completed  UploadSessionInfo
+		fileID     string
+		leftoverID int64
 	)
 
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 先锁用户、再锁会话：和取消、过期、重启恢复保持同一个加锁顺序。
-		if _, err := quota.LockUser(tx, ownerID); err != nil {
-			return err
-		}
+	for attempt := 0; attempt < contentPublishAttempts; attempt++ {
+		completed = UploadSessionInfo{}
+		fileID = ""
+		leftoverID = 0
 
-		// 并发的完成请求会在会话这一行上排队：
-		// 后到的请求等到前一个提交后读到 completed，直接返回同一个结果文件。
-		var session model.UploadSession
-		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ? AND owner_id = ?", sessionID, ownerID).
-			First(&session).Error
-		if err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrUploadSessionNotFound
+		err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			// 先锁用户、再锁会话：和取消、过期、重启恢复保持同一个加锁顺序。
+			if _, err := quota.LockUser(tx, ownerID); err != nil {
+				return err
 			}
-			return fmt.Errorf("lock upload session: %w", err)
-		}
 
-		plan, err := upload.PlanCompletion(&session)
-		if err != nil {
-			return err
-		}
-		// 已经完成过：先判断 completed，再检查过期。
-		// 上传结果一旦发布，即使会话后来过期，重复确认也应返回原文件 ID。
-		if !plan.CreateFile {
+			// 并发的完成请求会在会话这一行上排队：
+			// 后到的请求等到前一个提交后读到 completed，直接返回同一个结果文件。
+			var session model.UploadSession
+			err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND owner_id = ?", sessionID, ownerID).
+				First(&session).Error
+			if err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return ErrUploadSessionNotFound
+				}
+				return fmt.Errorf("lock upload session: %w", err)
+			}
+
+			plan, err := upload.PlanCompletion(&session)
+			if err != nil {
+				return err
+			}
+			// 已经完成过：先判断 completed，再检查过期。
+			// 上传结果一旦发布，即使会话后来过期，重复确认也应返回原文件 ID。
+			if !plan.CreateFile {
+				completed = toUploadSessionInfo(session)
+				return nil
+			}
+
+			// 首次完成只允许 ready，而且必须在有效期内。
+			if !session.ExpiresAt.After(time.Now()) {
+				return ErrUploadSessionExpired
+			}
+
+			// 接收内容期间目录可能被删除、改名或换到别人名下，事务内必须重新核对。
+			if _, err := queryDirectory(ctx, tx, ownerID, session.ParentID); err != nil {
+				return err
+			}
+
+			// 保持“先 Session 再 Entity”的加锁顺序，和内容收尾、核对流程一致。
+			var entity model.Entity
+			err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				First(&entity, session.EntityID).Error
+			if err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return fmt.Errorf(
+						"%w: placeholder entity %d not found",
+						ErrUploadSessionConflict, session.EntityID,
+					)
+				}
+				return fmt.Errorf("lock upload placeholder entity: %w", err)
+			}
+			if entity.Status != model.EntityStatusUploading || entity.RefCount != 0 {
+				return fmt.Errorf(
+					"%w: entity %d is %s/%d, want uploading/0",
+					ErrUploadSessionConflict, entity.ID, entity.Status, entity.RefCount,
+				)
+			}
+			// 客户端创建会话时声明的大小、实际收到的大小、Entity 记录的大小
+			// 必须完全一致，否则不能把这份内容发布成正式文件。
+			if session.ExpectedSize != session.ActualSize || session.ActualSize != entity.Size {
+				return fmt.Errorf(
+					"%w: expected_size=%d actual_size=%d entity_size=%d",
+					ErrUploadSessionConflict,
+					session.ExpectedSize, session.ActualSize, entity.Size,
+				)
+			}
+			// 预留量必须正好覆盖这次要发布的内容。少了就说明账目和内容对不上，
+			// 不能“先发布、以后再补”：那会让 used+reserved 越过配额上界。
+			if session.ReservedBytes != entity.Size {
+				return fmt.Errorf(
+					"%w: reserved_bytes=%d entity_size=%d",
+					ErrUploadSessionConflict, session.ReservedBytes, entity.Size,
+				)
+			}
+
+			// 空的分片会话没有调用过分片接口，磁盘上还没有对象；直接发布会让
+			// 完成后的文件下载不到。发布前幂等地补一个 0 字节对象。
+			//
+			// 用 Save 写空内容：同一个 key 重复写结果仍然是 0 字节，重试完成
+			// 不会产生多份内容。放在事务内是为了和会话/Entity 的发布共用同一个
+			// 提交边界，避免取消或过期清理与这次补写交错。
+			if session.ExpectedSize == 0 {
+				store, err := s.stores.Get(entity.StoragePolicyID)
+				if err != nil {
+					return fmt.Errorf(
+						"resolve storage policy %d for empty upload session %s: %w",
+						entity.StoragePolicyID, session.ID, err,
+					)
+				}
+				if _, err := store.Save(ctx, entity.StorageKey, bytes.NewReader(nil), 0); err != nil {
+					return fmt.Errorf("create empty upload content: %w", err)
+				}
+			}
+
+			// 先把预留转成已用。它和创建 File、激活/复用 Entity、标记 completed
+			// 在同一个事务里，失败时全部回滚，预留仍然保留，客户端可以重试完成。
+			if err := quota.Settle(tx, ownerID, session.ReservedBytes); err != nil {
+				return err
+			}
+
+			// 文件名字、目录、所有者都来自会话，完成时不允许客户端重新指定。
+			fileID, err = idgen.New()
+			if err != nil {
+				return err
+			}
+
+			// 摘要只由服务端在内容收尾时写入；历史会话没有摘要时跳过去重，
+			// 仍按原来的路径把本次占位实体激活，避免把空摘要写进内容映射。
+			digest := ""
+			if entity.ContentSHA256 != nil {
+				digest = *entity.ContentSHA256
+			}
+
+			reused := false
+			if digest != "" {
+				reused, err = reuseExistingContent(
+					tx, ownerID, session.ParentID, fileID, session.Name,
+					entity.StoragePolicyID, digest, entity.Size,
+				)
+				if err != nil {
+					return err
+				}
+			}
+
+			if reused {
+				// 本次上传的占位内容与已有内容重复：File 已经指向获胜实体，
+				// 这里把占位实体标记为待清理，事务提交后由 GC 删除物理对象。
+				discarded := tx.Model(&model.Entity{}).
+					Where("id = ? AND status = ? AND ref_count = 0",
+						entity.ID, model.EntityStatusUploading).
+					UpdateColumn("status", model.EntityStatusPendingDelete)
+				if discarded.Error != nil {
+					return fmt.Errorf("mark duplicate upload entity for deletion: %w", discarded.Error)
+				}
+				if discarded.RowsAffected != 1 {
+					return fmt.Errorf(
+						"%w: duplicate entity %d changed while completing",
+						ErrUploadSessionConflict, entity.ID,
+					)
+				}
+				leftoverID = entity.ID
+			} else {
+				entityID := entity.ID
+				parentID := session.ParentID
+				record := model.File{
+					ID:       fileID,
+					Name:     session.Name,
+					Kind:     model.KindFile,
+					ParentID: &parentID,
+					EntityID: &entityID,
+					OwnerID:  session.OwnerID,
+				}
+				// 同一目录同名由唯一索引兜底：冲突时整个事务回滚，
+				// 会话仍是 ready，已经传好的物理内容不会被删除。
+				if err := tx.Create(&record).Error; err != nil {
+					if errors.Is(err, gorm.ErrDuplicatedKey) {
+						return ErrAlreadyExists
+					}
+					return fmt.Errorf("create file: %w", err)
+				}
+
+				// 占位内容正式激活：引用计数从 0 变成 1。
+				activated := tx.Model(&model.Entity{}).
+					Where("id = ? AND status = ? AND ref_count = 0",
+						entity.ID, model.EntityStatusUploading).
+					UpdateColumns(map[string]any{
+						"status":    model.EntityStatusActive,
+						"ref_count": 1,
+					})
+				if activated.Error != nil {
+					return fmt.Errorf("activate upload entity: %w", activated.Error)
+				}
+				if activated.RowsAffected != 1 {
+					return fmt.Errorf(
+						"%w: entity %d changed while completing",
+						ErrUploadSessionConflict, entity.ID,
+					)
+				}
+
+				if digest != "" {
+					if err := insertContentKey(
+						tx, ownerID, entity.StoragePolicyID, digest, entity.Size, entity.ID,
+					); err != nil {
+						return err
+					}
+				}
+			}
+
+			marked := tx.Model(&model.UploadSession{}).
+				Where("id = ? AND owner_id = ? AND status = ?",
+					session.ID, ownerID, model.UploadStatusReady).
+				UpdateColumns(map[string]any{
+					"status":         model.UploadStatusCompleted,
+					"result_file_id": fileID,
+					"reserved_bytes": 0,
+				})
+			if marked.Error != nil {
+				return fmt.Errorf("complete upload session: %w", marked.Error)
+			}
+			if marked.RowsAffected != 1 {
+				return fmt.Errorf(
+					"%w: upload session %s is no longer ready",
+					ErrUploadSessionConflict, session.ID,
+				)
+			}
+
+			// 任务发布会话：task_results 必须和 File、Entity、容量结算在同一个
+			// 事务里提交。提交成功后，即使任务检查点还没保存，重启也能查到
+			// 这份结果并收敛，不会再发布第二份文件。
+			if session.TaskID != nil && *session.TaskID != "" {
+				result := model.TaskResult{
+					TaskID:  *session.TaskID,
+					OwnerID: ownerID,
+					FileID:  fileID,
+				}
+				if err := tx.Create(&result).Error; err != nil {
+					if errors.Is(err, gorm.ErrDuplicatedKey) {
+						// 另一个执行者已经发布了结果：整笔新发布回滚，
+						// 交给调用方查询已有结果并取消本次会话。
+						return ErrTaskResultExists
+					}
+					return fmt.Errorf("record task result: %w", err)
+				}
+			}
+
+			session.Status = model.UploadStatusCompleted
+			session.ResultFileID = &fileID
+			session.ReservedBytes = 0
 			completed = toUploadSessionInfo(session)
 			return nil
+		})
+		if !errors.Is(err, errContentKeyRace) {
+			break
 		}
-
-		// 首次完成只允许 ready，而且必须在有效期内。
-		if !session.ExpiresAt.After(time.Now()) {
-			return ErrUploadSessionExpired
-		}
-
-		// 接收内容期间目录可能被删除、改名或换到别人名下，事务内必须重新核对。
-		if _, err := queryDirectory(ctx, tx, ownerID, session.ParentID); err != nil {
-			return err
-		}
-
-		// 保持“先 Session 再 Entity”的加锁顺序，和内容收尾、核对流程一致。
-		var entity model.Entity
-		err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			First(&entity, session.EntityID).Error
-		if err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return fmt.Errorf(
-					"%w: placeholder entity %d not found",
-					ErrUploadSessionConflict, session.EntityID,
-				)
-			}
-			return fmt.Errorf("lock upload placeholder entity: %w", err)
-		}
-		if entity.Status != model.EntityStatusUploading || entity.RefCount != 0 {
-			return fmt.Errorf(
-				"%w: entity %d is %s/%d, want uploading/0",
-				ErrUploadSessionConflict, entity.ID, entity.Status, entity.RefCount,
-			)
-		}
-		// 客户端创建会话时声明的大小、实际收到的大小、Entity 记录的大小
-		// 必须完全一致，否则不能把这份内容发布成正式文件。
-		if session.ExpectedSize != session.ActualSize || session.ActualSize != entity.Size {
-			return fmt.Errorf(
-				"%w: expected_size=%d actual_size=%d entity_size=%d",
-				ErrUploadSessionConflict,
-				session.ExpectedSize, session.ActualSize, entity.Size,
-			)
-		}
-		// 预留量必须正好覆盖这次要发布的内容。少了就说明账目和内容对不上，
-		// 不能“先发布、以后再补”：那会让 used+reserved 越过配额上界。
-		if session.ReservedBytes != entity.Size {
-			return fmt.Errorf(
-				"%w: reserved_bytes=%d entity_size=%d",
-				ErrUploadSessionConflict, session.ReservedBytes, entity.Size,
-			)
-		}
-
-		// 空的分片会话没有调用过分片接口，磁盘上还没有对象；直接发布会让
-		// 完成后的文件下载不到。发布前幂等地补一个 0 字节对象。
-		//
-		// 用 Save 写空内容：同一个 key 重复写结果仍然是 0 字节，重试完成
-		// 不会产生多份内容。放在事务内是为了和会话/Entity 的发布共用同一个
-		// 提交边界，避免取消或过期清理与这次补写交错。
-		if session.ExpectedSize == 0 {
-			store, err := s.stores.Get(entity.StoragePolicyID)
-			if err != nil {
-				return fmt.Errorf(
-					"resolve storage policy %d for empty upload session %s: %w",
-					entity.StoragePolicyID, session.ID, err,
-				)
-			}
-			if _, err := store.Save(ctx, entity.StorageKey, bytes.NewReader(nil), 0); err != nil {
-				return fmt.Errorf("create empty upload content: %w", err)
-			}
-		}
-
-		// 先把预留转成已用。它和创建 File、激活 Entity、标记 completed
-		// 在同一个事务里，失败时全部回滚，预留仍然保留，客户端可以重试完成。
-		if err := quota.Settle(tx, ownerID, session.ReservedBytes); err != nil {
-			return err
-		}
-
-		// 文件名字、目录、所有者都来自会话，完成时不允许客户端重新指定。
-		fileID, err = idgen.New()
-		if err != nil {
-			return err
-		}
-		entityID := entity.ID
-		parentID := session.ParentID
-		record := model.File{
-			ID:       fileID,
-			Name:     session.Name,
-			Kind:     model.KindFile,
-			ParentID: &parentID,
-			EntityID: &entityID,
-			OwnerID:  session.OwnerID,
-		}
-		// 同一目录同名由唯一索引兜底：冲突时整个事务回滚，
-		// 会话仍是 ready，已经传好的物理内容不会被删除。
-		if err := tx.Create(&record).Error; err != nil {
-			if errors.Is(err, gorm.ErrDuplicatedKey) {
-				return ErrAlreadyExists
-			}
-			return fmt.Errorf("create file: %w", err)
-		}
-
-		// 占位内容正式激活：引用计数从 0 变成 1。
-		activated := tx.Model(&model.Entity{}).
-			Where("id = ? AND status = ? AND ref_count = 0",
-				entity.ID, model.EntityStatusUploading).
-			UpdateColumns(map[string]any{
-				"status":    model.EntityStatusActive,
-				"ref_count": 1,
-			})
-		if activated.Error != nil {
-			return fmt.Errorf("activate upload entity: %w", activated.Error)
-		}
-		if activated.RowsAffected != 1 {
-			return fmt.Errorf(
-				"%w: entity %d changed while completing",
-				ErrUploadSessionConflict, entity.ID,
-			)
-		}
-
-		marked := tx.Model(&model.UploadSession{}).
-			Where("id = ? AND owner_id = ? AND status = ?",
-				session.ID, ownerID, model.UploadStatusReady).
-			UpdateColumns(map[string]any{
-				"status":         model.UploadStatusCompleted,
-				"result_file_id": fileID,
-				"reserved_bytes": 0,
-			})
-		if marked.Error != nil {
-			return fmt.Errorf("complete upload session: %w", marked.Error)
-		}
-		if marked.RowsAffected != 1 {
-			return fmt.Errorf(
-				"%w: upload session %s is no longer ready",
-				ErrUploadSessionConflict, session.ID,
-			)
-		}
-
-		// 任务发布会话：task_results 必须和 File、Entity、容量结算在同一个
-		// 事务里提交。提交成功后，即使任务检查点还没保存，重启也能查到
-		// 这份结果并收敛，不会再发布第二份文件。
-		if session.TaskID != nil && *session.TaskID != "" {
-			result := model.TaskResult{
-				TaskID:  *session.TaskID,
-				OwnerID: ownerID,
-				FileID:  fileID,
-			}
-			if err := tx.Create(&result).Error; err != nil {
-				if errors.Is(err, gorm.ErrDuplicatedKey) {
-					// 另一个执行者已经发布了结果：整笔新发布回滚，
-					// 交给调用方查询已有结果并取消本次会话。
-					return ErrTaskResultExists
-				}
-				return fmt.Errorf("record task result: %w", err)
-			}
-		}
-
-		session.Status = model.UploadStatusCompleted
-		session.ResultFileID = &fileID
-		session.ReservedBytes = 0
-		completed = toUploadSessionInfo(session)
-		return nil
-	})
+	}
 	if err == nil {
 		// 会话已经发布：关闭资源锁，分片账本和运行状态都不再需要。
 		// 本次请求的短时保护退出后，锁才真正从管理器移除。
 		s.finishCompletedUpload(sessionID)
+		// 命中去重时，占位 Entity 已经标记 pending_delete；
+		// 立即尝试删一次，失败则留给后台 GC。
+		s.cleanPublishedLeftover(ctx, leftoverID)
 		return completed, nil
 	}
 
@@ -330,6 +389,7 @@ func (s *Service) CompleteUploadSession(
 	if verifyErr == nil && verified != nil {
 		// 提交结果已经确认是 completed：可以结束锁生命周期。
 		s.finishCompletedUpload(sessionID)
+		s.cleanPublishedLeftover(ctx, leftoverID)
 		return *verified, nil
 	}
 	if verifyErr != nil {
