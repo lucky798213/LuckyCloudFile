@@ -178,6 +178,8 @@ func autoMigrate(db *gorm.DB) error {
 		&model.UploadSession{},
 		&model.Task{},
 		&model.TaskResult{},
+		&model.ContentKey{},
+		&model.InstantUploadRequest{},
 	)
 }
 

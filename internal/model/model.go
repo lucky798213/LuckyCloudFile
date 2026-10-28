@@ -15,9 +15,10 @@ const (
 	KindDirectory = "directory"
 )
 
-// 存储策略的驱动类型。本阶段只实现本地目录。
+// 存储策略的驱动类型：本地目录或 S3 兼容对象存储。
 const (
 	StorageTypeLocal = "local"
+	StorageTypeS3    = "s3"
 
 	// LocalStorageConfigKey 是初始本地策略对应的配置键：
 	// 它映射到 [Storage] LocalRoot，也是新账号的默认策略。
@@ -26,18 +27,18 @@ const (
 
 // StoragePolicy 是一个具体的存储位置。
 //
-// 它只描述“用哪种驱动、去哪一组配置里找目录”，不保存目录本身；
-// 目录由配置按 ConfigKey 提供。这样数据库里的策略 ID 在重启后仍然稳定。
+// 它只描述驱动和配置键，不保存目录或云端密钥；实际连接信息由配置提供。
+// 这样数据库里的策略 ID 在重启后仍然稳定。
 type StoragePolicy struct {
 	ID int `gorm:"primaryKey;autoIncrement"`
 
 	// 展示名称，便于运维识别，不参与定位。
 	Name string `gorm:"type:varchar(255);not null"`
 
-	// 驱动类型：本阶段只有 local，以后接 S3 时再扩展。
+	// 驱动类型：local 或 s3。
 	Type string `gorm:"type:varchar(32);not null"`
 
-	// 对应哪一组存储配置。配置读取层用它在本地目录表里查找实际路径。
+	// 对应哪一组存储配置。本地目录或 S3 连接信息均由配置提供。
 	ConfigKey string `gorm:"type:varchar(64);not null;uniqueIndex:storage_policies_config_key"`
 }
 
@@ -112,6 +113,11 @@ type Entity struct {
 
 	// 内容大小，单位字节。下载时用来设置 Content-Length。
 	Size int64 `gorm:"not null"`
+
+	// 可信内容摘要：SHA-256 十六进制（64 个小写字符）。
+	// NULL 表示历史内容还没有计算完整摘要；它只能由服务端实际读取内容后填写，
+	// 不能把客户端提交的 hash 直接写进来。
+	ContentSHA256 *string `gorm:"column:content_sha256;type:char(64)"`
 
 	// 这份内容实际存放在哪个策略对应的位置。
 	// 下载和清理都以它为准，不看用户当前的默认策略。
@@ -384,3 +390,54 @@ type TaskResult struct {
 }
 
 func (TaskResult) TableName() string { return "task_results" }
+
+// ContentKey 把“当前用户 + 存储策略 + 内容摘要 + 大小”映射到一份可复用内容。
+//
+// 第一版只做同一用户、同一存储策略内的去重，不跨用户或跨策略合并：
+// 这样不需要全局文件存在性探测，也不会把别人的内容授权给当前用户。
+//
+// 唯一键 (owner_id, storage_policy_id, sha256, size) 是并发发布的最终兜底。
+// EntityID 指向真正可复用的 Entity；物理 StorageKey 仍然是独立随机键，
+// 不能直接用摘要当文件名，否则旧 GC 可能删到新一代对象。
+type ContentKey struct {
+	ID int64 `gorm:"primaryKey;autoIncrement"`
+
+	OwnerID int `gorm:"not null;uniqueIndex:idx_content_keys_scope,priority:1"`
+
+	StoragePolicyID int `gorm:"not null;uniqueIndex:idx_content_keys_scope,priority:2"`
+
+	// 服务端计算出的完整内容摘要，小写十六进制。
+	SHA256 string `gorm:"column:sha256;type:char(64);not null;uniqueIndex:idx_content_keys_scope,priority:3"`
+
+	Size int64 `gorm:"not null;uniqueIndex:idx_content_keys_scope,priority:4"`
+
+	// 当前作用域下应该复用的 Entity。
+	EntityID int64 `gorm:"not null;index"`
+}
+
+func (ContentKey) TableName() string { return "content_keys" }
+
+// InstantUploadRequest 是秒传请求的幂等凭据。
+//
+// 同一用户、同一 Idempotency-Key 只对应一次逻辑操作：
+//   - ResultFileID 非空：重试返回同一个文件，不重复创建、不重复计费；
+//   - ResultFileID 为空：第一次请求未命中，重试仍然返回未命中。
+//
+// RequestDigest 是请求参数（目录、名字、大小、摘要）的规范化摘要；
+// 同键不同参数必须拒绝，不能悄悄返回上一次的结果。
+type InstantUploadRequest struct {
+	ID int64 `gorm:"primaryKey;autoIncrement"`
+
+	OwnerID int `gorm:"not null;uniqueIndex:idx_instant_upload_requests_owner_key,priority:1"`
+
+	IdempotencyKey string `gorm:"type:varchar(255);not null;uniqueIndex:idx_instant_upload_requests_owner_key,priority:2"`
+
+	RequestDigest string `gorm:"column:request_digest;type:char(64);not null"`
+
+	// 命中时创建的文件 ID；未命中时为 NULL。
+	ResultFileID *string `gorm:"type:varchar(255)"`
+
+	CreatedAt time.Time `gorm:"not null;autoCreateTime"`
+}
+
+func (InstantUploadRequest) TableName() string { return "instant_upload_requests" }
