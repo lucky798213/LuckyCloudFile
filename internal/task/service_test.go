@@ -157,6 +157,22 @@ func TestTaskSurvivesServiceRebuildAndOwnerIsolation(t *testing.T) {
 	}
 }
 
+// dueTasksFor 只保留本测试关心的任务。所有包共用同一个测试库，
+// 这里不能假设 ListDue 返回的整个列表只有自己创建的行。
+func dueTasksFor(tasks []model.Task, ids ...string) []model.Task {
+	wanted := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		wanted[id] = true
+	}
+	filtered := make([]model.Task, 0, len(ids))
+	for _, task := range tasks {
+		if wanted[task.ID] {
+			filtered = append(filtered, task)
+		}
+	}
+	return filtered
+}
+
 // TestListDueAndTryStart 验证到期筛选和执行资格的唯一性。
 func TestListDueAndTryStart(t *testing.T) {
 	db := openTestDB(t)
@@ -199,12 +215,13 @@ func TestListDueAndTryStart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dueTasks, err := service.ListDue(ctx, now, 10)
+	dueTasks, err := service.ListDue(ctx, now, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
+	dueTasks = dueTasksFor(dueTasks, due.ID, retry.ID)
 	if len(dueTasks) != 2 {
-		t.Fatalf("ListDue returned %d tasks, want 2: %+v", len(dueTasks), dueTasks)
+		t.Fatalf("ListDue returned %d matching tasks, want 2: %+v", len(dueTasks), dueTasks)
 	}
 	// 按 next_run_at 升序：due(-1m) 先于 retry(-1m+1s)。
 	if dueTasks[0].ID != due.ID || dueTasks[1].ID != retry.ID {
@@ -285,10 +302,11 @@ func TestListDueAndTryStart(t *testing.T) {
 	if _, err := service.TryStart(ctx, due.ID, now); !errors.Is(err, ErrConflict) {
 		t.Fatalf("start completed task error = %v, want ErrConflict", err)
 	}
-	remaining, err := service.ListDue(ctx, now, 10)
+	remaining, err := service.ListDue(ctx, now, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
+	remaining = dueTasksFor(remaining, retry.ID)
 	if len(remaining) != 1 || remaining[0].ID != retry.ID {
 		t.Fatalf("ListDue after completion = %+v, want only retry task", remaining)
 	}
@@ -338,11 +356,11 @@ func TestRetryWaitAndFailure(t *testing.T) {
 	}
 
 	// 还没到 next_run_at：扫描不到，也不能提前开始。
-	due, err := service.ListDue(ctx, now, 10)
+	due, err := service.ListDue(ctx, now, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(due) != 0 {
+	if len(dueTasksFor(due, created.ID)) != 0 {
 		t.Fatalf("retry task became due before next_run_at: %+v", due)
 	}
 	if _, err := service.TryStart(ctx, created.ID, now); !errors.Is(err, ErrConflict) {
@@ -350,11 +368,12 @@ func TestRetryWaitAndFailure(t *testing.T) {
 	}
 
 	// 到期后重新取得执行资格，attempts 变成 2（达到上限）。
-	due, err = service.ListDue(ctx, later.Add(time.Second), 10)
+	due, err = service.ListDue(ctx, later.Add(time.Second), 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(due) != 1 || due[0].ID != created.ID {
+	matched := dueTasksFor(due, created.ID)
+	if len(matched) != 1 || matched[0].ID != created.ID {
 		t.Fatalf("ListDue after backoff = %+v, want the retry task", due)
 	}
 	started, err := service.TryStart(ctx, created.ID, later.Add(time.Second))
@@ -379,11 +398,11 @@ func TestRetryWaitAndFailure(t *testing.T) {
 	}
 
 	// 次数已经用完，任何时间都不会再被调度或开始。
-	due, err = service.ListDue(ctx, later.Add(24*time.Hour), 10)
+	due, err = service.ListDue(ctx, later.Add(24*time.Hour), 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(due) != 0 {
+	if len(dueTasksFor(due, created.ID)) != 0 {
 		t.Fatalf("failed task is still due: %+v", due)
 	}
 	if _, err := service.TryStart(ctx, created.ID, later.Add(24*time.Hour)); !errors.Is(err, ErrConflict) {
