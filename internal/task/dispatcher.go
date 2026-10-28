@@ -41,6 +41,11 @@ type DispatcherOptions struct {
 	// Runner 从数据库记录执行具体业务，例如 ZIP 打包。
 	Runner Runner
 
+	// Types 限定本地调度器负责的任务类型；为空表示不按类型过滤。
+	// 只应由独立 worker 领取的任务（例如内容校验）必须排除，
+	// 否则 API 进程会抢走它们并因为找不到执行器而失败。
+	Types []string
+
 	// ScanInterval / BatchSize 为零时使用上面的默认值。
 	ScanInterval time.Duration
 	BatchSize    int
@@ -62,6 +67,7 @@ type Dispatcher struct {
 	service      *Service
 	queue        *queue.Queue
 	runner       Runner
+	taskTypes    []string
 	scanInterval time.Duration
 	batchSize    int
 	retryBase    time.Duration
@@ -116,6 +122,7 @@ func NewDispatcher(options DispatcherOptions) (*Dispatcher, error) {
 		service:      options.Service,
 		queue:        options.Queue,
 		runner:       options.Runner,
+		taskTypes:    options.Types,
 		scanInterval: scanInterval,
 		batchSize:    batchSize,
 		retryBase:    retryBase,
@@ -173,7 +180,7 @@ func (d *Dispatcher) scan() {
 		return
 	}
 
-	due, err := d.service.ListDue(d.ctx, time.Now(), d.batchSize)
+	due, err := d.service.ListDue(d.ctx, time.Now(), d.batchSize, d.taskTypes...)
 	if err != nil {
 		if d.ctx.Err() == nil {
 			d.logger.Error("scan due tasks", "error", err)
@@ -388,7 +395,7 @@ func (d *Dispatcher) markRetryWithContext(
 		return nil
 	}
 
-	nextRunAt := time.Now().Add(d.retryDelay(started.Attempts))
+	nextRunAt := time.Now().Add(retryDelay(d.retryBase, started.Attempts))
 	if err := d.service.MarkRetry(
 		ctx, started.ID, started.Attempts, nextRunAt, cause,
 	); err != nil {
@@ -404,8 +411,9 @@ func (d *Dispatcher) markRetryWithContext(
 }
 
 // retryDelay 按本次执行编号做指数退避：1x、2x、4x……最多 maxRetryDelay。
-func (d *Dispatcher) retryDelay(attempt int) time.Duration {
-	delay := d.retryBase
+// 本地调度器和独立 worker 共用同一套退避规则。
+func retryDelay(base time.Duration, attempt int) time.Duration {
+	delay := base
 	for i := 1; i < attempt && delay < maxRetryDelay; i++ {
 		delay *= 2
 	}

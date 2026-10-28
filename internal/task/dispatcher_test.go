@@ -54,10 +54,14 @@ func startTestDispatcherWithRetry(
 ) *Dispatcher {
 	t.Helper()
 
+	// 测试库可能同时留有其他包创建的 queued 任务（例如清理任务）。
+	// 调度器只负责自己注册的类型，这里把测试限定在 fake_echo 上，
+	// 避免扫描到别的任务而让断言看到错误的记录。
 	dispatcher, err := NewDispatcher(DispatcherOptions{
 		Service:      service,
 		Queue:        q,
 		Runner:       runner,
+		Types:        []string{"fake_echo"},
 		ScanInterval: interval,
 		BatchSize:    10,
 		RetryBase:    retryBase,
@@ -676,7 +680,6 @@ func TestDispatcherTimeoutBecomesRetryWait(t *testing.T) {
 
 // TestRetryDelayIsCappedBackoff 验证退避按执行次数增长并有上限。
 func TestRetryDelayIsCappedBackoff(t *testing.T) {
-	dispatcher := &Dispatcher{retryBase: 10 * time.Second}
 	for attempt, want := range map[int]time.Duration{
 		1:  10 * time.Second,
 		2:  20 * time.Second,
@@ -684,7 +687,7 @@ func TestRetryDelayIsCappedBackoff(t *testing.T) {
 		4:  time.Minute,
 		10: time.Minute,
 	} {
-		if got := dispatcher.retryDelay(attempt); got != want {
+		if got := retryDelay(10*time.Second, attempt); got != want {
 			t.Fatalf("retryDelay(%d) = %s, want %s", attempt, got, want)
 		}
 	}

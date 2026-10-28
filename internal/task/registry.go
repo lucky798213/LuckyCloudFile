@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 
 	"luckyCloudFile/internal/model"
@@ -76,6 +77,22 @@ func (r *Registry) Register(taskType string, factory Factory) error {
 	}
 	r.factories[taskType] = factory
 	return nil
+}
+
+// Types 返回已注册的任务类型（排序后）。
+//
+// 独立 worker 用它限定 Claim 只领取自己真正能执行的任务；如果领到
+// 未注册的类型，执行器只会在拿到租约之后失败，白白占用一轮执行。
+func (r *Registry) Types() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	types := make([]string, 0, len(r.factories))
+	for taskType := range r.factories {
+		types = append(types, taskType)
+	}
+	sort.Strings(types)
+	return types
 }
 
 // Runner 按记录里的 type 重建一个执行器。它不执行任务，方便调用方在
