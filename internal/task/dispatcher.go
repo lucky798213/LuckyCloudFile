@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -247,29 +248,9 @@ func (j *dispatchedJob) RunWithProgress(
 		return "", err
 	}
 
-	result, runErr := j.dispatcher.runner.Run(ctx, *started, report)
+	result, runErr := j.dispatcher.runRunner(ctx, started, report)
 	if runErr != nil {
-		// 取消/超时也走 retry_wait：worker 已经返回，业务停在最后一个
-		// 已提交的检查点，下一次调度可以继续。这里用独立 context 写数据库，
-		// 不把执行期的取消带进状态更新。
-		if ctx.Err() != nil || IsRetryable(runErr) {
-			if markErr := j.dispatcher.markRetry(ctx, started, runErr); markErr != nil {
-				j.dispatcher.logger.Warn(
-					"mark task retry", "task_id", started.ID, "error", markErr,
-				)
-			}
-			return "", runErr
-		}
-		if markErr := j.dispatcher.finalize(ctx, func(finalizeCtx context.Context) error {
-			return j.dispatcher.service.MarkFailed(
-				finalizeCtx, started.ID, started.Attempts, runErr,
-			)
-		}); markErr != nil {
-			j.dispatcher.logger.Warn(
-				"mark task failed", "task_id", started.ID, "error", markErr,
-			)
-		}
-		return "", runErr
+		return j.finishFailure(ctx, started, runErr)
 	}
 
 	if markErr := j.dispatcher.finalize(ctx, func(finalizeCtx context.Context) error {
@@ -288,44 +269,138 @@ func (j *dispatchedJob) RunWithProgress(
 	return result, nil
 }
 
-// markRetry 把任务放回 retry_wait，并在次数用完时明确 failed。
+// runRunner 在持久化任务执行边界把 panic 转成普通错误。
 //
-// 等待时间保存进 next_run_at，worker 立即释放；不在 worker 里 sleep。
-// 这样重启后仍按原来的到期时间继续，也不会因为等待占住并发名额。
-func (d *Dispatcher) markRetry(
+// 队列自己的 recover 只负责保住 worker；如果 panic 直接越过这里，数据库
+// 会永久停在 running。返回 panicError 后，调用方会继续走 finishFailure，
+// 由它决定复用已发布结果、失败还是重试。
+func (d *Dispatcher) runRunner(
+	ctx context.Context,
+	started *model.Task,
+	report queue.ProgressFunc,
+) (result string, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			d.logger.Error("task panicked",
+				"task_id", started.ID,
+				"task_type", started.Type,
+				"panic", p,
+				"stack", string(debug.Stack()),
+			)
+			result = ""
+			err = &panicError{value: p}
+		}
+	}()
+	return d.runner.Run(ctx, *started, report)
+}
+
+// finishFailure 统一处理一次执行失败。
+//
+// 先核对 task_results：业务可能已经发布结果，随后才 panic 或返回错误。
+// 这时必须复用已发布文件收敛为 completed，不能重新发布或误判失败。
+// 没有结果时才按策略收尾：取消/暂时性错误进入 retry_wait，panic 和永久
+// 错误直接 failed。数据库写入使用独立 context，执行期的取消不影响收尾。
+func (j *dispatchedJob) finishFailure(
+	ctx context.Context,
+	started *model.Task,
+	cause error,
+) (string, error) {
+	finalizeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizeTimeout)
+	defer cancel()
+
+	fileID, published, err := j.dispatcher.service.publishedTaskResult(
+		finalizeCtx, started.OwnerID, started.ID,
+	)
+	if err != nil {
+		j.dispatcher.logger.Warn("query task result after error",
+			"task_id", started.ID, "error", err)
+		return "", cause
+	}
+	if published {
+		// 结果已经发布；先补清理责任，再收敛为 completed。即使这里再次
+		// 失败，下一次启动恢复也会按 task_results 补终态。
+		if markErr := j.dispatcher.service.SetCleanupPending(
+			finalizeCtx, started.ID, started.Attempts, true,
+		); markErr != nil {
+			j.dispatcher.logger.Warn("mark cleanup pending after published result",
+				"task_id", started.ID, "error", markErr)
+		}
+		if markErr := j.dispatcher.service.MarkCompleted(
+			finalizeCtx, started.ID, started.Attempts, fileID,
+		); markErr != nil {
+			j.dispatcher.logger.Warn("converge published task after error",
+				"task_id", started.ID, "error", markErr)
+			return "", cause
+		}
+		j.dispatcher.logger.Warn("task error after publishing; converged to completed",
+			"task_id", started.ID,
+			"result_file_id", fileID,
+			"error", cause,
+		)
+		return fileID, nil
+	}
+
+	if isPanicError(cause) {
+		if markErr := j.dispatcher.service.MarkFailed(
+			finalizeCtx, started.ID, started.Attempts, cause,
+		); markErr != nil {
+			j.dispatcher.logger.Warn("mark panicked task failed",
+				"task_id", started.ID, "error", markErr)
+		}
+		return "", cause
+	}
+	if ctx.Err() != nil || IsRetryable(cause) {
+		if markErr := j.dispatcher.markRetryWithContext(
+			finalizeCtx, started, cause,
+		); markErr != nil {
+			j.dispatcher.logger.Warn("mark task retry",
+				"task_id", started.ID, "error", markErr)
+		}
+		return "", cause
+	}
+	if markErr := j.dispatcher.service.MarkFailed(
+		finalizeCtx, started.ID, started.Attempts, cause,
+	); markErr != nil {
+		j.dispatcher.logger.Warn("mark task failed",
+			"task_id", started.ID, "error", markErr)
+	}
+	return "", cause
+}
+
+// markRetryWithContext 在调用方给定的收尾 context 里写 retry_wait，
+// 次数用完时明确 failed。等待时间保存进 next_run_at，worker 立即释放。
+func (d *Dispatcher) markRetryWithContext(
 	ctx context.Context,
 	started *model.Task,
 	cause error,
 ) error {
-	return d.finalize(ctx, func(finalizeCtx context.Context) error {
-		if started.Attempts >= started.MaxAttempts {
-			if err := d.service.MarkFailed(
-				finalizeCtx, started.ID, started.Attempts, cause,
-			); err != nil {
-				return err
-			}
-			d.logger.Warn("task retries exhausted",
-				"task_id", started.ID,
-				"attempts", started.Attempts,
-				"error", cause,
-			)
-			return nil
-		}
-
-		nextRunAt := time.Now().Add(d.retryDelay(started.Attempts))
-		if err := d.service.MarkRetry(
-			finalizeCtx, started.ID, started.Attempts, nextRunAt, cause,
+	if started.Attempts >= started.MaxAttempts {
+		if err := d.service.MarkFailed(
+			ctx, started.ID, started.Attempts, cause,
 		); err != nil {
 			return err
 		}
-		d.logger.Warn("task will retry",
+		d.logger.Warn("task retries exhausted",
 			"task_id", started.ID,
 			"attempts", started.Attempts,
-			"next_run_at", nextRunAt,
 			"error", cause,
 		)
 		return nil
-	})
+	}
+
+	nextRunAt := time.Now().Add(d.retryDelay(started.Attempts))
+	if err := d.service.MarkRetry(
+		ctx, started.ID, started.Attempts, nextRunAt, cause,
+	); err != nil {
+		return err
+	}
+	d.logger.Warn("task will retry",
+		"task_id", started.ID,
+		"attempts", started.Attempts,
+		"next_run_at", nextRunAt,
+		"error", cause,
+	)
+	return nil
 }
 
 // retryDelay 按本次执行编号做指数退避：1x、2x、4x……最多 maxRetryDelay。

@@ -427,6 +427,28 @@ func (s *Service) RecoverRunning(ctx context.Context, now time.Time) (RecoveryRe
 	}
 }
 
+// publishedTaskResult 返回任务已经提交的发布结果。
+//
+// task_results 是任务级幂等凭据：只要它存在，逻辑结果就已经发布，
+// 无论 tasks.status 现在是什么，都不能再执行业务或重新计费。
+func (s *Service) publishedTaskResult(
+	ctx context.Context,
+	ownerID int,
+	taskID string,
+) (fileID string, published bool, err error) {
+	var result model.TaskResult
+	err = s.db.WithContext(ctx).
+		Where("task_id = ? AND owner_id = ?", taskID, ownerID).
+		First(&result).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("query task result of %q: %w", taskID, err)
+	}
+	return result.FileID, true, nil
+}
+
 // recoverRunningTask 收敛一条 running 记录。更新条件仍带 attempt 围栏，
 // 避免覆盖恢复期间被别的执行者改过的行。
 func (s *Service) recoverRunningTask(
@@ -435,12 +457,13 @@ func (s *Service) recoverRunningTask(
 	now time.Time,
 	result *RecoveryResult,
 ) error {
-	var published model.TaskResult
-	err := s.db.WithContext(ctx).
-		Where("task_id = ? AND owner_id = ?", record.ID, record.OwnerID).
-		First(&published).Error
-	switch {
-	case err == nil:
+	publishedFileID, published, err := s.publishedTaskResult(
+		ctx, record.OwnerID, record.ID,
+	)
+	if err != nil {
+		return err
+	}
+	if published {
 		// 文件已经发布：只补终态和清理责任，绝不再次执行发布业务。
 		updated := s.db.WithContext(ctx).
 			Model(&model.Task{}).
@@ -448,7 +471,7 @@ func (s *Service) recoverRunningTask(
 				record.ID, model.TaskStatusRunning, record.Attempts).
 			Updates(map[string]any{
 				"status":          model.TaskStatusCompleted,
-				"result_file_id":  published.FileID,
+				"result_file_id":  publishedFileID,
 				"finished_at":     now,
 				"last_error":      "",
 				"cleanup_pending": true,
@@ -461,8 +484,6 @@ func (s *Service) recoverRunningTask(
 			result.Completed++
 		}
 		return nil
-	case !errors.Is(err, gorm.ErrRecordNotFound):
-		return fmt.Errorf("query task result of %q: %w", record.ID, err)
 	}
 
 	if record.Attempts >= record.MaxAttempts {
