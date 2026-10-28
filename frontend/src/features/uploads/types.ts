@@ -41,6 +41,10 @@ export type Transfer = {
   serverStatus?: SessionStatus
   resultFileId?: string | null
   instant?: boolean
+  // 秒传请求的摘要和“结果未知”标记：结果未知时不能直接开始普通上传，
+  // 必须用同一个幂等键重新确认。
+  instantDigest?: string
+  instantUnknown?: boolean
   message?: string
 }
 export type UploadGateway = {

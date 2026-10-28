@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { ApiError } from '../../shared/http/errors'
 import { UploadManager } from './manager'
 import { MAX_UPLOAD_BYTES, resolveMode } from './types'
 import type { UploadGateway, UploadSession } from './types'
@@ -42,8 +43,8 @@ function gateway(overrides: Partial<UploadGateway> = {}): UploadGateway {
   }
 }
 const file = () => new File(['hello'], 'sample.txt')
-async function waitFor(check: () => boolean) {
-  await vi.waitFor(() => expect(check()).toBe(true), { interval: 5 })
+async function waitFor(check: () => boolean, timeout = 1000) {
+  await vi.waitFor(() => expect(check()).toBe(true), { interval: 5, timeout })
 }
 
 describe('upload scheduler', () => {
@@ -129,6 +130,65 @@ describe('upload scheduler', () => {
     await waitFor(() => manager.getSnapshot()[0]?.status === 'completed')
     expect(manager.getSnapshot()[0]?.instant).toBe(true)
     expect(manager.getSnapshot()[0]?.resultFileId).toBe('raced-file')
+  })
+
+  it('retries an uncertain instant response with the same idempotency key', async () => {
+    const instant = vi
+      .fn<UploadGateway['instant']>()
+      .mockRejectedValueOnce(new TypeError('response lost'))
+      .mockResolvedValueOnce({ instant: true, file_id: 'confirmed-file' })
+    const api = gateway({ instant })
+    const manager = new UploadManager(api, vi.fn())
+    manager.enqueue([file()], '', 'full')
+    await waitFor(() => manager.getSnapshot()[0]?.status === 'completed')
+
+    const item = manager.getSnapshot()[0]!
+    expect(item.instant).toBe(true)
+    expect(item.resultFileId).toBe('confirmed-file')
+    expect(api.create).not.toHaveBeenCalled()
+    expect(api.instant).toHaveBeenCalledTimes(2)
+    const keys = vi.mocked(api.instant).mock.calls.map((call) => call[4])
+    expect(new Set(keys).size).toBe(1)
+  })
+
+  it('stops before a normal upload while the instant result is unknown, then confirms with the same key', async () => {
+    const instant = vi.fn<UploadGateway['instant']>(async () => {
+      throw new TypeError('offline')
+    })
+    const api = gateway({ instant })
+    const manager = new UploadManager(api, vi.fn())
+    manager.enqueue([file()], '', 'full')
+    await waitFor(() => manager.getSnapshot()[0]?.status === 'failed', 3000)
+
+    const item = manager.getSnapshot()[0]!
+    expect(item.instantUnknown).toBe(true)
+    expect(item.message).toContain('重试确认')
+    expect(api.create).not.toHaveBeenCalled()
+    expect(api.instant).toHaveBeenCalledTimes(3)
+    const firstKey = vi.mocked(api.instant).mock.calls[0]![4]
+
+    instant.mockResolvedValue({ instant: true, file_id: 'confirmed-file' })
+    manager.retry(item.id)
+    await waitFor(() => manager.getSnapshot()[0]?.status === 'completed')
+    expect(manager.getSnapshot()[0]?.instant).toBe(true)
+    expect(api.create).not.toHaveBeenCalled()
+    expect(vi.mocked(api.instant).mock.calls.at(-1)?.[4]).toBe(firstKey)
+  })
+
+  it('does not fall back to a normal upload when the instant request is rejected', async () => {
+    const api = gateway({
+      instant: vi.fn<UploadGateway['instant']>(async () => {
+        throw new ApiError('insufficient_storage', 'quota', 507)
+      }),
+    })
+    const manager = new UploadManager(api, vi.fn())
+    manager.enqueue([file()], '', 'full')
+    await waitFor(() => manager.getSnapshot()[0]?.status === 'failed')
+
+    expect(api.instant).toHaveBeenCalledTimes(1)
+    expect(api.create).not.toHaveBeenCalled()
+    expect(manager.getSnapshot()[0]?.instantUnknown).toBeUndefined()
+    expect(manager.getSnapshot()[0]?.message).toContain('未开始普通上传')
   })
 
   it('chooses modes at the boundary and rejects >32 MiB before creating a session', () => {

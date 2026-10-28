@@ -100,6 +100,9 @@ export function TransferList() {
                   )}
                 </div>
                 <div className={styles.transferActions}>
+                  {item.status === 'failed' && item.instantUnknown && (
+                    <Button onClick={() => manager.retry(item.id)}>重试确认</Button>
+                  )}
                   {item.status === 'failed' && item.sessionId && (
                     <>
                       <Button

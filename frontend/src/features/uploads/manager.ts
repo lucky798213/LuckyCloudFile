@@ -1,7 +1,46 @@
-import { errorMessage } from '../../shared/http/errors'
+import { ApiError, errorMessage } from '../../shared/http/errors'
 import { sha256Hex } from './hash'
 import { MAX_UPLOAD_BYTES, resolveMode } from './types'
 import type { ModeChoice, Transfer, UploadGateway, UploadSession } from './types'
+
+// The instant endpoint is idempotent, so an unknown result is retried with the
+// same key. A hit is a metadata-only operation; a miss is the only outcome that
+// is allowed to fall back to the normal byte upload.
+const INSTANT_CONFIRM_ATTEMPTS = 3
+const INSTANT_RETRY_DELAYS = [200, 600]
+
+class InstantUploadRejectedError extends Error {
+  constructor(cause: ApiError) {
+    super(errorMessage(cause))
+    this.name = 'InstantUploadRejectedError'
+  }
+}
+
+class InstantUploadUnconfirmedError extends Error {
+  constructor() {
+    super('秒传结果未确认：服务端可能已经创建文件。为避免重复上传，已停止普通上传，请点击“重试确认”。')
+    this.name = 'InstantUploadUnconfirmedError'
+  }
+}
+
+function isUnknownInstantError(error: unknown) {
+  if (error instanceof ApiError) {
+    // 507 是明确的容量不足，服务端没有创建文件；不能当成“结果未知”去重试。
+    if (error.code === 'insufficient_storage' || error.status === 507) return false
+    return (
+      error.status === 0 ||
+      error.status === 408 ||
+      error.status === 425 ||
+      error.status === 429 ||
+      error.status >= 500 ||
+      error.code === 'network_error' ||
+      error.code === 'invalid_response'
+    )
+  }
+  // fetch 在网络中断/CORS 失败时抛 TypeError；其他 DOMException 同样无法
+  // 证明服务端没有执行，按结果未知处理。
+  return error instanceof TypeError || error instanceof DOMException
+}
 
 // A small, framework-independent queue. React subscribes; it never schedules byte writes.
 export class UploadManager {
@@ -81,6 +120,20 @@ export class UploadManager {
     }
   }
 
+  // 秒传结果未知时，用同一个幂等键重新走一次预检。命中就完成，明确未命中
+  // 才继续普通上传；再次未知会重新进入待确认状态。
+  retry(id: string) {
+    const item = this.find(id)
+    if (!item || item.status !== 'failed' || !item.instantUnknown) return
+    this.canceled.delete(id)
+    this.update(id, {
+      status: 'queued',
+      instantUnknown: false,
+      message: '正在重新确认秒传结果…',
+    })
+    void this.pump()
+  }
+
   async confirm(id: string) {
     const item = this.find(id)
     if (!item?.sessionId || item.status !== 'failed' || item.serverStatus !== 'ready') return
@@ -115,6 +168,17 @@ export class UploadManager {
         const latest = this.find(item.id)
         if (this.canceled.has(item.id) && latest?.sessionId)
           await this.cancelRemote(item.id, latest.sessionId)
+        else if (error instanceof InstantUploadUnconfirmedError)
+          this.update(item.id, {
+            status: 'failed',
+            instantUnknown: true,
+            message: error.message,
+          })
+        else if (error instanceof InstantUploadRejectedError)
+          this.update(item.id, {
+            status: 'failed',
+            message: `秒传校验失败：${error.message} 未开始普通上传。`,
+          })
         else
           this.update(item.id, {
             status: 'failed',
@@ -129,8 +193,11 @@ export class UploadManager {
   }
 
   private async run(item: Transfer, signal: AbortSignal) {
-    this.update(item.id, { status: 'creating', message: '正在计算内容摘要…' })
-    if (await this.tryInstantUpload(item)) return
+    this.update(item.id, {
+      status: 'creating',
+      message: item.instantDigest ? '正在确认秒传结果…' : '正在计算内容摘要…',
+    })
+    if ((await this.tryInstantUpload(item)) === 'hit') return
     if (!this.alive) return
     if (this.canceled.has(item.id)) {
       this.update(item.id, { status: 'canceled', message: undefined })
@@ -191,36 +258,72 @@ export class UploadManager {
     this.applySession(item.id, session)
   }
 
-  // Best-effort preflight. Hashing or the instant request failing must never
-  // block the normal upload path, so every failure is treated as a miss.
-  private async tryInstantUpload(item: Transfer) {
-    try {
-      const digest = await sha256Hex(item.file)
-      if (!this.alive || this.canceled.has(item.id)) return false
-      const result = await this.gateway.instant(
-        item.parentId,
-        item.file.name,
-        item.file.size,
-        digest,
-        item.id,
-      )
-      if (!this.alive) return false
-      if (!result.instant || !result.file_id) return false
-      // 命中说明服务端已经创建了 File，取消已经无法撤销这次元数据写入。
-      // 仍然展示完成结果，避免目录里出现一个界面上看不见的文件。
-      this.update(item.id, {
-        status: 'completed',
-        loaded: item.file.size,
-        serverStatus: 'completed',
-        resultFileId: result.file_id,
-        instant: true,
-        message: '秒传完成：服务端已有相同内容。',
-      })
-      this.published(item.parentId)
-      return true
-    } catch {
-      return false
+  // 秒传预检的三种结果必须分开处理：
+  //   hit   → 服务端已经创建 File，结束；
+  //   miss  → 明确没有命中，可以安全地走普通上传；
+  //   throw → 只有明确失败才拒绝；网络/5xx 等结果未知会先用同一个幂等键重试。
+  private async tryInstantUpload(item: Transfer): Promise<'hit' | 'miss'> {
+    let digest = item.instantDigest
+    if (!digest) {
+      try {
+        digest = await sha256Hex(item.file)
+      } catch {
+        // 本地摘要失败说明请求根本没发出去，普通上传是安全的。
+        return 'miss'
+      }
+      if (!this.alive) return 'miss'
+      this.update(item.id, { instantDigest: digest })
     }
+    if (this.canceled.has(item.id)) return 'miss'
+
+    for (let attempt = 0; attempt < INSTANT_CONFIRM_ATTEMPTS; attempt++) {
+      try {
+        const result = await this.gateway.instant(
+          item.parentId,
+          item.file.name,
+          item.file.size,
+          digest,
+          item.id,
+        )
+        if (!this.alive) return 'miss'
+        // 只有明确的 {"instant":false} 才是“未命中”。缺字段、空响应或
+        // 命中却没有 file_id 都不能证明服务端没有创建文件，按结果未知重试。
+        if (typeof result?.instant !== 'boolean') {
+          throw new TypeError('instant upload returned an invalid response')
+        }
+        if (!result.instant) return 'miss'
+        if (!result.file_id) {
+          throw new TypeError('instant upload hit without a file id')
+        }
+        // 命中说明服务端已经创建了 File，取消已经无法撤销这次元数据写入。
+        // 仍然展示完成结果，避免目录里出现一个界面上看不见的文件。
+        this.update(item.id, {
+          status: 'completed',
+          loaded: item.file.size,
+          serverStatus: 'completed',
+          resultFileId: result.file_id,
+          instant: true,
+          instantUnknown: false,
+          message: '秒传完成：服务端已有相同内容。',
+        })
+        this.published(item.parentId)
+        return 'hit'
+      } catch (error) {
+        if (!this.alive) return 'miss'
+        if (!isUnknownInstantError(error)) {
+          if (error instanceof ApiError) throw new InstantUploadRejectedError(error)
+          throw error
+        }
+        if (attempt < INSTANT_CONFIRM_ATTEMPTS - 1) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, INSTANT_RETRY_DELAYS[attempt] ?? 0),
+          )
+          if (!this.alive) return 'miss'
+        }
+      }
+    }
+
+    throw new InstantUploadUnconfirmedError()
   }
 
   private async cancelRemote(id: string, sessionId: string) {
