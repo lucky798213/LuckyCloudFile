@@ -45,6 +45,7 @@ func OpenDSN(ctx context.Context, dsn string) (*gorm.DB, error) {
 		return nil, fmt.Errorf("parse mysql dsn: %w", err)
 	}
 	mc.ParseTime = true
+	alignSessionTimeZone(mc)
 	dsn = mc.FormatDSN()
 
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
@@ -645,5 +646,39 @@ func mysqlConfig(cfg config.Database) *mysqlDriver.Config {
 	// 连接建立时会执行 SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci，
 	// 保证中文文件名不会变成问号。
 	mc.Collation = "utf8mb4_unicode_ci"
+	alignSessionTimeZone(mc)
 	return mc
+}
+
+// alignSessionTimeZone 让 MySQL 的 NOW() 和 driver 写入的时间使用同一个时钟。
+//
+// go-sql-driver 用 Config.Loc（生产配置里是 time.Local）格式化 time.Time
+// 参数，而 MySQL 的 NOW() 用的是会话时区。两者不一致时，同一个 DATETIME
+// 列里会混进相差数小时的值：例如任务租约由数据库时钟写入，next_run_at
+// 由 Go 写入，直接比较就会把所有到期任务都判成“还没到”。
+//
+// 这里把会话时区固定成 Loc 当前的 UTC 偏移。用偏移而不是时区名，是因为
+// 命名时区依赖 MySQL 的时区表，很多镜像默认没有加载。代价是跨夏令时切换
+// 后新连接会使用新偏移，旧连接仍保留旧偏移；进程重启即可全部对齐。
+func alignSessionTimeZone(mc *mysqlDriver.Config) {
+	if mc.Params == nil {
+		mc.Params = make(map[string]string)
+	}
+	if _, exists := mc.Params["time_zone"]; exists {
+		return
+	}
+
+	loc := mc.Loc
+	if loc == nil {
+		loc = time.UTC
+	}
+	_, offset := time.Now().In(loc).Zone()
+	sign := "+"
+	if offset < 0 {
+		sign = "-"
+		offset = -offset
+	}
+	mc.Params["time_zone"] = fmt.Sprintf(
+		"'%s%02d:%02d'", sign, offset/3600, (offset%3600)/60,
+	)
 }

@@ -8,18 +8,25 @@
 //   - worker 出队后先 TryStart 做条件更新，只有取得执行资格的那一次
 //     才会真正运行业务。
 //
-// 业务执行通过 Runner 注入（例如 ZIP 打包），本包不直接依赖
-// internal/archive。恢复工厂、阶段检查点和结果幂等留给后续步骤。
+// 独立 worker 走另一条路径：Claim 用 SELECT ... FOR UPDATE SKIP LOCKED
+// 直接领取任务并写入 worker_id / attempts / lease_until，执行期间用
+// Heartbeat 续租；Complete / Retry / Fail 在同一个事务里先核对领取资格
+// 再写结果，被接管的旧执行者会被拒绝。
+//
+// 业务执行通过 Runner 注入（例如 ZIP 打包和内容校验），本包不直接依赖
+// internal/archive 或 internal/verify。
 package task
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"luckyCloudFile/internal/idgen"
 	"luckyCloudFile/internal/model"
@@ -61,7 +68,29 @@ var (
 	// ErrTooManyPending 表示数据库里已经有太多未终态任务。
 	// 它必须在插入之前返回，不能先落库再用失败响应“补丁式”拒绝。
 	ErrTooManyPending = errors.New("too many pending tasks")
+
+	// ErrClaimLost 表示这次领取已经不再有效：任务被别的 worker 接管，
+	// 或者租约已经过期。迟到的执行者不能再用它写任何业务结果。
+	ErrClaimLost = errors.New("task claim is no longer valid")
 )
+
+// Claim 是一次领取的执行凭据。
+//
+// 它记录“谁、第几次执行、租约到什么时候”。写业务结果时必须把整份凭据
+// 交给 Complete / Retry / Fail：只带 task ID 无法拒绝上一轮的旧执行者。
+type Claim struct {
+	TaskID     string
+	WorkerID   string
+	Attempt    int
+	LeaseUntil time.Time
+
+	// LeaseDuration 是领取时申请的租约时长，Heartbeat 用它续租。
+	LeaseDuration time.Duration
+
+	// Record 是领取之后的完整任务快照，用来重建对应的执行器。
+	// 执行器不能拿它覆盖数据库里的最新状态。
+	Record model.Task
+}
 
 // CreateParams 是创建一条排队任务的输入。
 //
@@ -346,7 +375,15 @@ func (s *Service) GetOwned(ctx context.Context, ownerID int, id string) (*model.
 // 它只做候选筛选，不保证一定能执行：真正取得资格要以 TryStart 的
 // 条件更新结果为准。这里排除次数已经用完的记录，避免扫描器反复取到
 // 永远起不来的任务。
-func (s *Service) ListDue(ctx context.Context, now time.Time, limit int) ([]model.Task, error) {
+//
+// taskTypes 为空表示不按类型过滤；本地调度器应传入自己注册的类型，
+// 否则会把只应由独立 worker 执行的任务也扫进本地队列。
+func (s *Service) ListDue(
+	ctx context.Context,
+	now time.Time,
+	limit int,
+	taskTypes ...string,
+) ([]model.Task, error) {
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -354,18 +391,300 @@ func (s *Service) ListDue(ctx context.Context, now time.Time, limit int) ([]mode
 		limit = DefaultListLimit
 	}
 
-	var tasks []model.Task
-	err := s.db.WithContext(ctx).
+	query := s.db.WithContext(ctx).
 		Where("status IN ?", []string{model.TaskStatusQueued, model.TaskStatusRetryWait}).
 		Where("next_run_at <= ?", now).
-		Where("attempts < max_attempts").
+		Where("attempts < max_attempts")
+	if len(taskTypes) > 0 {
+		query = query.Where("type IN ?", taskTypes)
+	}
+
+	var tasks []model.Task
+	if err := query.
 		Order("next_run_at ASC, id ASC").
 		Limit(limit).
-		Find(&tasks).Error
-	if err != nil {
+		Find(&tasks).Error; err != nil {
 		return nil, fmt.Errorf("list due tasks: %w", err)
 	}
 	return tasks, nil
+}
+
+// Claim 在事务里领取最多 availableSlots 条马上可以执行的任务。
+//
+// 领取用 SELECT ... FOR UPDATE SKIP LOCKED 只锁住本次选中的行：多个实例
+// 同时领取时，一个事务不会等待另一个事务手里的任务，也不会领到同一行。
+// UPDATE 同时写入 status=running、worker_id、attempts+1 和租约到期时间。
+// 业务执行在事务之外进行。
+//
+// 可以领取的记录有两类：
+//   - queued / retry_wait 且 next_run_at 已到；
+//   - running 但 lease_until 已过期（上一个执行者失联，本次接管）。
+//
+// 每个实例只领取自己马上能执行的数量。先领一大批堆在本地会让租约在
+// 排队期间白白过期，别的实例也无法分担。
+//
+// taskTypes 为空表示不按类型过滤；独立 worker 应只传自己注册的类型。
+func (s *Service) Claim(
+	ctx context.Context,
+	workerID string,
+	availableSlots int,
+	leaseDuration time.Duration,
+	taskTypes []string,
+) ([]Claim, error) {
+	if strings.TrimSpace(workerID) == "" {
+		return nil, errors.New("task worker id is required")
+	}
+	if leaseDuration <= 0 {
+		return nil, errors.New("task lease duration must be positive")
+	}
+	if availableSlots <= 0 {
+		return nil, nil
+	}
+
+	var claims []Claim
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 租约过期且次数已经用完的任务不会再被领取。这里明确收敛成
+		// failed，避免数据库里永久留下一条“看起来还在跑”的记录。
+		if err := tx.Exec(`
+			UPDATE tasks
+			SET status = ?, finished_at = NOW(6), lease_until = NULL,
+			    last_error = ?, updated_at = NOW(6)
+			WHERE status = ? AND lease_until <= NOW(6) AND attempts >= max_attempts`,
+			model.TaskStatusFailed,
+			"task lease expired after reaching the attempt limit",
+			model.TaskStatusRunning,
+		).Error; err != nil {
+			return fmt.Errorf("fail exhausted expired tasks: %w", err)
+		}
+
+		query := tx.Model(&model.Task{}).
+			Where("attempts < max_attempts").
+			Where(
+				"((status IN ? AND next_run_at <= ?) OR (status = ? AND lease_until <= NOW(6)))",
+				[]string{model.TaskStatusQueued, model.TaskStatusRetryWait},
+				time.Now(),
+				model.TaskStatusRunning,
+			)
+		if len(taskTypes) > 0 {
+			query = query.Where("type IN ?", taskTypes)
+		}
+
+		var due []model.Task
+		if err := query.
+			Clauses(clause.Locking{
+				Strength: clause.LockingStrengthUpdate,
+				Options:  clause.LockingOptionsSkipLocked,
+			}).
+			Order("next_run_at ASC, id ASC").
+			Limit(availableSlots).
+			Find(&due).Error; err != nil {
+			return fmt.Errorf("select claimable tasks: %w", err)
+		}
+		if len(due) == 0 {
+			return nil
+		}
+
+		ids := make([]string, 0, len(due))
+		for _, record := range due {
+			ids = append(ids, record.ID)
+		}
+
+		// lease_until 必须用数据库时钟：不同机器上的进程时钟可能不一致，
+		// 用应用时间会在接管判断上产生额外误差。
+		updated := tx.Model(&model.Task{}).
+			Where("id IN ?", ids).
+			Updates(map[string]any{
+				"status":    model.TaskStatusRunning,
+				"worker_id": workerID,
+				"attempts":  gorm.Expr("attempts + 1"),
+				"lease_until": gorm.Expr(
+					"DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)",
+					leaseDuration.Microseconds(),
+				),
+				"updated_at": gorm.Expr("NOW(6)"),
+			})
+		if updated.Error != nil {
+			return fmt.Errorf("claim tasks: %w", updated.Error)
+		}
+		if updated.RowsAffected != int64(len(ids)) {
+			return fmt.Errorf(
+				"claimed %d of %d selected tasks", updated.RowsAffected, len(ids),
+			)
+		}
+
+		// 回读领取之后的行：attempts 已经是本次执行的编号。调用方必须
+		// 保留这份快照，不能稍后重新读取一个新 attempt 当作自己的资格。
+		var claimed []model.Task
+		if err := tx.Where("id IN ?", ids).Find(&claimed).Error; err != nil {
+			return fmt.Errorf("reload claimed tasks: %w", err)
+		}
+		claims = make([]Claim, 0, len(claimed))
+		for _, record := range claimed {
+			if record.LeaseUntil == nil || record.WorkerID != workerID {
+				return fmt.Errorf("task %q was not claimed by this worker", record.ID)
+			}
+			claims = append(claims, Claim{
+				TaskID:        record.ID,
+				WorkerID:      record.WorkerID,
+				Attempt:       record.Attempts,
+				LeaseUntil:    *record.LeaseUntil,
+				LeaseDuration: leaseDuration,
+				Record:        record,
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return claims, nil
+}
+
+// Heartbeat 延长一条领取的租约。
+//
+// 条件里同时核对 worker、attempt 和租约尚未过期：任务一旦被接管或租约
+// 已经过期，续租返回 ErrClaimLost，执行方应立即停止并丢弃结果。
+func (s *Service) Heartbeat(ctx context.Context, claim Claim) error {
+	if claim.LeaseDuration <= 0 {
+		return errors.New("task claim has no lease duration")
+	}
+
+	result := s.db.WithContext(ctx).
+		Model(&model.Task{}).
+		Where(
+			"id = ? AND status = ? AND worker_id = ? AND attempts = ? AND lease_until > NOW(6)",
+			claim.TaskID, model.TaskStatusRunning, claim.WorkerID, claim.Attempt,
+		).
+		Updates(map[string]any{
+			"lease_until": gorm.Expr(
+				"DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)",
+				claim.LeaseDuration.Microseconds(),
+			),
+			"updated_at": gorm.Expr("NOW(6)"),
+		})
+	if result.Error != nil {
+		return fmt.Errorf("heartbeat task %q: %w", claim.TaskID, result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return ErrClaimLost
+	}
+	return nil
+}
+
+// Complete 在同一个事务里完成“复核领取资格 + 写业务结果 + 标记完成”。
+//
+// apply 可以为 nil（没有额外数据库副作用的任务）。内容校验用它把
+// “确认 Entity 仍有效、回填可信摘要、登记内容映射”和任务完成绑在一起：
+// 如果任务已经被接管，整个事务回滚，旧 worker 不会写入任何结果。
+//
+// 不能拆成“先检查 claim，再另开事务写摘要”：检查之后可能正好发生
+// 接管，旧 worker 仍然会把结果写进去。
+func (s *Service) Complete(
+	ctx context.Context,
+	claim Claim,
+	resultJSON string,
+	apply func(tx *gorm.DB) error,
+) error {
+	return s.finishClaim(ctx, claim, func(tx *gorm.DB) error {
+		if apply != nil {
+			if err := apply(tx); err != nil {
+				return err
+			}
+		}
+
+		values := map[string]any{
+			"status":      model.TaskStatusCompleted,
+			"finished_at": gorm.Expr("NOW(6)"),
+			"last_error":  "",
+			"lease_until": nil,
+			"updated_at":  gorm.Expr("NOW(6)"),
+		}
+		if resultJSON != "" {
+			values["result_json"] = resultJSON
+		}
+		return tx.Model(&model.Task{}).
+			Where("id = ?", claim.TaskID).
+			Updates(values).Error
+	})
+}
+
+// Retry 释放本次执行资格，把任务放回等待重试。
+//
+// 它和 Complete 用同一套租约围栏：被接管的旧执行者不能把新执行者
+// 正在运行的任务改成 retry_wait。
+func (s *Service) Retry(
+	ctx context.Context,
+	claim Claim,
+	nextRunAt time.Time,
+	cause error,
+) error {
+	if nextRunAt.IsZero() {
+		return errors.New("task next run time is required")
+	}
+	return s.finishClaim(ctx, claim, func(tx *gorm.DB) error {
+		return tx.Model(&model.Task{}).
+			Where("id = ?", claim.TaskID).
+			Updates(map[string]any{
+				"status":      model.TaskStatusRetryWait,
+				"next_run_at": nextRunAt,
+				"last_error":  errorText(cause),
+				"lease_until": nil,
+				"updated_at":  gorm.Expr("NOW(6)"),
+			}).Error
+	})
+}
+
+// Fail 在租约围栏内把任务标记为终态失败。
+func (s *Service) Fail(ctx context.Context, claim Claim, cause error) error {
+	return s.finishClaim(ctx, claim, func(tx *gorm.DB) error {
+		return tx.Model(&model.Task{}).
+			Where("id = ?", claim.TaskID).
+			Updates(map[string]any{
+				"status":      model.TaskStatusFailed,
+				"finished_at": gorm.Expr("NOW(6)"),
+				"last_error":  errorText(cause),
+				"lease_until": nil,
+				"updated_at":  gorm.Expr("NOW(6)"),
+			}).Error
+	})
+}
+
+// finishClaim 是所有“写结果”操作的统一入口：先锁任务行并核对领取
+// 资格，再执行调用方的更新。检查和写入必须在同一个事务里。
+func (s *Service) finishClaim(
+	ctx context.Context,
+	claim Claim,
+	update func(tx *gorm.DB) error,
+) error {
+	if claim.TaskID == "" || claim.WorkerID == "" || claim.Attempt <= 0 {
+		return ErrClaimLost
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockClaim(tx, claim); err != nil {
+			return err
+		}
+		return update(tx)
+	})
+}
+
+// lockClaim 锁住任务行，并确认它仍由这次领取持有。
+//
+// 租约是否有效也交给数据库时钟判断，和领取时写入的基准保持一致。
+func lockClaim(tx *gorm.DB, claim Claim) error {
+	var record model.Task
+	err := tx.Clauses(clause.Locking{Strength: clause.LockingStrengthUpdate}).
+		Where(
+			"id = ? AND status = ? AND worker_id = ? AND attempts = ? AND lease_until > NOW(6)",
+			claim.TaskID, model.TaskStatusRunning, claim.WorkerID, claim.Attempt,
+		).
+		First(&record).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return ErrClaimLost
+	}
+	if err != nil {
+		return fmt.Errorf("lock task claim %q: %w", claim.TaskID, err)
+	}
+	return nil
 }
 
 // RecoveryResult 是启动恢复遗留 running 任务的统计。
@@ -377,9 +696,9 @@ type RecoveryResult struct {
 
 // RecoverRunning 收敛上一次进程留下的 running 任务。
 //
-// 它必须在开始调度之前、且只有一个应用实例时调用：此时数据库里的
-// running 记录不可能仍由本进程持有，只可能是上一个进程崩溃或正常退出
-// 前没来得及写终态。多实例部署需要额外的租约/围栏，本阶段不做。
+// 它必须在开始调度之前调用。单实例部署时，数据库里的 running 记录不可能
+// 仍由本进程持有；多实例部署时，其他进程可能正持有有效租约，所以这里
+// 只处理 lease_until 为空（旧数据）或已经过期的记录，绝不碰仍然有效的租约。
 //
 // 顺序是“先核对结果，再决定是否重跑”：
 //   - task_results 已有记录：结果已经发布，不能再执行业务，直接补写
@@ -405,6 +724,7 @@ func (s *Service) RecoverRunning(ctx context.Context, now time.Time) (RecoveryRe
 		var tasks []model.Task
 		err := s.db.WithContext(ctx).
 			Where("status = ? AND id > ?", model.TaskStatusRunning, cursor).
+			Where("(lease_until IS NULL OR lease_until <= NOW(6))").
 			Order("id ASC").
 			Limit(DefaultListLimit).
 			Find(&tasks).Error

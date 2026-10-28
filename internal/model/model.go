@@ -330,7 +330,7 @@ type Task struct {
 	Owner *User `gorm:"foreignKey:OwnerID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 
 	// 通用执行状态，取值见 TaskStatus*。
-	Status string `gorm:"type:varchar(16);not null;default:queued;index:idx_tasks_due,priority:1"`
+	Status string `gorm:"type:varchar(16);not null;default:queued;index:idx_tasks_due,priority:1;index:idx_tasks_lease,priority:1"`
 
 	// 下一步业务阶段，例如 prepare / compress / publish / finalize。
 	// 它是“接下来做什么”，不是进度百分比：phase=publish 表示完整的
@@ -350,9 +350,27 @@ type Task struct {
 	// 到期扫描和 TryStart 都按它过滤。
 	NextRunAt time.Time `gorm:"not null;index:idx_tasks_due,priority:2"`
 
+	// WorkerID 是最近一次领取这条任务的 worker 实例标识。
+	// 空表示还没有被任何 worker 领取：本地调度器执行的任务、旧数据
+	// 或者已经释放执行资格、等待重试的任务。
+	WorkerID string `gorm:"type:varchar(128);not null;default:''"`
+
+	// LeaseUntil 是本次执行的租约到期时间，按数据库时钟计算。
+	//
+	// 非空且已经过期，表示领取它的 worker 失联，其他实例可以接管
+	// （attempts 加一，worker_id 换成新实例）。完成、失败或进入重试等待
+	// 时清空，避免把“已释放的资格”误判成“还在执行”。
+	LeaseUntil *time.Time `gorm:"index:idx_tasks_lease,priority:2"`
+
 	// 成功发布后的结果文件 ID。失败或尚未发布时为 NULL。
 	// 它是查询用的投影；发布幂等的真正凭据是 task_results 行。
 	ResultFileID *string `gorm:"type:varchar(255)"`
+
+	// ResultJSON 是任务成功后的业务结果投影（例如内容校验得到的摘要）。
+	//
+	// 它只用于查询和演示，不是幂等凭据：真正的业务事实写在自己的表里
+	// （例如 entities.content_sha256 和 content_keys）。失败或未完成时为空。
+	ResultJSON string `gorm:"type:text;not null"`
 
 	// 最后一次失败或等待重试的原因，只用于查询和排查，不保存堆栈。
 	LastError string `gorm:"type:text;not null"`
