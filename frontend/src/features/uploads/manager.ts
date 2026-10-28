@@ -204,8 +204,10 @@ export class UploadManager {
         digest,
         item.id,
       )
-      if (!this.alive || this.canceled.has(item.id)) return false
+      if (!this.alive) return false
       if (!result.instant || !result.file_id) return false
+      // 命中说明服务端已经创建了 File，取消已经无法撤销这次元数据写入。
+      // 仍然展示完成结果，避免目录里出现一个界面上看不见的文件。
       this.update(item.id, {
         status: 'completed',
         loaded: item.file.size,

@@ -111,6 +111,26 @@ describe('upload scheduler', () => {
     expect(manager.getSnapshot()[0]?.instant).toBeUndefined()
   })
 
+  it('shows an instant hit that lands while the user is canceling', async () => {
+    let finish: (result: { instant: boolean; file_id?: string }) => void = () => undefined
+    const api = gateway({
+      instant: vi.fn<UploadGateway['instant']>(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve
+          }),
+      ),
+    })
+    const manager = new UploadManager(api, vi.fn())
+    manager.enqueue([file()], '', 'full')
+    await waitFor(() => vi.mocked(api.instant).mock.calls.length === 1)
+    manager.cancel(manager.getSnapshot()[0]!.id)
+    finish({ instant: true, file_id: 'raced-file' })
+    await waitFor(() => manager.getSnapshot()[0]?.status === 'completed')
+    expect(manager.getSnapshot()[0]?.instant).toBe(true)
+    expect(manager.getSnapshot()[0]?.resultFileId).toBe('raced-file')
+  })
+
   it('chooses modes at the boundary and rejects >32 MiB before creating a session', () => {
     expect(resolveMode(0, 'auto')).toBe('full')
     expect(resolveMode(1024 * 1024, 'auto')).toBe('full')
