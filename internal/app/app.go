@@ -90,7 +90,7 @@ func run(
 	//
 	// 数据库里的策略必须在配置里找到对应目录，否则启动直接失败：
 	// 不能让旧内容落到猜测的位置。
-	stores, err := newStorageRegistry(db, cfg.Storage)
+	stores, err := NewStorageRegistry(db, cfg.Storage)
 	if err != nil {
 		return fmt.Errorf("initialize storage: %w", err)
 	}
@@ -325,12 +325,12 @@ func serve(ctx context.Context, server *http.Server, listener net.Listener, shut
 	return nil
 }
 
-// newStorageRegistry 把数据库里的每条存储策略绑定到配置中的本地目录。
+// NewStorageRegistry 把数据库里的每条存储策略绑定到配置中的本地目录。
 //
 // 策略只记录 Type 和 ConfigKey；实际目录由配置提供。
 // 任何一条策略找不到目录、类型不认识或 ID 重复，都让启动失败，
 // 而不是让它悄悄回退到 LocalRoot。
-func newStorageRegistry(db *gorm.DB, cfg config.Storage) (*storage.Registry, error) {
+func NewStorageRegistry(db *gorm.DB, cfg config.Storage) (*storage.Registry, error) {
 	var policies []model.StoragePolicy
 	if err := db.Order("id ASC").Find(&policies).Error; err != nil {
 		return nil, fmt.Errorf("query storage policies: %w", err)

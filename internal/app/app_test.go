@@ -246,7 +246,7 @@ func TestNewStorageRegistryFailsForReferencedMissingConfig(t *testing.T) {
 	cfg := testStorageConfig(t, db)
 	delete(cfg.LocalRoots, policy.ConfigKey)
 
-	_, err = newStorageRegistry(db, cfg)
+	_, err = NewStorageRegistry(db, cfg)
 	if err == nil || !strings.Contains(err.Error(), policy.ConfigKey) {
 		t.Fatalf("wanted a missing-config error for %q, got %v", policy.ConfigKey, err)
 	}

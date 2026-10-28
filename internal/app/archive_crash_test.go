@@ -303,7 +303,7 @@ func newCrashHarness(t *testing.T) *crashHarness {
 	t.Cleanup(func() { _ = database.Close(db) })
 
 	storageCfg := testStorageConfig(t, db)
-	stores, err := newStorageRegistry(db, storageCfg)
+	stores, err := NewStorageRegistry(db, storageCfg)
 	if err != nil {
 		t.Fatal(err)
 	}

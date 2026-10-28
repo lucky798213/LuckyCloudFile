@@ -36,6 +36,7 @@ type Config struct {
 	HTTP     HTTP
 	Upload   Upload
 	Task     Task
+	Worker   Worker
 	Storage  Storage
 	Database Database
 }
@@ -88,6 +89,30 @@ type Task struct {
 	// 相对路径以配置文件所在目录为基准。它不能依赖系统临时目录，
 	// 否则重启或临时目录清理会让 phase=publish 指向的完整产物丢失。
 	WorkDir string
+}
+
+// Worker 对应 [Worker]，是独立 worker 进程的参数。
+//
+// 这些值只影响领取循环，不影响 API 进程：worker 和 API 共用同一份配置
+// 文件，但只有 cmd/worker 会读取这一段。
+type Worker struct {
+	// ID 是本实例写进 tasks.worker_id 的标识。为空时由启动参数或
+	// “hostname-pid”生成；同一个数据库上的多个实例必须互不相同。
+	ID string
+
+	// Slots 是同时执行的任务数。worker 每次只领取空闲槽位数量，
+	// 不会把任务领到本地排队等租约过期。
+	Slots int
+
+	// LeaseSeconds 是一次领取的租约时长。进程停止心跳后，任务要等
+	// 这么久才会被其他实例接管。
+	LeaseSeconds int
+
+	// HeartbeatSeconds 是续租间隔，必须小于 LeaseSeconds。
+	HeartbeatSeconds int
+
+	// PollSeconds 是空闲时重新查询可领取任务的间隔。
+	PollSeconds int
 }
 
 // HTTP 对应 [HTTP]。
@@ -193,6 +218,12 @@ func defaultConfig() Config {
 			ScanBatchSize:       50,
 			WorkDir:             "../data-tasks",
 		},
+		Worker: Worker{
+			Slots:            2,
+			LeaseSeconds:     30,
+			HeartbeatSeconds: 10,
+			PollSeconds:      2,
+		},
 		Storage:  Storage{LocalRoots: make(map[string]string)},
 		Database: Database{Port: 3306},
 	}
@@ -218,6 +249,9 @@ func mapSections(file *ini.File, cfg *Config) error {
 	}
 	if err := file.Section("Task").StrictMapTo(&cfg.Task); err != nil {
 		return fmt.Errorf("parse [Task]: %w", err)
+	}
+	if err := file.Section("Worker").StrictMapTo(&cfg.Worker); err != nil {
+		return fmt.Errorf("parse [Worker]: %w", err)
 	}
 	if err := file.Section("Storage").StrictMapTo(&cfg.Storage); err != nil {
 		return fmt.Errorf("parse [Storage]: %w", err)
@@ -341,6 +375,22 @@ func (c Config) validate() error {
 	}
 	if strings.TrimSpace(c.Task.WorkDir) == "" {
 		return fmt.Errorf("Task.WorkDir is required")
+	}
+
+	// worker 的租约参数决定故障接管快慢：心跳必须严格短于租约，
+	// 否则还没等到下一次续租，任务就已经可以被别的实例接管。
+	if c.Worker.Slots < 1 || c.Worker.Slots > 64 {
+		return fmt.Errorf("Worker.Slots must be between 1 and 64")
+	}
+	if c.Worker.LeaseSeconds < 5 || c.Worker.LeaseSeconds > 3600 {
+		return fmt.Errorf("Worker.LeaseSeconds must be between 5 and 3600")
+	}
+	if c.Worker.HeartbeatSeconds < 1 ||
+		c.Worker.HeartbeatSeconds >= c.Worker.LeaseSeconds {
+		return fmt.Errorf("Worker.HeartbeatSeconds must be between 1 and LeaseSeconds-1")
+	}
+	if c.Worker.PollSeconds < 1 || c.Worker.PollSeconds > 3600 {
+		return fmt.Errorf("Worker.PollSeconds must be between 1 and 3600")
 	}
 
 	// 存储目录必须写。至于它到底能不能写，要等启动时实际试一下才知道（见 internal/app）。
