@@ -381,7 +381,10 @@ export class UploadManager {
 
   private applyDirect(id: string, session: DirectSession) {
     const completed = session.status === 'completed'
+    const item = this.find(id)
     this.update(id, {
+      loaded:
+        completed || session.status === 'verifying' ? (item?.file.size ?? 0) : (item?.loaded ?? 0),
       direct: true,
       sessionId: session.id,
       resultFileId: session.result_file_id,

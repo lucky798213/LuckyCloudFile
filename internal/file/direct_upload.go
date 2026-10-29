@@ -149,6 +149,9 @@ func (s *Service) CreateDirectUpload(ctx context.Context, owner int, parent, nam
 		if result.Error != nil {
 			return DirectUploadInfo{}, result.Error
 		}
+		if result.RowsAffected != 1 {
+			return DirectUploadInfo{}, ErrDirectConflict
+		}
 		d.UploadID = uploadID
 		d.Status = "uploading"
 	}

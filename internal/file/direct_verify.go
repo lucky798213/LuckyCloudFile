@@ -114,5 +114,5 @@ func (s *Service) publishDirect(tx *gorm.DB, d model.DirectUploadSession, fileID
 	if e = quota.Settle(tx, d.OwnerID, current.ReservedBytes); e != nil {
 		return e
 	}
-	return tx.Model(current).Updates(map[string]any{"status": "completed", "reserved_bytes": 0, "result_file_id": fileID}).Error
+	return tx.Model(current).Updates(map[string]any{"status": "completed", "reserved_bytes": 0, "result_file_id": fileID, "last_error": ""}).Error
 }
