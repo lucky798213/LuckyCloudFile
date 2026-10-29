@@ -1,12 +1,34 @@
+# Private documentation and local tools
+/docs/
+/.idea/
+/.vscode/
+/AGENT.md
+/AGENTS.md
+/CLAUDE.md
+/tutorial.md
+*.local.md
+/scripts/resume_*_evidence.py
+/internal/file/resume_evidence_test.go
+
+# Runtime data, credentials and build output
 /bin/
 /data/
-/data-tasks/
-/configs/conf.ini
+/data-*/
 /.gocache/
-*.out
-.DS_Store
-
-# Runtime COS credentials (never commit secrets)
-/configs/cos.env
+/configs/conf.ini
+/configs/*.env
 .env
-.env.local
+.env.*
+!.env.example
+!**/.env.example
+*.pem
+*.key
+*.log
+*.out
+*.pprof
+.DS_Store
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
