@@ -25,6 +25,7 @@ import (
 	"luckyCloudFile/internal/app"
 	"luckyCloudFile/internal/config"
 	"luckyCloudFile/internal/database"
+	"luckyCloudFile/internal/file"
 	"luckyCloudFile/internal/task"
 	"luckyCloudFile/internal/verify"
 )
@@ -86,6 +87,10 @@ func run() int {
 		return 1
 	}
 
+	if err := factories.Register(file.DirectVerifyTask, file.NewService(db, stores).DirectVerifyFactory(taskService)); err != nil {
+		logger.Error("register direct verify", "error", err)
+		return 1
+	}
 	worker, err := task.NewWorker(task.WorkerOptions{
 		Service:           taskService,
 		Registry:          factories,
