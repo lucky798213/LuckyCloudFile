@@ -17,7 +17,8 @@ import (
 //
 // 使用顺序固定为：PrepareChunks → 多次 WriteChunkAt → FinalizeChunks。
 // 它不负责记录“哪些分片已经写过”，那是业务层的进度；存储层只保证
-// 临时对象按指定长度预分配、按偏移写入，并在最后原子地发布成正式对象。
+// 临时对象按指定长度预分配、按偏移写入，并在最后发布完整对象。
+// Local 使用 Rename；S3 使用本地暂存 + 完整 PutObject，不模拟云端随机写。
 type ChunkStore interface {
 	Store
 

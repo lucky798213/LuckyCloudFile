@@ -17,6 +17,7 @@ import (
 	"github.com/go-ini/ini"
 
 	"luckyCloudFile/internal/model"
+	"luckyCloudFile/internal/storage"
 )
 
 // Config 是整份配置。
@@ -133,6 +134,9 @@ type Storage struct {
 	//
 	// LocalRoot 继续表示配置键 "local"，所以旧配置不需要改。
 	LocalRoots map[string]string `ini:"-"`
+
+	// S3 的键同样对应 StoragePolicy.ConfigKey；凭据仅从指定环境变量加载。
+	S3 map[string]storage.S3Options `ini:"-"`
 }
 
 // RootFor 按 StoragePolicy.ConfigKey 找到实际的本地目录。
@@ -224,7 +228,7 @@ func defaultConfig() Config {
 			HeartbeatSeconds: 10,
 			PollSeconds:      2,
 		},
-		Storage:  Storage{LocalRoots: make(map[string]string)},
+		Storage:  Storage{LocalRoots: make(map[string]string), S3: make(map[string]storage.S3Options)},
 		Database: Database{Port: 3306},
 	}
 }
@@ -261,6 +265,54 @@ func mapSections(file *ini.File, cfg *Config) error {
 	}
 	if err := mapStorageRoots(file, cfg); err != nil {
 		return err
+	}
+	return mapS3Storage(file, cfg)
+}
+
+// 每个 [StorageS3 CONFIG_KEY] 定义一个后端。INI 只保存凭据的环境变量名，
+// 不支持把密钥直接写入配置；Load 仍然没有网络/建目录副作用。
+func mapS3Storage(file *ini.File, cfg *Config) error {
+	for _, section := range file.Sections() {
+		if !strings.HasPrefix(section.Name(), "StorageS3 ") {
+			continue
+		}
+		key := strings.TrimSpace(strings.TrimPrefix(section.Name(), "StorageS3 "))
+		if key == "" || key == model.LocalStorageConfigKey {
+			return fmt.Errorf("[%s]: invalid or reserved config key", section.Name())
+		}
+		if _, exists := cfg.Storage.LocalRoots[key]; exists {
+			return fmt.Errorf("[%s]: config key also belongs to StorageLocal", section.Name())
+		}
+		if _, exists := cfg.Storage.S3[key]; exists {
+			return fmt.Errorf("[%s]: duplicate S3 config key", section.Name())
+		}
+		var raw struct {
+			Endpoint, Region, Bucket, Prefix, SpoolDir string
+			ForcePathStyle                             bool
+			AccessKeyIDEnv, SecretAccessKeyEnv         string
+			SessionTokenEnv                            string
+		}
+		if err := section.StrictMapTo(&raw); err != nil {
+			return fmt.Errorf("parse [%s]: %w", section.Name(), err)
+		}
+		if raw.AccessKeyIDEnv == "" || raw.SecretAccessKeyEnv == "" {
+			return fmt.Errorf("[%s]: AccessKeyIDEnv and SecretAccessKeyEnv are required", section.Name())
+		}
+		opts := storage.S3Options{
+			Endpoint: raw.Endpoint, Region: raw.Region, Bucket: raw.Bucket,
+			Prefix: raw.Prefix, SpoolDir: raw.SpoolDir, ForcePathStyle: raw.ForcePathStyle,
+			AccessKeyID: os.Getenv(raw.AccessKeyIDEnv), SecretAccessKey: os.Getenv(raw.SecretAccessKeyEnv),
+		}
+		if raw.SessionTokenEnv != "" {
+			opts.SessionToken = os.Getenv(raw.SessionTokenEnv)
+			if opts.SessionToken == "" {
+				return fmt.Errorf("[%s]: session token environment variable is empty", section.Name())
+			}
+		}
+		if err := opts.Validate(); err != nil {
+			return fmt.Errorf("[%s]: %w", section.Name(), err)
+		}
+		cfg.Storage.S3[key] = opts
 	}
 	return nil
 }
@@ -440,6 +492,14 @@ func (c *Config) resolveStoragePath(configPath string) error {
 			return fmt.Errorf("resolve StorageLocal.%s: %w", key, err)
 		}
 		c.Storage.LocalRoots[key] = resolved
+	}
+	for key, opts := range c.Storage.S3 {
+		resolved, err := resolvePath(configPath, opts.SpoolDir)
+		if err != nil {
+			return fmt.Errorf("resolve StorageS3 %s.SpoolDir: %w", key, err)
+		}
+		opts.SpoolDir = resolved
+		c.Storage.S3[key] = opts
 	}
 
 	workDir, err := resolvePath(configPath, c.Task.WorkDir)

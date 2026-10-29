@@ -1,0 +1,236 @@
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 9px 15px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 550;
+  white-space: nowrap;
+  transition:
+    background 0.16s,
+    border-color 0.16s;
+}
+.primary {
+  background: var(--accent);
+  color: white;
+  box-shadow: 0 3px 7px #4d63ed18;
+}
+.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+.secondary {
+  background: var(--surface);
+  border-color: var(--line-strong);
+}
+.secondary:hover:not(:disabled) {
+  background: var(--canvas);
+}
+.ghost {
+  background: transparent;
+  color: var(--muted);
+}
+.ghost:hover:not(:disabled) {
+  background: var(--canvas);
+  color: var(--ink);
+}
+.danger {
+  background: var(--danger);
+  color: white;
+}
+.iconButton {
+  border: 0;
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  color: var(--muted);
+}
+.iconButton:hover {
+  background: var(--canvas);
+}
+.modal {
+  width: min(480px, calc(100vw - 32px));
+  max-height: calc(100dvh - 48px);
+  padding: 26px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  color: var(--ink);
+  box-shadow: 0 24px 90px #18284a30;
+  overflow: auto;
+}
+.modal::backdrop {
+  background: #19213855;
+  backdrop-filter: blur(3px);
+}
+.modalHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.description {
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 9px;
+}
+.form {
+  display: grid;
+  gap: 18px;
+  margin-top: 22px;
+}
+.field {
+  display: grid;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 550;
+}
+.field small {
+  color: var(--muted);
+  font-weight: 400;
+}
+.footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 10px;
+}
+.error {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 13px 16px;
+  margin: 12px 0;
+  border-radius: 9px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.error > svg {
+  margin-top: 2px;
+}
+.error > span {
+  flex: 1;
+}
+.error button {
+  min-height: 24px;
+  padding: 0 3px;
+  color: inherit;
+}
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 340px;
+  padding: 42px 24px;
+  text-align: center;
+  gap: 12px;
+}
+.emptyIcon {
+  background: var(--accent-soft);
+  color: var(--accent);
+  padding: 22px;
+  border-radius: 24px;
+  margin-bottom: 8px;
+}
+.empty p {
+  max-width: 370px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.loading {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
+  min-height: 200px;
+  color: var(--muted);
+}
+.spinner {
+  display: inline-block;
+  width: 15px;
+  height: 15px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+.pageHeading {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 24px;
+  margin-bottom: 32px;
+}
+.eyebrow {
+  font-size: 10px;
+  letter-spacing: 2.3px;
+  font-weight: 650;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+.headingActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 22px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+}
+.pagination > div {
+  display: flex;
+  gap: 8px;
+}
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.badge {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 6px;
+  background: var(--canvas);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.muted {
+  color: var(--muted);
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (max-width: 700px) {
+  .pageHeading {
+    flex-direction: column;
+    align-items: flex-start;
+    margin-bottom: 24px;
+    gap: 18px;
+  }
+  .pagination {
+    padding: 16px 12px;
+    flex-wrap: wrap;
+  }
+}

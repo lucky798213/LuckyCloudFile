@@ -1,0 +1,175 @@
+.uploadList {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  max-height: 270px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+.uploadList li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.uploadList li:last-child {
+  border: 0;
+}
+.uploadList li > div {
+  min-width: 0;
+}
+.uploadList strong {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.uploadList div > span {
+  font-size: 11px;
+  color: var(--muted);
+}
+.tooLarge {
+  color: var(--danger);
+  font-size: 11px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+.panel {
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.panelHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+  padding: 23px;
+  border-bottom: 1px solid var(--line);
+}
+.panelHeader h2 {
+  font-size: 15px;
+}
+.panelHeader h2 > span {
+  font-size: 11px;
+  font-weight: 400;
+  margin-left: 9px;
+  background: var(--canvas);
+  border-radius: 5px;
+  padding: 2px 7px;
+  color: var(--muted);
+}
+.panelHeader p {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 6px;
+}
+.transfers {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.transfers > li {
+  display: flex;
+  align-items: flex-start;
+  gap: 15px;
+  padding: 24px;
+  border-bottom: 1px solid var(--line);
+}
+.transfers > li:last-child {
+  border: 0;
+}
+.transferContent {
+  flex: 1;
+  min-width: 0;
+}
+.transferTitle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.transferTitle strong {
+  font-size: 13px;
+  font-weight: 550;
+  overflow-wrap: anywhere;
+}
+.transferContent p {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 6px;
+}
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--accent);
+  font-size: 10px;
+  background: var(--accent-soft);
+  padding: 3px 8px;
+  border-radius: 6px;
+}
+.status.success {
+  color: var(--success);
+  background: var(--success-soft);
+}
+.status.warning {
+  color: var(--warning);
+  background: var(--warning-soft);
+}
+.progress {
+  height: 4px;
+  width: 100%;
+  border-radius: 5px;
+  background: #eef0f6;
+  overflow: hidden;
+  margin-top: 12px;
+}
+.progress > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: inherit;
+  transition: width 0.18s;
+}
+.transferActions {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-width: 190px;
+}
+.transferContent p.transferMessage {
+  color: var(--warning);
+  overflow-wrap: anywhere;
+}
+.note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 20px;
+}
+.note svg {
+  margin-top: 1px;
+}
+@media (max-width: 700px) {
+  .panelHeader {
+    padding: 18px 15px;
+  }
+  .transfers > li {
+    padding: 18px 14px;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .transferActions {
+    margin-left: 50px;
+    max-width: none;
+    width: calc(100% - 50px);
+  }
+}

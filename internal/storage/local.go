@@ -21,7 +21,7 @@ var ErrTooLarge = errors.New("content too large")
 
 // Local 表示“文件存在本机某个目录”，是 Store 的本地实现。
 //
-// 业务层只依赖 Store 接口；以后接 S3 时新增一个实现就行，不用改 internal/file。
+// 业务层只依赖 Store 接口，与 S3 共用同一套文件生命周期。
 type Local struct {
 	root string
 

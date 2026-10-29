@@ -1,0 +1,22 @@
+:root {
+  color-scheme: light;
+  --canvas: #f7f8fa;
+  --surface: #fff;
+  --ink: #222637;
+  --muted: #707788;
+  --line: #edf0f4;
+  --line-strong: #dce0e8;
+  --accent: #4d63ed;
+  --accent-hover: #3c50d3;
+  --accent-soft: #edf0ff;
+  --focus: #8c9bff;
+  --danger: #bd3546;
+  --danger-soft: #fff0f1;
+  --success: #197850;
+  --success-soft: #ebf7ef;
+  --warning: #906314;
+  --warning-soft: #fff6df;
+  --radius-sm: 9px;
+  --radius: 14px;
+  --shadow: 0 12px 40px #202b4810;
+}

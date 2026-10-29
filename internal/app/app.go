@@ -325,23 +325,55 @@ func serve(ctx context.Context, server *http.Server, listener net.Listener, shut
 	return nil
 }
 
-// NewStorageRegistry 把数据库里的每条存储策略绑定到配置中的本地目录。
+// NewStorageRegistry 把数据库中的策略绑定到配置中的本地目录或 S3 后端。
 //
 // 策略只记录 Type 和 ConfigKey；实际目录由配置提供。
 // 任何一条策略找不到目录、类型不认识或 ID 重复，都让启动失败，
 // 而不是让它悄悄回退到 LocalRoot。
+//
+// API 进程和独立 worker 都通过它装配存储：worker 必须能从同一个
+// 策略 ID 读到同一份内容（共享 S3 或同机共享目录）。
 func NewStorageRegistry(db *gorm.DB, cfg config.Storage) (*storage.Registry, error) {
 	var policies []model.StoragePolicy
 	if err := db.Order("id ASC").Find(&policies).Error; err != nil {
 		return nil, fmt.Errorf("query storage policies: %w", err)
 	}
+	return buildStorageRegistry(policies, cfg)
+}
+
+func buildStorageRegistry(policies []model.StoragePolicy, cfg config.Storage) (*storage.Registry, error) {
 	if len(policies) == 0 {
 		return nil, errors.New("no storage policies configured")
 	}
 
 	registry := storage.NewRegistry()
 	for _, policy := range policies {
-		if policy.Type != model.StorageTypeLocal {
+		switch policy.Type {
+		case model.StorageTypeS3:
+			opts, ok := cfg.S3[policy.ConfigKey]
+			if !ok {
+				return nil, fmt.Errorf("storage policy %d has no S3 config for key %q", policy.ID, policy.ConfigKey)
+			}
+			if err := checkStorage(opts.SpoolDir); err != nil {
+				return nil, fmt.Errorf("storage policy %d spool: %w", policy.ID, err)
+			}
+			store, err := storage.NewS3(opts)
+			if err != nil {
+				return nil, fmt.Errorf("storage policy %d: %w", policy.ID, err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err = store.Check(ctx)
+			cancel()
+			if err != nil {
+				return nil, fmt.Errorf("storage policy %d: %w", policy.ID, err)
+			}
+			if err := registry.Register(policy.ID, store); err != nil {
+				return nil, err
+			}
+			continue
+		case model.StorageTypeLocal:
+			// 本地后端沿用原来的目录校验和绑定规则。
+		default:
 			return nil, fmt.Errorf(
 				"storage policy %d (%q) has unsupported type %q",
 				policy.ID, policy.Name, policy.Type,
