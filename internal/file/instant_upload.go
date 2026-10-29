@@ -14,6 +14,7 @@ import (
 	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/pathlock"
 	"luckyCloudFile/internal/quota"
+	"luckyCloudFile/internal/storage"
 )
 
 var (
@@ -58,7 +59,13 @@ func (s *Service) InstantUpload(
 	if size < 0 {
 		return InstantUploadResult{}, ErrInvalidSize
 	}
-	if size > MaxUploadBytes {
+	limit := MaxUploadBytes
+	if _, st, err := s.uploadStore(ctx, ownerID); err == nil {
+		if _, ok := st.(storage.MultipartStore); ok {
+			limit = s.directMax
+		}
+	}
+	if size > limit {
 		return InstantUploadResult{}, ErrTooLarge
 	}
 	digest, err := normalizeContentSHA256(clientSHA256)

@@ -49,6 +49,7 @@ type System struct {
 
 // Upload 对应 [Upload]。
 type Upload struct {
+	DirectMaxBytes int64
 	// MaxParallelChunks 是单个分片会话同时处理多少个分片请求。
 	// 它限制的是“每个会话”，不是整个进程：多个会话各自都可以达到这个上限。
 	MaxParallelChunks int
@@ -210,7 +211,7 @@ func defaultConfig() Config {
 		System: System{LogLevel: "info"},
 		HTTP:   HTTP{ShutdownTimeoutSeconds: 5},
 		// 没有 [Upload] 段的旧配置也使用这个默认值。
-		Upload: Upload{MaxParallelChunks: 2},
+		Upload: Upload{MaxParallelChunks: 2, DirectMaxBytes: 128 << 20},
 		// 没有 [Task] 段的旧配置也使用这些默认值，和 queue 包的默认值一致。
 		Task: Task{
 			Workers:             2,
@@ -266,6 +267,13 @@ func mapSections(file *ini.File, cfg *Config) error {
 	}
 	if err := mapStorageRoots(file, cfg); err != nil {
 		return err
+	}
+	if value := os.Getenv("LCF_DIRECT_UPLOAD_MAX_BYTES"); value != "" {
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || n <= 0 || n > 80<<30 {
+			return fmt.Errorf("invalid LCF_DIRECT_UPLOAD_MAX_BYTES")
+		}
+		cfg.Upload.DirectMaxBytes = n
 	}
 	if os.Getenv("LCF_COS_ENABLED") == "true" {
 		cfg.Storage.COS = map[string]storage.COSOptions{"cos": {BucketURL: os.Getenv("LCF_COS_BUCKET_URL"), Prefix: os.Getenv("LCF_COS_PREFIX"), SecretID: os.Getenv("LCF_COS_SECRET_ID"), SecretKey: os.Getenv("LCF_COS_SECRET_KEY"), SessionToken: os.Getenv("LCF_COS_SESSION_TOKEN")}}

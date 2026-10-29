@@ -101,7 +101,7 @@ func run(
 	fileService := file.NewService(db, stores).
 		WithLogger(logger).
 		WithPathLocks(pathLocks).
-		WithChunkParallel(cfg.Upload.MaxParallelChunks)
+		WithChunkParallel(cfg.Upload.MaxParallelChunks).WithDirectMax(cfg.Upload.DirectMaxBytes)
 	authService := auth.NewService(db)
 
 	// 作废上一次进程留下的未完成上传会话。

@@ -28,6 +28,10 @@ func registerDirectUploads(g *gin.RouterGroup, logger *slog.Logger, svc fileServ
 			var err error
 			status := http.StatusOK
 			switch operation {
+			case "capabilities":
+				enabled, limit, e := s.DirectCapabilities(ctx, owner)
+				err = e
+				result = gin.H{"enabled": enabled, "max_bytes": limit}
 			case "create":
 				var req instantUploadRequest
 				if c.ShouldBindJSON(&req) != nil || req.Size == nil {
@@ -72,6 +76,7 @@ func registerDirectUploads(g *gin.RouterGroup, logger *slog.Logger, svc fileServ
 			c.JSON(status, result)
 		}
 	}
+	g.GET("/direct-upload-capabilities", run("capabilities"))
 	g.DELETE("/direct-upload-sessions/:id", run("cancel"))
 	g.POST("/direct-upload-sessions", run("create"))
 	g.GET("/direct-upload-sessions/:id", run("get"))

@@ -277,3 +277,15 @@ func (s *Service) enqueueDirectVerify(ctx context.Context, d model.DirectUploadS
 		return tx.Model(current).Updates(map[string]any{"status": "verifying", "verify_task_id": taskID}).Error
 	})
 }
+
+func (s *Service) DirectCapabilities(ctx context.Context, owner int) (bool, int64, error) {
+	_, st, e := s.uploadStore(ctx, owner)
+	if e != nil {
+		return false, 0, e
+	}
+	_, enabled := st.(storage.MultipartStore)
+	if enabled {
+		return true, s.directMax, nil
+	}
+	return false, MaxUploadBytes, nil
+}
