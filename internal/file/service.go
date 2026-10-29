@@ -1318,7 +1318,7 @@ func toFile(record model.File) File {
 
 // WithDirectMax configures a separate cloud transfer limit; proxy remains 32 MiB.
 func (s *Service) WithDirectMax(n int64) *Service {
-	if n > 0 && n <= 80<<30 {
+	if n > 0 && n <= 10000*DirectPartSize {
 		s.directMax = n
 	}
 	return s

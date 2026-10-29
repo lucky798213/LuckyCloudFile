@@ -349,7 +349,7 @@ func buildStorageRegistry(policies []model.StoragePolicy, cfg config.Storage) (*
 	registry := storage.NewRegistry()
 	for _, policy := range policies {
 		switch policy.Type {
-		case "cos":
+		case model.StorageTypeCOS:
 			opts, ok := cfg.COS[policy.ConfigKey]
 			if !ok {
 				return nil, fmt.Errorf("missing COS config for %q", policy.ConfigKey)

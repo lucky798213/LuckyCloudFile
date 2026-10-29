@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -76,7 +77,7 @@ func (s *Service) publishDirect(tx *gorm.DB, d model.DirectUploadSession, fileID
 	if e != nil {
 		return e
 	}
-	if current.Status != "verifying" || current.VerifyTaskID != d.VerifyTaskID {
+	if current.Status != "verifying" || current.VerifyTaskID != d.VerifyTaskID || !time.Now().Before(current.ExpiresAt) {
 		return ErrDirectConflict
 	}
 	// Lock the actual parent, so deletion cannot race a new child insertion.

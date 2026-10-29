@@ -270,7 +270,7 @@ func mapSections(file *ini.File, cfg *Config) error {
 	}
 	if value := os.Getenv("LCF_DIRECT_UPLOAD_MAX_BYTES"); value != "" {
 		n, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || n <= 0 || n > 80<<30 {
+		if err != nil || n <= 0 || n > 10000*(8<<20) {
 			return fmt.Errorf("invalid LCF_DIRECT_UPLOAD_MAX_BYTES")
 		}
 		cfg.Upload.DirectMaxBytes = n

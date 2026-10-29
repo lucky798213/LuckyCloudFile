@@ -19,6 +19,7 @@ const (
 const (
 	StorageTypeLocal = "local"
 	StorageTypeS3    = "s3"
+	StorageTypeCOS   = "cos"
 
 	// LocalStorageConfigKey 是初始本地策略对应的配置键：
 	// 它映射到 [Storage] LocalRoot，也是新账号的默认策略。

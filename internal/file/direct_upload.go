@@ -62,9 +62,7 @@ func (s *Service) CreateDirectUpload(ctx context.Context, owner int, parent, nam
 	if size <= 0 {
 		return DirectUploadInfo{}, ErrInvalidSize
 	}
-	if size > s.directMax {
-		return DirectUploadInfo{}, ErrTooLarge
-	}
+
 	digest, e := normalizeContentSHA256(digest)
 	if e != nil {
 		return DirectUploadInfo{}, e
@@ -73,6 +71,21 @@ func (s *Service) CreateDirectUpload(ctx context.Context, owner int, parent, nam
 		return DirectUploadInfo{}, ErrInvalidIdempotencyKey
 	}
 	requestDigest := instantRequestDigest(owner, parent, name, size, digest)
+	// A retry belongs to its original policy even if the user's default changed.
+	var previous model.DirectUploadSession
+	lookupErr := s.db.WithContext(ctx).Where("owner_id = ? AND request_id = ?", owner, requestID).First(&previous).Error
+	if lookupErr == nil {
+		if previous.RequestDigest != requestDigest {
+			return DirectUploadInfo{}, ErrIdempotencyConflict
+		}
+		return DirectUploadInfo{previous, []storage.UploadedPart{}}, nil
+	}
+	if !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+		return DirectUploadInfo{}, lookupErr
+	}
+	if size > s.directMax {
+		return DirectUploadInfo{}, ErrTooLarge
+	}
 	policy, st, e := s.uploadStore(ctx, owner)
 	if e != nil {
 		return DirectUploadInfo{}, e
@@ -142,6 +155,8 @@ func (s *Service) CreateDirectUpload(ctx context.Context, owner int, parent, nam
 	return DirectUploadInfo{d, []storage.UploadedPart{}}, nil
 }
 func (s *Service) GetDirectUpload(ctx context.Context, owner int, id string) (DirectUploadInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	d, e := s.directOwned(ctx, owner, id)
 	if e != nil {
 		return DirectUploadInfo{}, e
