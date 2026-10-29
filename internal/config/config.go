@@ -124,7 +124,8 @@ type HTTP struct {
 
 // Storage 对应 [Storage]。
 type Storage struct {
-	LocalRoot string // 文件保存目录；相对路径以配置文件所在目录为基准
+	COS       map[string]storage.COSOptions `ini:"-"`
+	LocalRoot string                        // 文件保存目录；相对路径以配置文件所在目录为基准
 
 	// LocalRoots 是额外的本地目录，键对应 StoragePolicy.ConfigKey。
 	// 它来自可选的 [StorageLocal] 段：
@@ -265,6 +266,12 @@ func mapSections(file *ini.File, cfg *Config) error {
 	}
 	if err := mapStorageRoots(file, cfg); err != nil {
 		return err
+	}
+	if os.Getenv("LCF_COS_ENABLED") == "true" {
+		cfg.Storage.COS = map[string]storage.COSOptions{"cos": {BucketURL: os.Getenv("LCF_COS_BUCKET_URL"), Prefix: os.Getenv("LCF_COS_PREFIX"), SecretID: os.Getenv("LCF_COS_SECRET_ID"), SecretKey: os.Getenv("LCF_COS_SECRET_KEY"), SessionToken: os.Getenv("LCF_COS_SESSION_TOKEN")}}
+		if _, err := storage.NewCOS(cfg.Storage.COS["cos"]); err != nil {
+			return err
+		}
 	}
 	return mapS3Storage(file, cfg)
 }
