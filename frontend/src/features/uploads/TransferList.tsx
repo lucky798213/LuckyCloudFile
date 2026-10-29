@@ -75,7 +75,13 @@ export function TransferList() {
                   </div>
                   <p>
                     {formatBytes(item.loaded)} / {formatBytes(item.file.size)} ·{' '}
-                    {item.instant ? '秒传' : item.mode === 'full' ? '整文件' : '分片上传'}
+                    {item.instant
+                      ? '秒传'
+                      : item.direct
+                        ? 'COS 直传'
+                        : item.mode === 'full'
+                          ? '整文件'
+                          : '分片上传'}
                     {isActive(item.status) ? ` · ${percent}%` : ''}
                   </p>
                   <div
@@ -100,7 +106,7 @@ export function TransferList() {
                   )}
                 </div>
                 <div className={styles.transferActions}>
-                  {item.status === 'failed' && item.instantUnknown && (
+                  {item.status === 'failed' && (item.instantUnknown || item.direct) && (
                     <Button onClick={() => manager.retry(item.id)}>重试确认</Button>
                   )}
                   {item.status === 'failed' && item.sessionId && (

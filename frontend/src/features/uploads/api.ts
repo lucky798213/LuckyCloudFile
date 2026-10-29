@@ -4,6 +4,7 @@ import type { InstantUploadResult, UploadGateway, UploadSession } from './types'
 const path = (id: string) => `/upload-sessions/${encodeURIComponent(id)}`
 
 export const uploadApi: UploadGateway = {
+  directCapabilities: () => api.request('/direct-upload-capabilities'),
   create: (file, parentId, mode) =>
     api.request<UploadSession>('/upload-sessions', {
       method: 'POST',

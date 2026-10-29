@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { uploadApi } from './api'
 import { Link } from 'react-router'
 import { useUploads } from './context'
 import { MAX_UPLOAD_BYTES, resolveMode } from './types'
@@ -23,7 +24,24 @@ export function UploadDialog({
   const { manager } = useUploads()
   const [mode, setMode] = useState<ModeChoice>('auto')
   const [error, setError] = useState<unknown>(null)
-  const oversized = files.some((file) => file.size > MAX_UPLOAD_BYTES)
+  const [capabilities, setCapabilities] = useState<{ enabled: boolean; max_bytes: number }>()
+  useEffect(() => {
+    let alive = true
+    void uploadApi
+      .directCapabilities?.()
+      .then((value) => {
+        if (alive) setCapabilities(value)
+      })
+      .catch(setError)
+    return () => {
+      alive = false
+    }
+  }, [])
+  const limit =
+    (mode === 'auto' || mode === 'direct') && capabilities?.enabled
+      ? capabilities.max_bytes
+      : MAX_UPLOAD_BYTES
+  const oversized = files.some((file) => file.size > limit)
   return (
     <Modal
       title="上传文件"
@@ -45,7 +63,8 @@ export function UploadDialog({
         <label className={ui.field}>
           上传方式
           <select value={mode} onChange={(event) => setMode(event.target.value as ModeChoice)}>
-            <option value="auto">自动选择（≤ 1 MiB 整文件，其余分片）</option>
+            <option value="auto">自动选择（COS 策略直传，其他策略代理上传）</option>
+            <option value="direct">COS 直传（支持重新选文件续传）</option>
             <option value="full">整文件上传</option>
             <option value="chunked">分片上传</option>
           </select>
@@ -61,14 +80,18 @@ export function UploadDialog({
                   {resolveMode(file.size, mode) === 'full' ? '整文件' : '分片'}
                 </span>
               </div>
-              {file.size > MAX_UPLOAD_BYTES && <span className={styles.tooLarge}>超出上限</span>}
+              {file.size > limit && <span className={styles.tooLarge}>超出上限</span>}
             </li>
           ))}
         </ul>
-        {oversized && <ErrorNotice error={new Error('包含超过 32 MiB 的文件，请重新选择。')} />}
+        {oversized && (
+          <ErrorNotice
+            error={new Error('包含超过当前方式上限的文件，代理 32 MiB / COS 按服务端配置。')}
+          />
+        )}
         {error !== null && <ErrorNotice error={error} />}
         <p className={ui.description}>
-          刷新或关闭页面会中断上传，不支持自动续传。可在
+          COS 直传刷新后重新选择同名、同内容文件即可补传缺片；代理上传不支持跨重启续传。可在
           <Link to="/transfers" onClick={onClose} style={{ color: 'var(--accent)' }}>
             传输列表
           </Link>

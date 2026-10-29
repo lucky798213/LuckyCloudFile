@@ -1,6 +1,6 @@
 export const MAX_UPLOAD_BYTES = 32 * 1024 * 1024
 export type UploadMode = 'full' | 'chunked'
-export type ModeChoice = 'auto' | UploadMode
+export type ModeChoice = 'auto' | 'direct' | UploadMode
 export type SessionStatus = 'pending' | 'receiving' | 'ready' | 'completed' | 'canceled' | 'expired'
 export type UploadSession = {
   id: string
@@ -37,6 +37,8 @@ export type Transfer = {
   mode: UploadMode
   status: TransferStatus
   loaded: number
+  direct?: boolean
+  choice?: ModeChoice
   sessionId?: string
   serverStatus?: SessionStatus
   resultFileId?: string | null
@@ -48,6 +50,7 @@ export type Transfer = {
   message?: string
 }
 export type UploadGateway = {
+  directCapabilities?: () => Promise<{ enabled: boolean; max_bytes: number }>
   create: (file: File, parentId: string, mode: UploadMode) => Promise<UploadSession>
   instant: (
     parentId: string,
@@ -75,7 +78,11 @@ export type UploadGateway = {
 }
 
 export function resolveMode(size: number, choice: ModeChoice): UploadMode {
-  return choice === 'auto' ? (size <= 1024 * 1024 ? 'full' : 'chunked') : choice
+  return choice === 'auto' || choice === 'direct'
+    ? size <= 1024 * 1024
+      ? 'full'
+      : 'chunked'
+    : choice
 }
 
 export function isActive(status: TransferStatus) {

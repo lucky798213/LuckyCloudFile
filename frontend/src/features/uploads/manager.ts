@@ -1,5 +1,7 @@
 import { ApiError, errorMessage } from '../../shared/http/errors'
 import { sha256Hex } from './hash'
+import { runDirect, getDirect, cancelDirect } from './direct-manager'
+import type { DirectSession } from './direct-manager'
 import { MAX_UPLOAD_BYTES, resolveMode } from './types'
 import type { ModeChoice, Transfer, UploadGateway, UploadSession } from './types'
 
@@ -18,7 +20,9 @@ class InstantUploadRejectedError extends Error {
 
 class InstantUploadUnconfirmedError extends Error {
   constructor() {
-    super('秒传结果未确认：服务端可能已经创建文件。为避免重复上传，已停止普通上传，请点击“重试确认”。')
+    super(
+      '秒传结果未确认：服务端可能已经创建文件。为避免重复上传，已停止普通上传，请点击“重试确认”。',
+    )
     this.name = 'InstantUploadUnconfirmedError'
   }
 }
@@ -74,8 +78,16 @@ export class UploadManager {
   }
 
   enqueue(files: File[], parentId: string, mode: ModeChoice) {
-    if (files.some((file) => file.size > MAX_UPLOAD_BYTES))
-      throw new Error('单个文件不能超过 32 MiB。')
+    if (
+      files.some(
+        (file) =>
+          file.size >
+          ((mode === 'auto' || mode === 'direct') && this.gateway.directCapabilities
+            ? 80 * 1024 * 1024 * 1024
+            : MAX_UPLOAD_BYTES),
+      )
+    )
+      throw new Error('超过当前上传方式上限：代理 32 MiB，COS 直传 128 MiB。')
     this.items = [
       ...this.items,
       ...files.map((file) => ({
@@ -83,6 +95,7 @@ export class UploadManager {
         file,
         parentId,
         mode: resolveMode(file.size, mode),
+        choice: mode,
         status: 'queued' as const,
         loaded: 0,
       })),
@@ -114,7 +127,12 @@ export class UploadManager {
     if (!item?.sessionId || item.status !== 'failed') return
     this.update(id, { status: 'checking', message: undefined })
     try {
-      this.applySession(id, await this.gateway.get(item.sessionId))
+      if (item.direct) {
+        const session = await getDirect(item.sessionId)
+        this.applyDirect(id, session)
+        if (['initializing', 'uploading', 'completing', 'verifying'].includes(session.status))
+          this.update(id, { status: 'failed', message: '会话仍在进行，可重试续传或继续查询状态。' })
+      } else this.applySession(id, await this.gateway.get(item.sessionId))
     } catch (error) {
       this.update(id, { status: 'failed', message: errorMessage(error) })
     }
@@ -124,7 +142,7 @@ export class UploadManager {
   // 才继续普通上传；再次未知会重新进入待确认状态。
   retry(id: string) {
     const item = this.find(id)
-    if (!item || item.status !== 'failed' || !item.instantUnknown) return
+    if (!item || item.status !== 'failed' || (!item.instantUnknown && !item.direct)) return
     this.canceled.delete(id)
     this.update(id, {
       status: 'queued',
@@ -197,7 +215,31 @@ export class UploadManager {
       status: 'creating',
       message: item.instantDigest ? '正在确认秒传结果…' : '正在计算内容摘要…',
     })
+    const capability = this.gateway.directCapabilities
+      ? await this.gateway.directCapabilities()
+      : { enabled: false, max_bytes: MAX_UPLOAD_BYTES }
+    const direct =
+      item.file.size > 0 &&
+      capability.enabled &&
+      (item.choice === 'auto' || item.choice === 'direct')
+    if (item.choice === 'direct' && item.file.size > 0 && !direct)
+      throw new Error('当前存储策略尚未启用 COS 直传。')
+    if (item.file.size > (direct ? capability.max_bytes : MAX_UPLOAD_BYTES))
+      throw new Error('文件超过当前存储策略的上传上限。')
+    if (direct) this.update(item.id, { direct: true })
     if ((await this.tryInstantUpload(item)) === 'hit') return
+    if (direct) {
+      const digest = this.find(item.id)?.instantDigest ?? (await sha256Hex(item.file))
+      await runDirect(
+        item.file,
+        item.parentId,
+        digest,
+        signal,
+        (session) => this.applyDirect(item.id, session),
+        (loaded) => this.update(item.id, { loaded }),
+      )
+      return
+    }
     if (!this.alive) return
     if (this.canceled.has(item.id)) {
       this.update(item.id, { status: 'canceled', message: undefined })
@@ -315,9 +357,7 @@ export class UploadManager {
           throw error
         }
         if (attempt < INSTANT_CONFIRM_ATTEMPTS - 1) {
-          await new Promise((resolve) =>
-            setTimeout(resolve, INSTANT_RETRY_DELAYS[attempt] ?? 0),
-          )
+          await new Promise((resolve) => setTimeout(resolve, INSTANT_RETRY_DELAYS[attempt] ?? 0))
           if (!this.alive) return 'miss'
         }
       }
@@ -329,12 +369,39 @@ export class UploadManager {
   private async cancelRemote(id: string, sessionId: string) {
     if (!this.alive) return
     try {
-      this.applySession(id, await this.gateway.cancel(sessionId))
+      if (this.find(id)?.direct) this.applyDirect(id, await cancelDirect(sessionId))
+      else this.applySession(id, await this.gateway.cancel(sessionId))
     } catch (error) {
       this.update(id, {
         status: 'failed',
         message: `取消结果未确认。${errorMessage(error)} 请查询状态。`,
       })
+    }
+  }
+
+  private applyDirect(id: string, session: DirectSession) {
+    const completed = session.status === 'completed'
+    this.update(id, {
+      direct: true,
+      sessionId: session.id,
+      resultFileId: session.result_file_id,
+      status: completed
+        ? 'completed'
+        : session.status === 'canceled' ||
+            session.status === 'expired' ||
+            session.status === 'failed'
+          ? session.status
+          : session.status === 'uploading'
+            ? 'uploading'
+            : 'confirming',
+      message:
+        session.status === 'verifying'
+          ? 'COS 已合并，等待 worker 完整校验后发布…'
+          : session.last_error,
+    })
+    if (completed) {
+      const item = this.find(id)
+      if (item) this.published(item.parentId)
     }
   }
 
