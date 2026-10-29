@@ -5,3 +5,8 @@
 /.gocache/
 *.out
 .DS_Store
+
+# Runtime COS credentials (never commit secrets)
+/configs/cos.env
+.env
+.env.local
