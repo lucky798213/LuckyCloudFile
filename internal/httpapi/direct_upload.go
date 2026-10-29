@@ -47,6 +47,8 @@ func registerDirectUploads(g *gin.RouterGroup, logger *slog.Logger, svc fileServ
 					return
 				}
 				result, err = s.SignDirectParts(ctx, owner, id, req.Numbers)
+			case "cancel":
+				result, err = s.CancelDirectUpload(ctx, owner, id)
 			case "complete":
 				result, err = s.CompleteDirectUpload(ctx, owner, id)
 				status = 202
@@ -70,6 +72,7 @@ func registerDirectUploads(g *gin.RouterGroup, logger *slog.Logger, svc fileServ
 			c.JSON(status, result)
 		}
 	}
+	g.DELETE("/direct-upload-sessions/:id", run("cancel"))
 	g.POST("/direct-upload-sessions", run("create"))
 	g.GET("/direct-upload-sessions/:id", run("get"))
 	g.POST("/direct-upload-sessions/:id/part-urls", run("sign"))

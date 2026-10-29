@@ -62,6 +62,10 @@ type CleanupResult struct {
 // 失败不会中断整轮扫描：该实体保留 pending_delete，下一轮再试。
 // 按 id 递增扫描，所以同一轮里失败的行不会反复取到同一个。
 func (s *Service) CleanupPending(ctx context.Context, batchSize int) (CleanupResult, error) {
+	if err := s.ReconcileDirectUploads(ctx, batchSize); err != nil {
+		s.logger.Warn("reconcile direct uploads", "error", err)
+	}
+
 	if batchSize <= 0 {
 		batchSize = DefaultCleanupBatchSize
 	}
