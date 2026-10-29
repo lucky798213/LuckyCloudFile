@@ -122,10 +122,11 @@ type ListResult struct {
 // 多个存储位置由 storage.Registry 按策略 ID 管理；
 // Service 不自己选目录，也不回退到“默认位置”。
 type Service struct {
-	db      *gorm.DB
-	stores  *storage.Registry
-	logger  *slog.Logger
-	uploads *uploadController
+	directMax int64
+	db        *gorm.DB
+	stores    *storage.Registry
+	logger    *slog.Logger
+	uploads   *uploadController
 
 	// chunks 是跨请求保留的分片账本，和 uploads（当前是否有请求在写）
 	// 职责分开。它只保存内存状态，不落库。
@@ -144,7 +145,7 @@ type Service struct {
 // NewService 创建文件服务。
 func NewService(db *gorm.DB, stores *storage.Registry) *Service {
 	return &Service{
-		db:     db,
+		directMax: 128 << 20, db: db,
 		stores: stores,
 		// 默认丢弃日志：构造 Service 的人不一定关心后台清理，
 		// 生产代码可以用 WithLogger 换成真正的 logger。
@@ -1313,4 +1314,12 @@ func toFile(record model.File) File {
 		Kind:     record.Kind,
 		ParentID: record.ParentID,
 	}
+}
+
+// WithDirectMax configures a separate cloud transfer limit; proxy remains 32 MiB.
+func (s *Service) WithDirectMax(n int64) *Service {
+	if n > 0 && n <= 80<<30 {
+		s.directMax = n
+	}
+	return s
 }

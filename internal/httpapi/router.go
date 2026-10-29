@@ -101,6 +101,7 @@ func newRouter(
 	// 下面这些接口都先经过 Token 校验，再进入各自的处理函数。
 	protected := r.Group("/api")
 	protected.Use(requireAuth(logger, authService))
+	registerDirectUploads(protected, logger, fileService)
 	protected.POST("/auth/logout", logout(logger, authService))
 	// 目录：只插入一行 File，不写磁盘。
 	protected.POST("/directories", createDirectory(logger, fileService))
