@@ -37,6 +37,8 @@ export function UploadDialog({
       alive = false
     }
   }, [])
+  // Fail closed while capabilities are loading or unavailable.
+  const proxyChunkDisabled = capabilities?.enabled !== false
   const limit =
     (mode === 'auto' || mode === 'direct') && capabilities?.enabled
       ? capabilities.max_bytes
@@ -52,6 +54,7 @@ export function UploadDialog({
         className={ui.form}
         onSubmit={(event) => {
           event.preventDefault()
+          if (mode === 'chunked' && proxyChunkDisabled) return
           try {
             manager.enqueue(files, parentId, mode)
             onClose()
@@ -66,9 +69,16 @@ export function UploadDialog({
             <option value="auto">自动选择（COS 策略直传，其他策略代理上传）</option>
             <option value="direct">COS 直传（支持重新选文件续传）</option>
             <option value="full">整文件上传</option>
-            <option value="chunked">分片上传</option>
+            <option value="chunked" disabled={proxyChunkDisabled}>
+              代理分片上传{capabilities?.enabled ? '（COS 策略不支持）' : ''}
+            </option>
           </select>
         </label>
+        {capabilities?.enabled && (
+          <p className={ui.description}>
+            COS 策略不支持代理分片上传，请使用 COS 直传或整文件上传。
+          </p>
+        )}
         <ul className={styles.uploadList}>
           {files.map((file, index) => (
             <li key={index}>
@@ -99,7 +109,11 @@ export function UploadDialog({
         </p>
         <div className={ui.footer}>
           <Button onClick={onClose}>取消</Button>
-          <Button type="submit" variant="primary" disabled={oversized || files.length === 0}>
+          <Button
+            type="submit"
+            variant="primary"
+            disabled={oversized || files.length === 0 || (mode === 'chunked' && proxyChunkDisabled)}
+          >
             开始上传
           </Button>
         </div>

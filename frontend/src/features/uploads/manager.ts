@@ -218,6 +218,14 @@ export class UploadManager {
     const capability = this.gateway.directCapabilities
       ? await this.gateway.directCapabilities()
       : { enabled: false, max_bytes: MAX_UPLOAD_BYTES }
+    // Recheck at execution time: the default policy can change after the dialog opens.
+    if (capability.enabled && item.choice === 'chunked') {
+      this.update(item.id, {
+        status: 'failed',
+        message: 'COS 策略不支持代理分片上传，请选择 COS 直传或整文件上传。',
+      })
+      return
+    }
     const direct =
       item.file.size > 0 &&
       capability.enabled &&

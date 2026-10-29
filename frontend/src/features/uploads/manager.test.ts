@@ -48,6 +48,19 @@ async function waitFor(check: () => boolean, timeout = 1000) {
 }
 
 describe('upload scheduler', () => {
+  it('rejects a stale proxy chunk choice on COS before probing or creating a session', async () => {
+    const api = gateway({
+      directCapabilities: vi.fn(async () => ({ enabled: true, max_bytes: 128 * 1024 * 1024 })),
+    })
+    const manager = new UploadManager(api, vi.fn())
+    manager.enqueue([file()], 'root', 'chunked')
+    await waitFor(() => manager.getSnapshot()[0]?.status === 'failed')
+    expect(manager.getSnapshot()[0]?.message).toContain('COS 策略不支持代理分片上传')
+    expect(api.instant).not.toHaveBeenCalled()
+    expect(api.create).not.toHaveBeenCalled()
+    expect(api.chunk).not.toHaveBeenCalled()
+  })
+
   it('does not claim an unknown created session was remotely canceled without its ID', async () => {
     const api = gateway({
       create: vi.fn<UploadGateway['create']>(async () => {
