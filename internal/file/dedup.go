@@ -11,20 +11,22 @@ import (
 	"luckyCloudFile/internal/model"
 )
 
-// contentPublishAttempts 是内容映射唯一键冲突时的重试次数。
+// contentPublishAttempts 是发布事务因唯一键冲突或数据库死锁时的重试上限。
 //
-// 冲突不代表“已经存在”，而是说明另一个事务先提交了映射；
-// 重开事务后重新读取获胜实体，再决定复用还是继续插入。
+// 冲突不代表“已经存在”，而是说明另一个事务先提交了映射；死锁说明两个
+// 事务发生了锁竞争。两者都由数据库回滚了整笔事务，重开后重新读取获胜
+// 实体再决定复用还是继续插入；超过上限仍失败就按普通错误返回。
 const contentPublishAttempts = 3
 
 // errContentKeyRace 是内部信号：ContentKey 唯一键被并发事务抢先写入。
 // 调用方必须重试整个发布事务，不能把它当成普通的“文件已存在”。
 var errContentKeyRace = errors.New("content key was created concurrently")
 
-// lookupContentKey 在当前用户、当前策略作用域内查找内容映射。
+// lookupContentKey 在当前用户、当前策略作用域内读取内容映射。
 //
-// 使用锁定读而不是普通快照读：发布事务可能在这笔事务建立快照之后、
-// 取得用户行锁之前提交了映射，锁定读能等待并读到最新提交结果。
+// 这里刻意使用快照读而不是 FOR UPDATE：如果先锁 ContentKey 再锁 Entity，
+// 会和“锁 Entity → 锁 ContentKey”的删除/校验链路反向加锁。
+// 这个结果只是候选线索；真正能否复用由 lockReusableContent 在锁内复核。
 func lookupContentKey(
 	tx *gorm.DB,
 	ownerID, policyID int,
@@ -32,7 +34,7 @@ func lookupContentKey(
 	size int64,
 ) (*model.ContentKey, error) {
 	var key model.ContentKey
-	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+	err := tx.Where(
 		"owner_id = ? AND storage_policy_id = ? AND sha256 = ? AND size = ?",
 		ownerID, policyID, digest, size,
 	).First(&key).Error
@@ -43,6 +45,88 @@ func lookupContentKey(
 		return nil, fmt.Errorf("query content key: %w", err)
 	}
 	return &key, nil
+}
+
+// lockContentKey 按主键锁住一条内容映射。
+//
+// 调用方必须已经持有该映射指向的 Entity 行锁，保证内容发布、校验回填和
+// 删除都按 Entity → ContentKey 的顺序加锁，不会形成等待环。
+func lockContentKey(tx *gorm.DB, id int64) (*model.ContentKey, error) {
+	var key model.ContentKey
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ?", id).First(&key).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("lock content key %d: %w", id, err)
+	}
+	return &key, nil
+}
+
+// lockReusableContent 查找并锁定当前作用域下可复用的内容。
+//
+// 先锁候选 Entity，再锁 ContentKey 并复核映射没有被并发删除或改写。
+// 这既避免了“ContentKey → Entity”和“Entity → ContentKey”的锁顺序倒置，
+// 也保证返回的 Entity 在事务剩余时间里不会被删除或改写。
+//
+// 返回 (nil, nil) 表示未命中：没有映射、映射已过期，或映射在加锁期间
+// 被并发改写。调用方按未命中继续，唯一键竞争仍由 insertContentKey 兜底。
+func lockReusableContent(
+	tx *gorm.DB,
+	ownerID, policyID int,
+	digest string,
+	size int64,
+) (*model.Entity, error) {
+	hint, err := lookupContentKey(tx, ownerID, policyID, digest, size)
+	if err != nil {
+		return nil, err
+	}
+	if hint == nil {
+		return nil, nil
+	}
+
+	entity, err := lockReusableEntity(tx, hint)
+	if err != nil {
+		return nil, err
+	}
+	if entity == nil {
+		// 映射指向的内容已经不可引用。锁住映射后确认它仍指向同一份过期内容，
+		// 再删掉它，让后续上传按未命中重新登记。
+		if err := dropStaleContentKey(tx, hint); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+
+	current, err := lockContentKey(tx, hint.ID)
+	if err != nil {
+		return nil, err
+	}
+	if current == nil || current.EntityID != entity.ID {
+		// 映射在提示读和 Entity 锁之间被别的发布事务改写。
+		// 不复用旧候选；调用方继续登记时会由唯一键触发有界重试。
+		return nil, nil
+	}
+	return entity, nil
+}
+
+// dropStaleContentKey 删除一条仍指向同一份过期内容的映射。
+//
+// 如果映射已经被并发删除或改写，这里什么都不做：那条新映射属于另一个
+// 发布事务，不能按旧候选把它删掉。
+func dropStaleContentKey(tx *gorm.DB, stale *model.ContentKey) error {
+	current, err := lockContentKey(tx, stale.ID)
+	if err != nil {
+		return err
+	}
+	if current == nil || current.EntityID != stale.EntityID {
+		return nil
+	}
+	if err := tx.Where("id = ?", current.ID).Delete(&model.ContentKey{}).Error; err != nil {
+		return fmt.Errorf("delete stale content key: %w", err)
+	}
+	return nil
 }
 
 // lockReusableEntity 锁住映射指向的 Entity，并确认它仍然可以被引用。
@@ -88,24 +172,11 @@ func reuseExistingContent(
 	digest string,
 	size int64,
 ) (bool, error) {
-	key, err := lookupContentKey(tx, ownerID, policyID, digest, size)
-	if err != nil {
-		return false, err
-	}
-	if key == nil {
-		return false, nil
-	}
-
-	entity, err := lockReusableEntity(tx, key)
+	entity, err := lockReusableContent(tx, ownerID, policyID, digest, size)
 	if err != nil {
 		return false, err
 	}
 	if entity == nil {
-		// 映射指向的内容已经不可引用。删掉旧映射，按未命中重新登记，
-		// 这样旧 GC 不会继续把新内容导向一份待删除的对象。
-		if err := tx.Where("id = ?", key.ID).Delete(&model.ContentKey{}).Error; err != nil {
-			return false, fmt.Errorf("delete stale content key: %w", err)
-		}
 		return false, nil
 	}
 

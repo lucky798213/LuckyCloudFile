@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"luckyCloudFile/internal/database"
 	"luckyCloudFile/internal/idgen"
 	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/quota"
@@ -369,8 +370,18 @@ func (s *Service) CompleteUploadSession(
 			completed = toUploadSessionInfo(session)
 			return nil
 		})
-		if !errors.Is(err, errContentKeyRace) {
+		if err == nil {
 			break
+		}
+		if !errors.Is(err, errContentKeyRace) {
+			// 唯一键竞争立即重开事务；死锁/锁等待则退避后再试。
+			// 两者都只重试有限次，其它数据库错误直接返回。
+			if !database.IsRetryableConflict(err) {
+				break
+			}
+			if waitErr := database.WaitForRetry(ctx, attempt); waitErr != nil {
+				return UploadSessionInfo{}, waitErr
+			}
 		}
 	}
 	if err == nil {

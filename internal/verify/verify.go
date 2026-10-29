@@ -31,6 +31,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"luckyCloudFile/internal/database"
 	"luckyCloudFile/internal/failpoint"
 	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/queue"
@@ -56,6 +57,10 @@ const (
 	// emptyContentSHA256 是空内容的 SHA-256。空文件不读对象，
 	// 但仍然要回填一条可信摘要。
 	emptyContentSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+	// commitAttempts 是回填事务遇到数据库死锁时的重试上限。
+	// InnoDB 会回滚整笔事务，重新走一遍 Complete 不会重复写入。
+	commitAttempts = 3
 )
 
 var (
@@ -219,13 +224,30 @@ func (r *runner) Run(
 
 	// 回填摘要、登记映射和标记完成必须在同一个事务里提交。
 	// Complete 会先锁任务行并核对 worker / attempt / 租约，再执行 apply。
-	if err := r.options.Tasks.Complete(
-		ctx, r.claim, string(resultJSON),
-		func(tx *gorm.DB) error {
-			return r.backfill(tx, record.OwnerID, target, digest)
-		},
-	); err != nil {
-		return "", err
+	//
+	// 死锁/锁等待超时由 InnoDB 回滚整笔事务，可以在本进程内有界重试；
+	// 重试仍失败时标记为可重试，交给任务调度器按 attempt 上限再排一次。
+	for attempt := 0; attempt < commitAttempts; attempt++ {
+		err = r.options.Tasks.Complete(
+			ctx, r.claim, string(resultJSON),
+			func(tx *gorm.DB) error {
+				return r.backfill(tx, record.OwnerID, target, digest)
+			},
+		)
+		if err == nil {
+			break
+		}
+		if !database.IsRetryableConflict(err) {
+			return "", err
+		}
+		if attempt+1 < commitAttempts {
+			if waitErr := database.WaitForRetry(ctx, attempt); waitErr != nil {
+				return "", waitErr
+			}
+		}
+	}
+	if err != nil {
+		return "", task.Retryable(err)
 	}
 	return string(resultJSON), nil
 }
@@ -270,6 +292,9 @@ func (r *runner) loadTarget(ctx context.Context, ownerID int) (*model.Entity, er
 // backfill 在 Complete 的事务里执行：
 //
 //	锁文件行 → 核对实体仍有效 → 回填摘要 → 登记或复用内容映射
+//
+// 加锁顺序固定为 File → Entity → ContentKey，和发布/删除链路一致；
+// 内容键永远最后锁，不能反过来先锁 ContentKey 再锁 Entity。
 //
 // 任何一步发现目标已经不可校验，都返回 ErrTargetGone 让整个事务回滚，
 // 任务随后收敛为失败，不会留下错误的内容映射。

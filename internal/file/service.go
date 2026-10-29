@@ -19,6 +19,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"luckyCloudFile/internal/database"
 	"luckyCloudFile/internal/idgen"
 	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/pathlock"
@@ -327,7 +328,8 @@ func (s *Service) uploadStore(ctx context.Context, ownerID int) (int, storage.St
 // 旧上传没有提前预留容量，但发布同样不能绕过配额：这里先锁住用户行，
 // 再用一条受条件约束的 UPDATE 把实际大小加进 used_bytes。容量不足时
 // 整个事务回滚，调用方会删除已经落盘的内容（见 Upload 的补偿删除）。
-// 加锁顺序和所有容量事务一致：User → Entity → File。
+// 加锁顺序和所有发布/容量事务一致：User → Entity → File → ContentKey。
+// 内容键永远在实体之后锁定，避免和校验回填、删除形成等待环。
 func (s *Service) saveRecords(ctx context.Context, ownerID int, parentID, fileID, storageKey string, policyID int, name string, size int64, digest string, target pathSnapshot) error {
 	var leftoverID int64
 	var err error
@@ -402,8 +404,18 @@ func (s *Service) saveRecords(ctx context.Context, ownerID int, parentID, fileID
 			// 重试时会读到获胜实体并走复用路径。
 			return insertContentKey(tx, ownerID, policyID, digest, size, entity.ID)
 		})
-		if !errors.Is(err, errContentKeyRace) {
+		if err == nil {
 			break
+		}
+		if !errors.Is(err, errContentKeyRace) {
+			// 唯一键竞争立即重开事务；死锁/锁等待则退避后再试。
+			// 两者都只重试有限次，其它数据库错误直接返回。
+			if !database.IsRetryableConflict(err) {
+				break
+			}
+			if waitErr := database.WaitForRetry(ctx, attempt); waitErr != nil {
+				return waitErr
+			}
 		}
 	}
 	if err != nil {

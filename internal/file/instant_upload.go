@@ -134,25 +134,13 @@ func (s *Service) InstantUpload(
 				return err
 			}
 
-			key, err := lookupContentKey(
+			entity, err := lockReusableContent(
 				tx, ownerID, user.DefaultStoragePolicyID, digest, size,
 			)
 			if err != nil {
 				return err
 			}
-			if key == nil {
-				return s.recordInstantUploadMiss(tx, ownerID, idempotencyKey, requestDigest, &result)
-			}
-			entity, err := lockReusableEntity(tx, key)
-			if err != nil {
-				return err
-			}
 			if entity == nil {
-				// 映射已经过期：先删掉旧映射，再记一次未命中，
-				// 避免后续上传继续被导向一份待删除的对象。
-				if err := tx.Where("id = ?", key.ID).Delete(&model.ContentKey{}).Error; err != nil {
-					return fmt.Errorf("delete stale content key: %w", err)
-				}
 				return s.recordInstantUploadMiss(tx, ownerID, idempotencyKey, requestDigest, &result)
 			}
 

@@ -9,6 +9,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"luckyCloudFile/internal/database"
 	"luckyCloudFile/internal/model"
 	"luckyCloudFile/internal/pathlock"
 )
@@ -335,7 +336,8 @@ func verifyPathSnapshotsWith(ctx context.Context, db *gorm.DB, requests []pathLo
 // runLockedOperation 先解析快照，再在锁内执行事务。
 //
 // 另一请求正持有一把冲突的锁，或者解析之后路径被改动时，重新解析快照并重试。
-// 这样同一个路径上的并发操作会串行完成，而不是直接返回一个内部错误。
+// 事务遇到 MySQL 死锁/锁等待超时时也重开事务重试：InnoDB 已经回滚了整笔
+// 事务，重做不会留下半成品。两种重试都有固定上限，其它错误直接返回。
 func (s *Service) runLockedOperation(
 	ctx context.Context,
 	prepare func() ([]pathLockRequest, error),
@@ -349,11 +351,17 @@ func (s *Service) runLockedOperation(
 		}
 
 		lastErr = s.withLockedTx(ctx, requests, fn)
-		if !isRetryablePathError(lastErr) {
+		switch {
+		case isRetryablePathError(lastErr):
+			if err := waitPathLockRetry(ctx); err != nil {
+				return err
+			}
+		case database.IsRetryableConflict(lastErr):
+			if err := database.WaitForRetry(ctx, attempt); err != nil {
+				return err
+			}
+		default:
 			return lastErr
-		}
-		if err := waitPathLockRetry(ctx); err != nil {
-			return err
 		}
 	}
 	if errors.Is(lastErr, pathlock.ErrConflict) {
